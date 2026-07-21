@@ -273,6 +273,11 @@ impl ObjectStore {
                         entry.lock().spilled = true;
                     }
                 } else {
+                    // Spill failed — disk may be full. Warn the user (#25448
+                    // analog: silent OOM with no feedback).
+                    tracing::warn!(
+                        "failed to spill object {id} to disk at {path:?}; keeping in memory"
+                    );
                     // Put it back if spill fails
                     let map = self.inner.map.lock();
                     if let Some(entry) = map.get(&id) {
