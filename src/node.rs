@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::common::{ActorID, ObjectID};
+use crate::common::ObjectID;
 use crate::object_store::ObjectStore;
 
 /// Maximum allowed message size (256 MiB).
@@ -295,7 +295,7 @@ impl crate::object_store::RemoteFetcher for Node {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, node: Arc<Node>) -> Result<(), NodeError> {
+async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), NodeError> {
     let mut conn = Connection { stream };
     while let Some(msg) = conn.recv().await? {
         match msg {

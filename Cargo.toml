@@ -2,7 +2,14 @@
 name = "crayon"
 version = "0.1.0"
 edition = "2021"
-description = "Crayon: a Rust reimplementation of Ray's core (object store, actors, tasks, status)"
+description = "A Rust reimplementation of Ray's core: distributed object store, actors, task scheduling, and multi-node execution for RL training infrastructure"
+license = "MIT"
+repository = "https://github.com/cklxx/crayon"
+homepage = "https://github.com/cklxx/crayon"
+documentation = "https://docs.rs/crayon"
+readme = "README.md"
+keywords = ["ray", "distributed", "rl", "reinforcement-learning", "actor"]
+categories = ["concurrency", "distributed-computing", "science"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

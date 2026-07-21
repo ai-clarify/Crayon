@@ -50,6 +50,11 @@ impl ActorHandleInner {
             .map_err(|_| CrayonError::ActorDead(self.id))
     }
 
+    /// Signal the actor to shut down. New calls will fail with ActorDead.
+    pub(crate) fn shutdown(&self) {
+        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn store(&self) -> &ObjectStore {
         &self.store
     }

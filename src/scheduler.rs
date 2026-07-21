@@ -71,6 +71,8 @@ pub struct WorkerPool {
     tracker: Arc<ResourceTracker>,
     num_workers: usize,
     /// Workers send a signal here when they finish a task (releasing resources).
+    /// Kept alive to prevent the receiver from closing.
+    #[allow(dead_code)]
     done_tx: mpsc::UnboundedSender<()>,
     /// Maps task id -> cancellation flag. Set by `cancel_task`.
     cancel_tokens: Arc<PlMutex<std::collections::HashMap<TaskID, Arc<AtomicBool>>>>,

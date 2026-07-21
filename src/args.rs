@@ -55,6 +55,7 @@ macro_rules! impl_resolve_args {
     };
     ($($T:ident),+) => {
         #[async_trait]
+        #[allow(non_snake_case)]
         impl<$($T: ResolveArg),+> ResolveArgs for ($($T,)+) {
             type Output = ($($T::Output,)+);
             async fn resolve(self, store: &ObjectStore) -> Result<Self::Output, CrayonError> {

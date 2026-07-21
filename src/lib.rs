@@ -125,6 +125,16 @@ impl Ray {
         self.inner.store.get(r.id).await
     }
 
+    /// Fetch many objects concurrently. Returns results in input order.
+    /// Critical for RL: pulling a batch of rollout samples in one fan-out.
+    pub async fn get_batch<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        refs: &[ObjectRef<T>],
+    ) -> Vec<Result<T, CrayonError>> {
+        let ids: Vec<_> = refs.iter().map(|r| r.id).collect();
+        self.inner.store.get_batch(&ids).await
+    }
+
     /// Run a closure as a remote task on a worker, using default resources
     /// (1 CPU, 0 GPU). `args` is a tuple of
     /// [`ResolveArg`](crate::args::ResolveArg)s; any [`ObjectRef`] arguments
@@ -257,6 +267,21 @@ impl Ray {
             .get(name)
             .cloned()
             .map(ActorHandle::from_inner)
+    }
+
+    /// Remove a named actor from the registry and kill it. Returns `true` if
+    /// the actor existed. This allows long-running training jobs to clean up
+    /// actors that are no longer needed (Ray #24711 analog).
+    pub fn remove_actor(&self, name: &str) -> bool {
+        if let Some(inner) = self.inner.named_actors.lock().remove(name) {
+            inner.shutdown();
+            inner
+                .gcs()
+                .set_actor_state(inner.id, crate::common::ActorState::Dead);
+            true
+        } else {
+            false
+        }
     }
 
     /// Snapshot the current system status.

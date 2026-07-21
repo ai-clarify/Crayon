@@ -5,7 +5,6 @@
 
 use crayon::node::Node;
 use crayon::object_store::ObjectStore;
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
