@@ -1,0 +1,21 @@
+examples/rl_cartpole.rs
+  s_3ed83973de6379::t_31fa7e59b4fb05 10,14,52-53,93,96,105-113,133-136,140-141,143-145,147,149,151-153,155-156,158,164-167,169,179,191,224-231,248-254,275,282,289,304,308-310,316,320-322,368-371
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "48a0450c486e63dc68fbe6d44a96aee769d9fbc5",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
