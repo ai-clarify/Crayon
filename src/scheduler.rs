@@ -135,16 +135,7 @@ impl WorkerPool {
                     let fut = std::panic::AssertUnwindSafe((task.func)(store.clone()));
                     let outcome = match fut.catch_unwind().await {
                         Ok(r) => r,
-                        Err(p) => {
-                            let msg = if let Some(s) = p.downcast_ref::<&str>() {
-                                s.to_string()
-                            } else if let Some(s) = p.downcast_ref::<String>() {
-                                s.clone()
-                            } else {
-                                "task panicked".into()
-                            };
-                            Err(CrayonError::TaskFailed(msg))
-                        }
+                        Err(p) => Err(crate::common::panic_to_error(p, "task panicked")),
                     };
                     match outcome {
                         Ok(bytes) => {

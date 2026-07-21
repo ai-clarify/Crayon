@@ -12,9 +12,10 @@
 //! ```
 
 use std::cell::Cell;
+use std::sync::OnceLock;
 
 thread_local! {
-    static CURRENT_DEVICE: Cell<Option<usize>> = Cell::new(None);
+    static CURRENT_DEVICE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// The GPU device id assigned to the current worker thread, if any.
@@ -28,43 +29,46 @@ pub(crate) fn set_current_device(device: Option<usize>) {
     CURRENT_DEVICE.with(|d| d.set(device));
 }
 
-/// Detect the number of CUDA GPUs on this node.
-///
-/// Order of checks:
-/// 1. `CUDA_VISIBLE_DEVICES` env var (respects container/device limits)
-/// 2. `/proc/driver/nvidia/gpus/` directory (Linux, no subprocess)
-/// 3. `nvidia-smi -L` (fallback, requires nvidia-smi)
-/// 4. 0 if none found
+/// Detect the number of CUDA GPUs on this node. Cached after first call —
+/// GPU count never changes during a process lifetime, and the `nvidia-smi`
+/// fallback can take 100ms+.
 pub fn detect_gpu_count() -> usize {
-    // 1. CUDA_VISIBLE_DEVICES
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(detect_gpu_count_uncached)
+}
+
+fn detect_gpu_count_uncached() -> usize {
+    // 1. CUDA_VISIBLE_DEVICES (respects container/device limits)
     if let Ok(visible) = std::env::var("CUDA_VISIBLE_DEVICES") {
-        if !visible.is_empty() && visible != "-1" {
-            return visible.split(',').filter(|s| !s.trim().is_empty()).count();
-        }
-        return 0;
+        return if visible.is_empty() || visible == "-1" {
+            0
+        } else {
+            visible.split(',').filter(|s| !s.trim().is_empty()).count()
+        };
     }
 
-    // 2. /proc/driver/nvidia/gpus/ (Linux)
-    if let Ok(entries) = std::fs::read_dir("/proc/driver/nvidia/gpus/") {
-        let count = entries.filter(|e| e.is_ok()).count();
-        if count > 0 {
-            return count;
-        }
-    }
-
-    // 3. nvidia-smi -L
-    if let Ok(out) = std::process::Command::new("nvidia-smi")
-        .arg("-L")
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            let count = s.lines().filter(|l| l.starts_with("GPU ")).count();
-            if count > 0 {
-                return count;
-            }
-        }
-    }
-
-    0
+    // 2. & 3. Try each detector in order; return the first positive count.
+    let detectors: [fn() -> Option<usize>; 2] = [
+        || {
+            std::fs::read_dir("/proc/driver/nvidia/gpus/")
+                .ok()
+                .map(|e| e.filter(|e| e.is_ok()).count())
+                .filter(|&c| c > 0)
+        },
+        || {
+            std::process::Command::new("nvidia-smi")
+                .arg("-L")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter(|l| l.starts_with("GPU "))
+                        .count()
+                })
+                .filter(|&c| c > 0)
+        },
+    ];
+    detectors.iter().find_map(|f| f()).unwrap_or(0)
 }

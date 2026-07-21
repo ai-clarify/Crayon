@@ -19,6 +19,25 @@ fn rollout_work(n: u64) -> u64 {
     x
 }
 
+/// Run N tasks on the given runtime and print throughput.
+fn bench_task_throughput(rt: tokio::runtime::Runtime, num_workers: usize, n: u64) {
+    let start = Instant::now();
+    rt.block_on(async {
+        let ray = Ray::init(num_workers);
+        let refs: Vec<_> = (0..n)
+            .map(|i| ray.spawn((), move |()| rollout_work(i % 1000)))
+            .collect();
+        let results = ray.get_batch(&refs).await;
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        let elapsed = start.elapsed();
+        println!(
+            "  {n} tasks in {:.2?} -> {:.0} tasks/sec, {ok} ok",
+            elapsed,
+            n as f64 / elapsed.as_secs_f64()
+        );
+    });
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Crayon Benchmarks ===\n");
 
@@ -35,44 +54,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .worker_threads(num_workers)
             .enable_all()
             .build()?;
-        let n = 10_000u64;
-        let start = Instant::now();
-        rt.block_on(async {
-            let ray = Ray::init(num_workers);
-            let refs: Vec<_> = (0..n)
-                .map(|i| ray.spawn((), move |()| rollout_work(i % 1000)))
-                .collect();
-            let results = ray.get_batch(&refs).await;
-            let ok = results.iter().filter(|r| r.is_ok()).count();
-            let elapsed = start.elapsed();
-            println!(
-                "  {n} tasks in {:.2?} -> {:.0} tasks/sec, {ok} ok",
-                elapsed,
-                n as f64 / elapsed.as_secs_f64()
-            );
-        });
+        bench_task_throughput(rt, num_workers, 10_000);
     }
 
     // ---- Bench 2: task throughput (pinned runtime) ----
     println!("\n--- Task throughput (pinned/NUMA runtime) ---");
     {
         let rt = crayon::affinity::build_runtime(num_workers);
-        let n = 10_000u64;
-        let start = Instant::now();
-        rt.block_on(async {
-            let ray = Ray::init(num_workers);
-            let refs: Vec<_> = (0..n)
-                .map(|i| ray.spawn((), move |()| rollout_work(i % 1000)))
-                .collect();
-            let results = ray.get_batch(&refs).await;
-            let ok = results.iter().filter(|r| r.is_ok()).count();
-            let elapsed = start.elapsed();
-            println!(
-                "  {n} tasks in {:.2?} -> {:.0} tasks/sec, {ok} ok",
-                elapsed,
-                n as f64 / elapsed.as_secs_f64()
-            );
-        });
+        bench_task_throughput(rt, num_workers, 10_000);
     }
 
     // ---- Bench 3: object store put/get throughput ----

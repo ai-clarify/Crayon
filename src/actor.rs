@@ -202,14 +202,10 @@ pub fn spawn_actor<S: Send + Clone + 'static>(
                 })) {
                     Ok(v) => Ok(v),
                     Err(p) => {
-                        let msg = if let Some(s) = p.downcast_ref::<&str>() {
-                            s.to_string()
-                        } else if let Some(s) = p.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "actor method panicked".into()
-                        };
-                        let _ = call.reply.send(Err(CrayonError::TaskFailed(msg)));
+                        let _ = call.reply.send(Err(crate::common::panic_to_error(
+                            p,
+                            "actor method panicked",
+                        )));
                         if restarts < max_restarts {
                             // Reset to initial state and keep going.
                             restarts += 1;

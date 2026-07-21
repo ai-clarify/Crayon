@@ -33,7 +33,7 @@ async fn multi_node_object_transfer() {
     let store2 = store2.with_remote(worker.clone());
 
     // Put an object on the head node (keep the ref alive so it isn't GC'd)
-    let r = store1.put(42i32);
+    let (r, _) = store1.put(42i32);
 
     // Fetch it from the worker node (remote fetch)
     let v: i32 = store2.get(r.id).await.unwrap();
@@ -51,7 +51,7 @@ async fn disk_spilling() {
     let mut refs = Vec::new();
     for i in 0..5 {
         let data = vec![i as u8; 50]; // 50 bytes each
-        let r = store.put(data);
+        let (r, _) = store.put(data);
         refs.push(r);
     }
 

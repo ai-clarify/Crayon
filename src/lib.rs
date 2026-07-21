@@ -120,8 +120,7 @@ impl Ray {
     /// Store an object in the object store. Returns a typed, refcounted
     /// reference. When the last clone is dropped, the object is evicted.
     pub fn put<T: serde::Serialize + Send + 'static>(&self, value: T) -> ObjectRef<T> {
-        let r = self.inner.store.put(value);
-        let size = self.inner.store.object_size(r.id);
+        let (r, size) = self.inner.store.put(value);
         self.inner.gcs.add_object(crate::gcs::ObjectMeta {
             id: r.id,
             size_bytes: size,

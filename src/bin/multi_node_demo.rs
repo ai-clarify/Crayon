@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let store = store.with_remote(node.clone());
 
         // Put an object that the worker will fetch
-        let r = store.put(42i32);
+        let (r, _) = store.put(42i32);
         println!("head put object {} = 42", r.id);
 
         // Keep the head alive
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // We need the object ID — in a real system the head would publish it.
         // For the demo, the head puts object with a known ID pattern.
         // Instead, let's put our own object and verify round-trip.
-        let r = store.put(99i32);
+        let (r, _) = store.put(99i32);
         println!("worker put object {} = 99", r.id);
         let v: i32 = store.get(r.id).await?;
         println!("worker fetched back {v}");

@@ -88,16 +88,17 @@ impl ObjectStore {
         Arc::downgrade(&self.inner)
     }
 
-    pub fn put<T: serde::Serialize + Send + 'static>(&self, value: T) -> ObjectRef<T> {
+    pub fn put<T: serde::Serialize + Send + 'static>(&self, value: T) -> (ObjectRef<T>, usize) {
         let id = ObjectID::new();
         let bytes = bincode::serialize(&value).expect("bincode serialize should not fail");
+        let size = bytes.len();
         self.put_bytes(id, bytes, None);
         let entry = self.entry(id, None);
         let e = entry.lock();
         e.refcount.fetch_add(1, Ordering::Relaxed);
         let refcount = e.refcount.clone();
         drop(e);
-        ObjectRef::new(id, refcount, self.downgrade())
+        (ObjectRef::new(id, refcount, self.downgrade()), size)
     }
 
     /// Store many objects at once. Returns one `ObjectRef` per input. Amortizes
@@ -107,7 +108,10 @@ impl ObjectStore {
         &self,
         values: Vec<T>,
     ) -> Vec<ObjectRef<T>> {
-        values.into_iter().map(|v| self.put(v)).collect()
+        values
+            .into_iter()
+            .map(|v| self.put(v).0)
+            .collect()
     }
 
     pub fn put_with_id<T: serde::Serialize + Send + 'static>(&self, id: ObjectID, value: T) {

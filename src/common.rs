@@ -230,6 +230,21 @@ impl fmt::Display for CrayonError {
 
 impl std::error::Error for CrayonError {}
 
+/// Convert a caught panic payload into a [`CrayonError::TaskFailed`].
+///
+/// Shared by the scheduler and actor runtime — both catch panics via
+/// `catch_unwind` and need to extract a human-readable message.
+pub fn panic_to_error(p: Box<dyn std::any::Any + Send>, default_msg: &str) -> CrayonError {
+    let msg = if let Some(s) = p.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        default_msg.into()
+    };
+    CrayonError::TaskFailed(msg)
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
