@@ -1,0 +1,29 @@
+Cargo.toml
+  s_3ed83973de6379::t_ec7c70498d2419 17-21
+src/actor.rs
+  s_3ed83973de6379::t_ee8832c0a2d0f4 36-47,124-128,132,143,146-207,258-265,372-373,375-376
+src/node.rs
+  s_3ed83973de6379::t_809bb61d9e4fc4 344-349,384-387
+src/object_store.rs
+  s_3ed83973de6379::t_603f0dc23cf8ce 53-63,107-109,218-240,242-253,255-257,262,265-270,274,287-288,290,292-293
+src/status.rs
+  s_3ed83973de6379::t_1cd6e8844da67a 62-73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e5d0391c09f222550959690e1e933e8542dc1b3e",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
