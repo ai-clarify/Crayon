@@ -9,7 +9,7 @@ homepage = "https://github.com/cklxx/crayon"
 documentation = "https://docs.rs/crayon"
 readme = "README.md"
 keywords = ["ray", "distributed", "rl", "actor", "scheduling"]
-categories = ["concurrency", "distributed-computing", "science"]
+categories = ["concurrency", "science", "algorithms"]
 
 [lib]
 name = "crayon"
