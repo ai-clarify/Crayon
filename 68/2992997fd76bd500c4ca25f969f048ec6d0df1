@@ -1,0 +1,25 @@
+Cargo.toml
+  s_3ed83973de6379::t_8d60308263ee3f 3
+crates/crayon-py/Cargo.toml
+  s_3ed83973de6379::t_4f209f6b02aeca 3
+crates/crayon-py/pyproject.toml
+  s_3ed83973de6379::t_549a789ad37c79 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "682992997fd76bd500c4ca25f969f048ec6d0df1",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
