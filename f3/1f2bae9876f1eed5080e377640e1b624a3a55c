@@ -1,0 +1,23 @@
+README.md
+  s_3ed83973de6379::t_5426c0a801b0cb 1-4,7-11,13,15,17-23,25-27,34,36,40,45,47-48,50,52,58,60-64,66,68-71,74,76-92,94,96,98,100
+logo.svg
+  s_3ed83973de6379::t_124d70d0eb5796 1-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f31f2bae9876f1eed5080e377640e1b624a3a55c",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
