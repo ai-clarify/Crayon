@@ -13,6 +13,7 @@ pub struct SystemStatus {
     pub actors: Vec<ActorStatus>,
     pub tasks_total: usize,
     pub tasks_finished: usize,
+    pub tasks_failed: usize,
     pub tasks_pending: usize,
     pub tasks_running: usize,
     pub workers: Vec<WorkerStatus>,
@@ -56,6 +57,10 @@ impl SystemStatus {
             .iter()
             .filter(|t| matches!(t.state, crate::common::TaskState::Finished))
             .count();
+        let tasks_failed = tasks
+            .iter()
+            .filter(|t| matches!(t.state, crate::common::TaskState::Failed))
+            .count();
         let tasks_pending = tasks
             .iter()
             .filter(|t| matches!(t.state, crate::common::TaskState::Pending))
@@ -87,6 +92,7 @@ impl SystemStatus {
             actors,
             tasks_total,
             tasks_finished,
+            tasks_failed,
             tasks_pending,
             tasks_running,
             workers,
@@ -100,8 +106,12 @@ impl SystemStatus {
         s.push_str("=== Crayon Status ===\n");
         s.push_str(&format!("Objects: {}\n", self.objects));
         s.push_str(&format!(
-            "Tasks: {} total, {} finished, {} running, {} pending\n",
-            self.tasks_total, self.tasks_finished, self.tasks_running, self.tasks_pending
+            "Tasks: {} total, {} finished, {} failed, {} running, {} pending\n",
+            self.tasks_total,
+            self.tasks_finished,
+            self.tasks_failed,
+            self.tasks_running,
+            self.tasks_pending
         ));
         s.push_str(&format!(
             "Workers: {} (utilization {:.0}%)\n",
