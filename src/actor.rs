@@ -36,10 +36,14 @@ pub struct ActorHandleInner {
     tx: mpsc::Sender<Call>,
     store: ObjectStore,
     gcs: Gcs,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ActorHandleInner {
     pub(crate) async fn send_call(&self, call: Call) -> Result<(), CrayonError> {
+        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(CrayonError::ActorDead(self.id));
+        }
         self.tx
             .send(call)
             .await
@@ -124,8 +128,12 @@ impl<S: Send + 'static> ActorHandle<S> {
         Ok(r)
     }
 
-    /// Kill the actor (drops the mailbox). In-flight calls will error.
+    /// Kill the actor: signals the actor task to shut down and rejects new
+    /// calls. In-flight calls will complete or error.
     pub fn kill(&self) {
+        self.inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.inner.gcs().set_actor_state(self.inner.id, ActorState::Dead);
     }
 }
@@ -153,12 +161,18 @@ pub fn spawn_actor<S: Send + Clone + 'static>(
     let (tx, mut rx) = mpsc::channel::<Call>(ACTOR_MAILBOX_SIZE);
     let gcs_clone = gcs.clone();
     let initial_state = state.clone();
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
 
     tokio::spawn(async move {
         let mut restarts = 0;
         let mut state: Box<dyn Any + Send> = Box::new(state);
-        loop {
+        'restart: loop {
             while let Some(call) = rx.recv().await {
+                if shutdown_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    gcs_clone.set_actor_state(id, ActorState::Dead);
+                    return;
+                }
                 gcs_clone.set_actor_state(id, ActorState::Running);
                 let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     (call.func)(state.as_mut())
@@ -178,11 +192,11 @@ pub fn spawn_actor<S: Send + Clone + 'static>(
                             restarts += 1;
                             state = Box::new(initial_state.clone());
                             gcs_clone.set_actor_state(id, ActorState::Running);
+                            continue 'restart;
                         } else {
                             gcs_clone.set_actor_state(id, ActorState::Dead);
                             return;
                         }
-                        continue;
                     }
                 };
                 let _ = call.reply.send(result);
@@ -194,7 +208,13 @@ pub fn spawn_actor<S: Send + Clone + 'static>(
     });
 
     ActorHandle {
-        inner: Arc::new(ActorHandleInner { id, tx, store, gcs }),
+        inner: Arc::new(ActorHandleInner {
+            id,
+            tx,
+            store,
+            gcs,
+            shutdown,
+        }),
         _state: std::marker::PhantomData,
     }
 }

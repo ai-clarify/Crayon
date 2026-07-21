@@ -120,7 +120,7 @@ impl Node {
                     let n = node_clone.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(stream, n).await {
-                            eprintln!("connection error: {e}");
+                            tracing::warn!("connection error: {e}");
                         }
                     });
                 }
