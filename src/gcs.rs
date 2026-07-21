@@ -97,6 +97,18 @@ impl Gcs {
         self.inner.lock().actors.get(&id).cloned()
     }
 
+    /// Look up an actor by name. Avoids cloning all actor metas (unlike
+    /// `actors().iter().find(...)`) — scans the map under the lock and returns
+    /// only the match. Used by `Ray::get_actor` for remote actor discovery.
+    pub fn get_actor_by_name(&self, name: &str) -> Option<ActorMeta> {
+        self.inner
+            .lock()
+            .actors
+            .values()
+            .find(|a| a.name == name)
+            .cloned()
+    }
+
     pub fn set_actor_state(&self, id: ActorID, state: ActorState) {
         if let Some(a) = self.inner.lock().actors.get_mut(&id) {
             a.state = state;

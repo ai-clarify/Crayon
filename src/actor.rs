@@ -255,23 +255,15 @@ impl<S: Send + 'static> ActorHandle<S> {
     /// Use [`ActorHandle::register_method`] on the owner node to expose methods,
     /// and [`ActorHandle::call_named`] on any node to invoke them.
     pub async fn call_named(&self, method: &str, args: Vec<u8>) -> Result<Vec<u8>, CrayonError> {
-        // Local actor: call directly through the mailbox.
-        if self.inner.owner_node.is_none() || self.inner.node.is_none() {
-            return self.inner.call_method(method, args).await;
+        match (self.inner.owner_node, self.inner.node.clone()) {
+            // Remote actor: forward via the local node to the owner node.
+            (Some(owner), Some(node)) => node
+                .remote_actor_call(self.inner.id, owner, method, args)
+                .await
+                .map_err(|e| CrayonError::TaskFailed(e.to_string())),
+            // Local actor (or no node attached): call directly through the mailbox.
+            _ => self.inner.call_method(method, args).await,
         }
-        // Remote actor: forward via the local node to the owner node.
-        let node = self
-            .inner
-            .node
-            .clone()
-            .ok_or(CrayonError::ActorDead(self.inner.id))?;
-        let owner = self
-            .inner
-            .owner_node
-            .ok_or(CrayonError::ActorDead(self.inner.id))?;
-        node.remote_actor_call(self.inner.id, owner, method, args)
-            .await
-            .map_err(|e| CrayonError::TaskFailed(e.to_string()))
     }
 }
 

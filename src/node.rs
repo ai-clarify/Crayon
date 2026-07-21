@@ -69,29 +69,21 @@ pub enum Message {
             Option<NodeID>,
         )>,
     },
-    /// Invoke a registered method on a remote actor. `call_id` lets the caller
-    /// match the reply.
+    /// Invoke a registered method on a remote actor. The pooled connection
+    /// guarantees one request/response per checkout, so no correlation ID
+    /// is needed — the reply is always the next message.
     ActorCall {
         actor_id: crate::common::ActorID,
         method: String,
         args: Vec<u8>,
-        call_id: u64,
     },
     /// Reply to an [`Message::ActorCall`].
     ActorCallReply {
-        call_id: u64,
         result: Result<Vec<u8>, String>,
     },
 }
 
 type NodeError = Box<dyn std::error::Error + Send + Sync>;
-
-/// Monotonic call ID generator for matching [`Message::ActorCall`] replies.
-fn rand_call_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
-}
 
 /// A pooled TCP connection that can send/receive [`Message`]s.
 struct Connection {
@@ -319,24 +311,20 @@ impl Node {
             .map(|p| p.addr.clone())
             .ok_or_else(|| format!("no peer with node id {owner}"))?;
 
-        let call_id = rand_call_id();
         let mut conn = self.pool.get(&addr).await?;
         conn.send(&Message::ActorCall {
             actor_id,
             method: method.to_string(),
             args,
-            call_id,
         })
         .await?;
-        match conn.recv().await? {
-            Some(Message::ActorCallReply { call_id: rid, result }) if rid == call_id => {
-                self.pool.put(&addr, conn);
-                result.map_err(|e| e.into())
-            }
-            _ => {
-                self.pool.put(&addr, conn);
-                Err("unexpected reply to actor call".into())
-            }
+        // Pool guarantees one request/response per checkout — the next message
+        // is always our reply.
+        let reply = conn.recv().await?;
+        self.pool.put(&addr, conn);
+        match reply {
+            Some(Message::ActorCallReply { result }) => result.map_err(|e| e.into()),
+            _ => Err("unexpected reply to actor call".into()),
         }
     }
     async fn broadcast_gcs(&self) {
@@ -522,7 +510,6 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                 actor_id,
                 method,
                 args,
-                call_id,
             } => {
                 // Route the incoming call to the local actor task.
                 let actor = node.local_actors.lock().get(&actor_id).cloned();
@@ -533,7 +520,7 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                     },
                     None => Err(format!("actor {actor_id} not found on this node")),
                 };
-                conn.send(&Message::ActorCallReply { call_id, result: reply })
+                conn.send(&Message::ActorCallReply { result: reply })
                     .await?;
             }
             _ => {}

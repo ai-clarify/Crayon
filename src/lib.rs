@@ -283,7 +283,7 @@ impl Ray {
             self.inner.gcs.clone(),
             self.inner.store.clone(),
             owner_node,
-            node,
+            node.clone(),
         );
         if !name.is_empty() {
             self.inner
@@ -291,7 +291,7 @@ impl Ray {
                 .lock()
                 .insert(name.to_string(), handle.inner.clone());
         }
-        if let Some(node) = self.inner.node.lock().clone() {
+        if let Some(node) = node {
             node.register_actor(handle.inner.clone());
         }
         handle
@@ -313,15 +313,11 @@ impl Ray {
         // 2. Remote actor discovered via GCS sync. Build a proxy handle whose
         //    `call_named` routes through the local node to the owner node.
         let node = self.inner.node.lock().clone()?;
-        let meta = self
-            .inner
-            .gcs
-            .actors()
-            .into_iter()
-            .find(|a| a.name == name && a.owner_node.is_some())?;
+        let meta = self.inner.gcs.get_actor_by_name(name)?;
+        let owner = meta.owner_node?; // local actors are checked above
         let inner = crate::actor::ActorHandleInner::remote_proxy(
             meta.id,
-            meta.owner_node.unwrap(),
+            owner,
             node,
             self.inner.store.clone(),
             self.inner.gcs.clone(),
