@@ -301,9 +301,16 @@ impl Node {
     }
 
     /// Register a locally-hosted actor so incoming [`Message::ActorCall`]
-    /// messages can be routed to it.
+    /// messages can be routed to it. Triggers an immediate GCS broadcast so
+    /// peers discover the new actor without waiting for the next periodic sync.
     pub fn register_actor(&self, inner: Arc<crate::actor::ActorHandleInner>) {
         self.local_actors.lock().insert(inner.id, inner);
+        // Kick off a broadcast right away so peers learn about this actor
+        // without waiting up to 2s for the next periodic tick.
+        let node = self.clone();
+        tokio::spawn(async move {
+            node.broadcast_gcs().await;
+        });
     }
 
     /// Invoke a registered method on a remote actor. Sends an
