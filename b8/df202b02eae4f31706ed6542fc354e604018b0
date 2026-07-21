@@ -1,0 +1,23 @@
+src/actor.rs
+  s_c7261244c3cb24::t_068c0271d44890 133-136,139,155,158,160-192
+src/lib.rs
+  s_c7261244c3cb24::t_1c8a85bb5acfd3 216-229,233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b8df202b02eae4f31706ed6542fc354e604018b0",
+  "prompts": {},
+  "sessions": {
+    "s_c7261244c3cb24": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a9227b1b5cfb0cefb",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
