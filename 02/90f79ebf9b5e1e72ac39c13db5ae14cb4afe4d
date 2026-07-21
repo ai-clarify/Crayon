@@ -1,0 +1,39 @@
+README.md
+  s_3ed83973de6379::t_cdec6838da3f42 2-127
+src/actor.rs
+  s_3ed83973de6379::t_a678f45b435709 1-173
+src/args.rs
+  s_3ed83973de6379::t_e91ace6d3ec994 1-77
+src/bin/demo.rs
+  s_3ed83973de6379::t_426cad14bbd6bc 1-90
+src/gcs.rs
+  s_3ed83973de6379::t_576eb87856f7b3 1-164
+src/memory.rs
+  s_3ed83973de6379::t_0ef0b36f55d421 1-101
+src/resources.rs
+  s_3ed83973de6379::t_d8755df4cd9389 1-93
+src/status.rs
+  s_3ed83973de6379::t_6a82dc53577d70 1-122
+tests/e2e.rs
+  s_3ed83973de6379::t_34a19e48c07d3e 1-118
+tests/integration.rs
+  s_3ed83973de6379::t_144d77a7f635b5 1-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0290f79ebf9b5e1e72ac39c13db5ae14cb4afe4d",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
