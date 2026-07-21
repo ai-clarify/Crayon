@@ -124,9 +124,9 @@ impl Gcs {
         // accumulate, prune completed ones. Keeps pending/running tasks.
         const MAX_TASKS: usize = 100_000;
         if inner.tasks.len() > MAX_TASKS {
-            inner.tasks.retain(|_, t| {
-                t.state == TaskState::Pending || t.state == TaskState::Running
-            });
+            inner
+                .tasks
+                .retain(|_, t| t.state == TaskState::Pending || t.state == TaskState::Running);
         }
     }
 
