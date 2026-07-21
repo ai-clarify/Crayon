@@ -57,11 +57,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 核心能力
 
-- **Object Store** — Plasma 风格，bincode 序列化，引用计数 GC，LRU 磁盘溢出
-- **Tasks** — 依赖自动解析，资源声明，失败自动重试
-- **Actors** — 串行邮箱，命名查找，参数服务器模式
-- **Resources** — CPU/GPU 记账，分数资源，调度器只派给能 fit 的 worker
-- **Multi-Node** — TCP 点对点，心跳检测，透明远程拉取
+- **Object Store** — Plasma 风格，bincode 序列化，引用计数 GC，LRU 磁盘溢出，批量 put/get
+- **Tasks** — 依赖自动解析，资源声明，失败自动重试 + 指数退避，任务取消，优先级调度
+- **Actors** — 串行邮箱，命名查找，参数服务器模式，故障自动重启，显式 kill
+- **Resources** — CPU/GPU 记账，分数资源，GPU-aware 调度（CPU 任务优先用 CPU 节点）
+- **Multi-Node** — TCP 点对点，心跳检测，透明远程拉取，消息大小上限
+- **Robustness** — 超时保护，死锁检测，背压（bounded mailbox），spill 文件自动清理
+
+## 解决的 Ray 核心 Issue
+
+| Ray Issue | Crayon 解决方案 |
+|-----------|---------------|
+| #18916 无超时机制 | `get` 默认 30s 超时，可自定义 |
+| #43102 spot 实例 actor 死亡 | `max_restarts` 自动重启 |
+| #64470 关键 actor 死亡不 fast-fail | actor panic 标记 dead，新调用立即失败 |
+| #53261 RSS 内存泄漏 | refcount 归零时清理 spill 文件 |
+| #47866 CPU 任务浪费 GPU 节点 | GPU-aware 调度，CPU 任务优先 CPU 节点 |
+| #43624 lineage 大小计算错误 | MemoryManager 用真实对象大小 |
+| #62093 plasma 死锁 | 超时 + 死锁检测（资源超 worker 总量时报错）|
+| #32952 actor 清理不可靠 | `kill()` 真正关闭 actor task |
+| #27499 idle worker 无限 spawn | 固定 worker pool，无动态创建 |
 
 ## 运行
 
