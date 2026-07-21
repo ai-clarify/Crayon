@@ -38,6 +38,9 @@ struct Entry {
     refcount: Arc<AtomicUsize>,
     owner_node: Option<crate::node::NodeID>,
     spilled: bool,
+    /// True while the object is being asynchronously written to disk.
+    /// Readers must wait for it to finish (or fail) before reading from disk.
+    spilling: bool,
 }
 
 pub(crate) struct StoreInner {
@@ -178,50 +181,59 @@ impl ObjectStore {
         id: ObjectID,
         timeout: std::time::Duration,
     ) -> Result<Vec<u8>, CrayonError> {
-        // Fast path: in memory
-        if let Some(bytes) = self.try_get_in_memory(&id) {
-            self.touch(&id);
-            return Ok(bytes);
-        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut tried_remote = false;
 
-        // Check if spilled to disk
-        if self.is_spilled(&id) {
-            match self.load_from_disk(&id) {
-                Ok(bytes) => {
-                    self.put_bytes(id, bytes.clone(), None);
-                    return Ok(bytes);
-                }
-                Err(_) => {
-                    // Spilled but file is gone; fall through to remote fetch
-                }
-            }
-        }
-
-        // Try remote fetch
-        let remote = self.inner.remote.lock().clone();
-        if let Some(remote) = remote {
-            if let Ok(bytes) = remote.fetch_remote(id).await {
-                self.put_bytes(id, bytes.clone(), None);
+        loop {
+            // Fast path: in memory
+            if let Some(bytes) = self.try_get_in_memory(&id) {
+                self.touch(&id);
                 return Ok(bytes);
             }
-        }
 
-        // If the entry was pre-reserved (in-flight task output), wait for it.
-        let existed = self.inner.map.lock().contains_key(&id);
-        if !existed {
-            return Err(CrayonError::ObjectNotFound(id));
-        }
-
-        let entry = self.entry(id, None);
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let notified = {
-                let e = entry.lock();
-                if let Some(bytes) = e.value.as_ref() {
-                    return Ok(bytes.clone());
+            // Check if spilled to disk
+            if self.is_spilled(&id) {
+                match self.load_from_disk(&id) {
+                    Ok(bytes) => {
+                        self.put_bytes(id, bytes.clone(), None);
+                        return Ok(bytes);
+                    }
+                    Err(_) => {
+                        // Spilled but file is gone; fall through to remote fetch
+                    }
                 }
-                e.notify.clone()
-            };
+            }
+
+            // If currently spilling to disk, wait for it to finish.
+            if self.is_spilling(&id) {
+                let entry = self.entry(id, None);
+                let notified = { entry.lock().notify.clone() };
+                match tokio::time::timeout_at(deadline, notified.notified()).await {
+                    Ok(_) => continue,
+                    Err(_) => return Err(CrayonError::Timeout(id)),
+                }
+            }
+
+            // Try remote fetch (once)
+            if !tried_remote {
+                tried_remote = true;
+                let remote = self.inner.remote.lock().clone();
+                if let Some(remote) = remote {
+                    if let Ok(bytes) = remote.fetch_remote(id).await {
+                        self.put_bytes(id, bytes.clone(), None);
+                        return Ok(bytes);
+                    }
+                }
+            }
+
+            // If the entry was pre-reserved (in-flight task output), wait for it.
+            let existed = self.inner.map.lock().contains_key(&id);
+            if !existed {
+                return Err(CrayonError::ObjectNotFound(id));
+            }
+
+            let entry = self.entry(id, None);
+            let notified = { entry.lock().notify.clone() };
             match tokio::time::timeout_at(deadline, notified.notified()).await {
                 Ok(_) => continue,
                 Err(_) => return Err(CrayonError::Timeout(id)),
@@ -252,39 +264,66 @@ impl ObjectStore {
         }
     }
 
+    fn is_spilling(&self, id: &ObjectID) -> bool {
+        self.inner
+            .map
+            .lock()
+            .get(id)
+            .map(|e| e.lock().spilling)
+            .unwrap_or(false)
+    }
+
+    /// Asynchronously spill an object to disk. Takes the bytes out of memory
+    /// immediately (so the memory budget is freed), then writes to disk on a
+    /// background task. Readers see `spilling=true` and wait for completion.
     fn spill_to_disk(&self, id: ObjectID) {
-        // Take the bytes out of the entry first, releasing locks before disk I/O
         let bytes = {
             let map = self.inner.map.lock();
             if let Some(entry) = map.get(&id) {
                 let mut e = entry.lock();
+                e.spilling = true;
                 e.value.take()
             } else {
                 None
             }
         };
-        if let Some(bytes) = bytes {
-            if let Some(mem) = self.inner.mem.lock().clone() {
+        let Some(bytes) = bytes else {
+            return;
+        };
+        let mem = self.inner.mem.lock().clone();
+        let store = self.inner.clone();
+
+        let do_spill = move || {
+            let result = if let Some(mem) = mem {
                 let path = mem.spill_path(id);
-                if std::fs::write(&path, &bytes).is_ok() {
-                    // Mark as spilled
-                    let map = self.inner.map.lock();
-                    if let Some(entry) = map.get(&id) {
-                        entry.lock().spilled = true;
-                    }
-                } else {
-                    // Spill failed — disk may be full. Warn the user (#25448
-                    // analog: silent OOM with no feedback).
-                    tracing::warn!(
-                        "failed to spill object {id} to disk at {path:?}; keeping in memory"
-                    );
-                    // Put it back if spill fails
-                    let map = self.inner.map.lock();
-                    if let Some(entry) = map.get(&id) {
-                        entry.lock().value = Some(bytes);
+                std::fs::write(&path, &bytes)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no memory manager",
+                ))
+            };
+            let map = store.map.lock();
+            if let Some(entry) = map.get(&id) {
+                let mut e = entry.lock();
+                e.spilling = false;
+                match result {
+                    Ok(_) => e.spilled = true,
+                    Err(_) => {
+                        tracing::warn!("failed to spill object {id} to disk; keeping in memory");
+                        e.value = Some(bytes);
                     }
                 }
+                e.notify.notify_waiters();
             }
+        };
+
+        // Spawn on the tokio runtime if available, else run synchronously.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(do_spill);
+            }
+            Err(_) => do_spill(),
         }
     }
 
@@ -310,7 +349,7 @@ impl ObjectStore {
             .get(&id)
             .map(|e| {
                 let e = e.lock();
-                e.value.is_some() || e.spilled
+                e.value.is_some() || e.spilled || e.spilling
             })
             .unwrap_or(false)
     }
@@ -337,7 +376,7 @@ impl ObjectStore {
             .values()
             .filter(|e| {
                 let e = e.lock();
-                e.value.is_some() || e.spilled
+                e.value.is_some() || e.spilled || e.spilling
             })
             .count()
     }
@@ -356,6 +395,7 @@ impl ObjectStore {
                     refcount: Arc::new(AtomicUsize::new(0)),
                     owner_node,
                     spilled: false,
+                    spilling: false,
                 }))
             })
             .clone()
