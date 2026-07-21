@@ -18,18 +18,17 @@ use tokio::sync::Notify;
 use crate::common::{CrayonError, ObjectID, ObjectRef};
 use crate::memory::MemoryManager;
 
+/// Boxed future returned by [`RemoteFetcher::fetch_remote`].
+pub type RemoteFetchFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>>
+            + Send,
+    >,
+>;
+
 /// Trait for fetching objects from remote nodes. Implemented by [`Node`].
 pub trait RemoteFetcher: Send + Sync {
-    fn fetch_remote(
-        &self,
-        id: ObjectID,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>,
-                > + Send,
-        >,
-    >;
+    fn fetch_remote(&self, id: ObjectID) -> RemoteFetchFuture;
 }
 
 struct Entry {

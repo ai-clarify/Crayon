@@ -18,8 +18,12 @@ use crate::common::{ActorID, ActorState, CrayonError, ObjectID};
 use crate::gcs::Gcs;
 use crate::object_store::ObjectStore;
 
+/// A type-erased actor method: takes the actor's state (as `&mut dyn Any`),
+/// returns the serialized result.
+pub(crate) type ActorMethod = Box<dyn FnOnce(&mut dyn Any) -> Vec<u8> + Send>;
+
 pub(crate) struct Call {
-    func: Box<dyn FnOnce(&mut dyn Any) -> Vec<u8> + Send>,
+    func: ActorMethod,
     reply: oneshot::Sender<Vec<u8>>,
 }
 
@@ -52,7 +56,8 @@ impl ActorHandleInner {
 
     /// Signal the actor to shut down. New calls will fail with ActorDead.
     pub(crate) fn shutdown(&self) {
-        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn store(&self) -> &ObjectStore {
@@ -105,13 +110,12 @@ impl<S: Send + 'static> ActorHandle<S> {
         let r = self.inner.store().reserve_ref(output_id);
         self.inner.gcs().record_actor_task(self.inner.id, false);
 
-        let erased: Box<dyn FnOnce(&mut dyn Any) -> Vec<u8> + Send> =
-            Box::new(move |state: &mut dyn Any| {
-                let s = state
-                    .downcast_mut::<S>()
-                    .expect("actor state type mismatch");
-                bincode::serialize(&func(s)).expect("serialize actor result")
-            });
+        let erased: ActorMethod = Box::new(move |state: &mut dyn Any| {
+            let s = state
+                .downcast_mut::<S>()
+                .expect("actor state type mismatch");
+            bincode::serialize(&func(s)).expect("serialize actor result")
+        });
 
         let (reply, rx) = oneshot::channel();
         self.inner

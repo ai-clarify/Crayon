@@ -18,6 +18,11 @@ use crate::gcs::Gcs;
 use crate::object_store::ObjectStore;
 use crate::resources::{ResourceTracker, Resources};
 
+/// A task closure: takes the object store, returns a future that resolves to
+/// serialized bytes (the task output) or an error.
+pub type TaskFunc =
+    Arc<dyn Fn(ObjectStore) -> BoxFuture<'static, Result<Vec<u8>, CrayonError>> + Send + Sync>;
+
 /// A unit of work a worker can execute. The closure receives the object store
 /// (so it can resolve task dependencies) and returns serialized bytes that get
 /// stored under `output_id`.
@@ -29,8 +34,7 @@ pub struct Task {
     pub retries: u32,
     pub priority: u8,
     pub cancelled: Arc<AtomicBool>,
-    pub func:
-        Arc<dyn Fn(ObjectStore) -> BoxFuture<'static, Result<Vec<u8>, CrayonError>> + Send + Sync>,
+    pub func: TaskFunc,
 }
 
 impl PartialEq for Task {
@@ -122,11 +126,10 @@ impl WorkerPool {
                     }
 
                     gcs.set_task_state(task.id, TaskState::Running, None);
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        (task.func)(store.clone())
-                    }));
-                    let outcome = match result {
-                        Ok(fut) => fut.await,
+                    use futures::FutureExt;
+                    let fut = std::panic::AssertUnwindSafe((task.func)(store.clone()));
+                    let outcome = match fut.catch_unwind().await {
+                        Ok(r) => r,
                         Err(p) => {
                             let msg = if let Some(s) = p.downcast_ref::<&str>() {
                                 s.to_string()
@@ -152,9 +155,14 @@ impl WorkerPool {
                                     100 * (1 << task.retries.min(6)),
                                 );
                                 let pending = pending.clone();
+                                let done_tx_retry = done_tx.clone();
                                 tokio::spawn(async move {
                                     tokio::time::sleep(delay).await;
                                     pending.lock().push(task);
+                                    // Signal pump_pending so the retried task gets
+                                    // dispatched to a worker. Without this, the
+                                    // task sits in `pending` forever.
+                                    let _ = done_tx_retry.send(());
                                 });
                                 let _ = done_tx.send(());
                                 gcs.set_worker_busy(i, false);
