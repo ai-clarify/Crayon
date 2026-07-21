@@ -1,0 +1,37 @@
+crates/crayon-py/.cargo/config.toml
+  s_a94eaa1c02275c::t_adef095c0bfadb 1-7
+crates/crayon-py/pyproject.toml
+  s_3ed83973de6379::t_0c4e9f15eb5039 6,8,11-19
+src/memory.rs
+  s_3ed83973de6379::t_88874a17927fe3 97-110
+src/object_store.rs
+  s_3ed83973de6379::t_80e31ad6194c9e 418-427
+src/status.rs
+  s_3ed83973de6379::t_4154642916bea9 9,22-25,45,47,106-107,129-137,150-161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "619beaea24188eda350276769135fcabc33d3144",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_a94eaa1c02275c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af82449be137fa0e1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
