@@ -33,3 +33,7 @@ path = "src/bin/demo.rs"
 [[bin]]
 name = "crayon-multi"
 path = "src/bin/multi_node_demo.rs"
+
+[[bin]]
+name = "crayon-rl"
+path = "src/bin/rl_sim.rs"
