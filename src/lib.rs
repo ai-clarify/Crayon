@@ -30,6 +30,7 @@ pub mod object_store;
 pub mod resources;
 pub mod scheduler;
 pub mod status;
+pub mod versioning;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,24 +59,24 @@ struct RayInner {
 impl Ray {
     /// Initialize the runtime with `num_workers` worker tasks, each with
     /// 1 CPU and 0 GPU (Ray's default per-worker resources).
+    ///
+    /// Memory management (LRU eviction + disk spilling) is enabled by default
+    /// with a limit of 50% of available RAM. This prevents the OOM kills that
+    /// plague Ray's plasma store — objects are transparently spilled to a temp
+    /// directory when the budget is exceeded. Use [`Ray::init_with_memory`]
+    /// to customize the limit or spill directory.
     pub fn init(num_workers: usize) -> Self {
-        Self::init_with_resources(num_workers, Resources::new(1.0, 0.0))
+        let max_mem = default_memory_budget();
+        let spill_dir = std::env::temp_dir().join(format!("crayon-spill-{}", std::process::id()));
+        Self::init_with_memory(num_workers, max_mem, spill_dir)
     }
 
     /// Initialize the runtime with custom per-worker resources.
+    /// Memory management uses the same defaults as [`Ray::init`].
     pub fn init_with_resources(num_workers: usize, per_worker: Resources) -> Self {
-        let store = ObjectStore::new();
-        let gcs = Gcs::new();
-        let pool = WorkerPool::new(num_workers, per_worker, gcs.clone(), store.clone());
-        let scheduler = Scheduler::new(pool);
-        Ray {
-            inner: Arc::new(RayInner {
-                store,
-                gcs,
-                scheduler,
-                named_actors: parking_lot::Mutex::new(HashMap::new()),
-            }),
-        }
+        let max_mem = default_memory_budget();
+        let spill_dir = std::env::temp_dir().join(format!("crayon-spill-{}", std::process::id()));
+        Self::init_with_memory_and_resources(num_workers, max_mem, spill_dir, per_worker)
     }
 
     /// Initialize with a memory manager for disk spilling.
@@ -84,15 +85,25 @@ impl Ray {
         max_memory_bytes: usize,
         spill_dir: std::path::PathBuf,
     ) -> Self {
+        Self::init_with_memory_and_resources(
+            num_workers,
+            max_memory_bytes,
+            spill_dir,
+            Resources::new(1.0, 0.0),
+        )
+    }
+
+    /// Initialize with both memory management and custom per-worker resources.
+    pub fn init_with_memory_and_resources(
+        num_workers: usize,
+        max_memory_bytes: usize,
+        spill_dir: std::path::PathBuf,
+        per_worker: Resources,
+    ) -> Self {
         let mem = crate::memory::MemoryManager::new(max_memory_bytes, spill_dir);
         let store = ObjectStore::new().with_memory(mem);
         let gcs = Gcs::new();
-        let pool = WorkerPool::new(
-            num_workers,
-            Resources::new(1.0, 0.0),
-            gcs.clone(),
-            store.clone(),
-        );
+        let pool = WorkerPool::new(num_workers, per_worker, gcs.clone(), store.clone());
         let scheduler = Scheduler::new(pool);
         Ray {
             inner: Arc::new(RayInner {
@@ -294,7 +305,7 @@ impl Ray {
 
     /// Snapshot the current system status.
     pub fn status(&self) -> SystemStatus {
-        SystemStatus::snapshot(&self.inner.gcs)
+        SystemStatus::snapshot(&self.inner.gcs, &self.inner.store)
     }
 
     /// Cancel a task by id. The task will be skipped if pending, or its result
@@ -311,8 +322,56 @@ impl Ray {
         &self.inner.store
     }
 
+    /// Create a versioned artifact store for RL checkpoints, rollouts, etc.
+    /// `keep_last` bounds versions per name (0 = unlimited). Old versions are
+    /// evicted automatically — the other half of the OOM story.
+    pub fn versioned_store(&self, keep_last: usize) -> crate::versioning::VersionedStore {
+        crate::versioning::VersionedStore::new(self.inner.store.clone(), keep_last)
+    }
+
     /// Access the GCS directly (advanced).
     pub fn gcs(&self) -> &Gcs {
         &self.inner.gcs
     }
+}
+
+/// Pick a sensible default memory budget: 50% of available RAM, clamped to
+/// `[256 MiB, 32 GiB]`. Falls back to 2 GiB if detection fails.
+///
+/// This is what makes Crayon OOM-safe out of the box — unlike Ray's plasma
+/// store, which grows until the OS OOM-kills the process.
+fn default_memory_budget() -> usize {
+    let total = detect_total_memory_bytes().unwrap_or(2 * 1024 * 1024 * 1024);
+    let budget = total / 2;
+    budget.clamp(256 * 1024 * 1024, 32 * 1024 * 1024 * 1024)
+}
+
+/// Best-effort total system memory detection, no external crates.
+fn detect_total_memory_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+            for line in content.lines() {
+                if line.starts_with("MemTotal:") {
+                    let kb: usize = line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse().ok())?;
+                    return Some(kb * 1024);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let out = Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        return s.trim().parse::<usize>().ok();
+    }
+    #[allow(unreachable_code)]
+    None
 }

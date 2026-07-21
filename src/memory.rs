@@ -94,6 +94,20 @@ impl MemoryManager {
         self.inner.lock().total_bytes
     }
 
+    /// Maximum in-memory bytes before spilling kicks in.
+    pub fn max_memory_bytes(&self) -> usize {
+        self.inner.lock().max_memory_bytes
+    }
+
+    /// Fraction of memory budget currently in use (0.0 to 1.0+).
+    pub fn usage_ratio(&self) -> f64 {
+        let inner = self.inner.lock();
+        if inner.max_memory_bytes == 0 {
+            return 0.0;
+        }
+        inner.total_bytes as f64 / inner.max_memory_bytes as f64
+    }
+
     pub fn spill_path(&self, id: ObjectID) -> PathBuf {
         self.inner.lock().spill_dir.join(format!("{}.bin", id))
     }

@@ -6,6 +6,7 @@
 use serde::Serialize;
 
 use crate::gcs::Gcs;
+use crate::object_store::ObjectStore;
 
 #[derive(Debug, Serialize)]
 pub struct SystemStatus {
@@ -18,6 +19,10 @@ pub struct SystemStatus {
     pub tasks_running: usize,
     pub workers: Vec<WorkerStatus>,
     pub worker_utilization: f64,
+    /// Bytes currently held in the in-memory object store.
+    pub memory_used_bytes: usize,
+    /// Memory budget; objects are spilled to disk beyond this. 0 = unlimited.
+    pub memory_limit_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,8 +42,9 @@ pub struct WorkerStatus {
 }
 
 impl SystemStatus {
-    pub fn snapshot(gcs: &Gcs) -> Self {
+    pub fn snapshot(gcs: &Gcs, store: &ObjectStore) -> Self {
         let objects = gcs.objects().len();
+        let (memory_used_bytes, memory_limit_bytes) = store.memory_stats();
         let actors = gcs
             .actors()
             .into_iter()
@@ -97,6 +103,8 @@ impl SystemStatus {
             tasks_running,
             workers,
             worker_utilization,
+            memory_used_bytes,
+            memory_limit_bytes,
         }
     }
 
@@ -118,6 +126,15 @@ impl SystemStatus {
             self.workers.len(),
             self.worker_utilization * 100.0
         ));
+        if self.memory_limit_bytes > 0 {
+            let pct = self.memory_used_bytes as f64 / self.memory_limit_bytes as f64 * 100.0;
+            s.push_str(&format!(
+                "Memory: {} / {} ({:.0}%)\n",
+                format_bytes(self.memory_used_bytes),
+                format_bytes(self.memory_limit_bytes),
+                pct
+            ));
+        }
         if !self.actors.is_empty() {
             s.push_str("Actors:\n");
             for a in &self.actors {
@@ -129,4 +146,16 @@ impl SystemStatus {
         }
         s
     }
+}
+
+/// Human-readable byte size, e.g. "1.5 GiB".
+fn format_bytes(b: usize) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{:.1} {}", v, UNITS[i])
 }

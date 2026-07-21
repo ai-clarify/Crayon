@@ -415,6 +415,16 @@ impl ObjectStore {
         self.len() == 0
     }
 
+    /// Return (used_bytes, limit_bytes) for the memory manager, if attached.
+    /// `limit_bytes` is 0 when no memory manager is configured.
+    pub fn memory_stats(&self) -> (usize, usize) {
+        if let Some(mem) = self.inner.mem.lock().clone() {
+            (mem.total_bytes(), mem.max_memory_bytes())
+        } else {
+            (0, 0)
+        }
+    }
+
     fn entry(&self, id: ObjectID, owner_node: Option<crate::node::NodeID>) -> Arc<Mutex<Entry>> {
         let mut map = self.inner.map.lock();
         map.entry(id)

@@ -153,15 +153,42 @@ struct Ray {
 #[pymethods]
 impl Ray {
     /// Initialize the runtime with `num_workers` worker threads.
+    ///
+    /// Memory management (LRU eviction + disk spilling) is enabled by default
+    /// with a limit of 50% of available RAM. Pass `max_memory_bytes` and/or
+    /// `spill_dir` to customize — this is what keeps Crayon from OOM-killing
+    /// like Ray's plasma store on large RL workloads.
     #[new]
-    fn new(num_workers: usize) -> PyResult<Self> {
+    #[pyo3(signature = (num_workers, max_memory_bytes=None, spill_dir=None))]
+    fn new(
+        num_workers: usize,
+        max_memory_bytes: Option<usize>,
+        spill_dir: Option<String>,
+    ) -> PyResult<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("failed to build tokio runtime: {e}")))?;
         let runtime = Arc::new(runtime);
 
-        let inner = runtime.block_on(async { RustRay::init(num_workers) });
+        let inner = match (max_memory_bytes, spill_dir) {
+            (None, None) => runtime.block_on(async { RustRay::init(num_workers) }),
+            (mem, dir) => {
+                let max_mem = mem.unwrap_or_else(|| {
+                    // Reuse Rust's default detection when only spill_dir is given.
+                    2 * 1024 * 1024 * 1024
+                });
+                let spill = dir
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::env::temp_dir()
+                            .join(format!("crayon-spill-{}", std::process::id()))
+                    });
+                runtime.block_on(async {
+                    RustRay::init_with_memory(num_workers, max_mem, spill)
+                })
+            }
+        };
 
         Ok(Ray { inner, runtime })
     }
@@ -328,6 +355,8 @@ impl Ray {
             dict.set_item("tasks_pending", status.tasks_pending)?;
             dict.set_item("tasks_running", status.tasks_running)?;
             dict.set_item("worker_utilization", status.worker_utilization)?;
+            dict.set_item("memory_used_bytes", status.memory_used_bytes)?;
+            dict.set_item("memory_limit_bytes", status.memory_limit_bytes)?;
 
             let actors_list = PyList::empty_bound(py);
             for a in &status.actors {
@@ -433,6 +462,96 @@ fn parse_task_id(s: &str) -> PyResult<TaskID> {
     Ok(id)
 }
 
+// ---------------------------------------------------------------------------
+// VersionedStore — RL artifact versioning (checkpoints, rollouts, metrics)
+// ---------------------------------------------------------------------------
+
+/// Versioned artifact store for RL training.
+///
+/// Keeps a bounded history of named artifacts (policy weights, rollout batches,
+/// metrics) so you can roll back, reproduce, and compare across training steps.
+/// Old versions are evicted automatically — part of Crayon's OOM prevention.
+#[pyclass]
+struct VersionedStore {
+    inner: crayon_rs::versioning::VersionedStore,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+#[pymethods]
+impl VersionedStore {
+    /// Create a versioned store. `keep_last` bounds versions per name (0 = unlimited).
+    #[new]
+    fn new(ray: &Ray, keep_last: usize) -> PyResult<Self> {
+        Ok(VersionedStore {
+            inner: ray.inner.versioned_store(keep_last),
+            runtime: ray.runtime.clone(),
+        })
+    }
+
+    /// Store a new version of `name`. If `version` is None, auto-increments.
+    /// Returns the version number used.
+    #[pyo3(signature = (name, value, version=None))]
+    fn put(&self, name: &str, value: &Bound<'_, PyAny>, version: Option<u64>) -> PyResult<u64> {
+        let py = value.py();
+        let bytes = pickle_dumps(py, value)?;
+        let v = version.unwrap_or_else(|| self.inner.latest_version(name) + 1);
+        let meta = self.inner.put_with_version(name, bytes, v);
+        Ok(meta.version)
+    }
+
+    /// Get the latest version of `name`.
+    fn get(&self, name: &str) -> PyResult<PyObject> {
+        let inner = self.inner.clone();
+        let name_owned = name.to_string();
+        let bytes = Python::with_gil(|py| {
+            py.allow_threads(|| {
+                self.runtime.block_on(async move {
+                    inner.get::<Vec<u8>>(&name_owned).await
+                })
+            })
+        })
+        .ok_or_else(|| PyRuntimeError::new_err(format!("no version found for '{name}'")))?;
+        Python::with_gil(|py| pickle_loads(py, &bytes))
+    }
+
+    /// Get a specific version of `name`.
+    fn get_at(&self, name: &str, version: u64) -> PyResult<PyObject> {
+        let inner = self.inner.clone();
+        let name_owned = name.to_string();
+        let bytes = Python::with_gil(|py| {
+            py.allow_threads(|| {
+                self.runtime.block_on(async move {
+                    inner.get_at::<Vec<u8>>(&name_owned, version).await
+                })
+            })
+        })
+        .ok_or_else(|| PyRuntimeError::new_err(format!("version {version} of '{name}' not found")))?;
+        Python::with_gil(|py| pickle_loads(py, &bytes))
+    }
+
+    /// List all versions of `name` as (version, created_at) tuples.
+    fn history(&self, name: &str) -> PyResult<PyObject> {
+        let history = self.inner.history(name);
+        Python::with_gil(|py| {
+            let list = PyList::empty_bound(py);
+            for m in history {
+                list.append((m.version, m.created_at))?;
+            }
+            Ok(list.unbind().into_any())
+        })
+    }
+
+    /// Latest version number for `name`, or 0 if none.
+    fn latest_version(&self, name: &str) -> u64 {
+        self.inner.latest_version(name)
+    }
+
+    /// Delete all versions of `name`.
+    fn remove(&self, name: &str) {
+        self.inner.remove(name);
+    }
+}
+
 /// Module definition.
 #[pymodule]
 fn crayon(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -440,5 +559,6 @@ fn crayon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ObjectRef>()?;
     m.add_class::<Resources>()?;
     m.add_class::<ActorHandle>()?;
+    m.add_class::<VersionedStore>()?;
     Ok(())
 }
