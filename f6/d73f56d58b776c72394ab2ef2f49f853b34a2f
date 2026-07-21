@@ -1,0 +1,27 @@
+src/actor.rs
+  s_3ed83973de6379::t_28e13a6e63e6e2 246-269,275-294,297-302,306-310,313-336
+src/lib.rs
+  s_3ed83973de6379::t_35cbd404a5443a 124-127,131-134
+src/node.rs
+  s_3ed83973de6379::t_968a98ce85ac48 80-82,84,128-130,136-139,153-154,156-161,310-311,318,526-528,532-536
+tests/e2e.rs
+  s_3ed83973de6379::t_59561e1b8785d1 219-220,222-223,226,231-232,235
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f6d73f56d58b776c72394ab2ef2f49f853b34a2f",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
