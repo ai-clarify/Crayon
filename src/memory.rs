@@ -78,13 +78,16 @@ impl MemoryManager {
         inner.lru.push(id);
     }
 
-    /// Record that an object was removed.
+    /// Record that an object was removed. Also deletes its spill file if any.
     pub fn remove(&self, id: ObjectID) {
         let mut inner = self.inner.lock();
         if let Some(sz) = inner.sizes.remove(&id) {
             inner.total_bytes -= sz;
         }
         inner.lru.retain(|x| *x != id);
+        // Clean up spill file to prevent disk leaks (#53261 analog).
+        let path = inner.spill_dir.join(format!("{}.bin", id));
+        std::fs::remove_file(&path).ok();
     }
 
     pub fn total_bytes(&self) -> usize {

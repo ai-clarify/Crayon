@@ -213,11 +213,24 @@ impl Ray {
 
     /// Spawn a stateful actor with the given initial state. If `name` is
     /// non-empty, the actor is registered and can later be retrieved with
-    /// [`Ray::get_actor`].
-    pub fn create_actor<S: Send + 'static>(&self, name: &str, state: S) -> ActorHandle<S> {
+    /// [`Ray::get_actor`]. The actor does not restart on panic by default.
+    pub fn create_actor<S: Send + Clone + 'static>(&self, name: &str, state: S) -> ActorHandle<S> {
+        self.create_actor_with_restarts(name, state, 0)
+    }
+
+    /// Like [`Ray::create_actor`] but with a custom `max_restarts` count.
+    /// On panic, the actor is reset to its initial state and continues
+    /// (up to `max_restarts` times).
+    pub fn create_actor_with_restarts<S: Send + Clone + 'static>(
+        &self,
+        name: &str,
+        state: S,
+        max_restarts: u32,
+    ) -> ActorHandle<S> {
         let handle = spawn_actor(
             name,
             state,
+            max_restarts,
             self.inner.gcs.clone(),
             self.inner.store.clone(),
         );

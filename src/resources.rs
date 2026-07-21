@@ -67,8 +67,21 @@ impl ResourceTracker {
 
     /// Try to reserve `needed` resources on some worker. Returns the worker id
     /// if one had enough free resources, else `None`.
+    ///
+    /// If the task needs no GPU, prefers workers with no GPU total to avoid
+    /// wasting expensive GPU nodes on CPU-only work (#47866 analog).
     pub fn try_acquire(&self, needed: &Resources) -> Option<usize> {
         let mut workers = self.inner.lock();
+        // First pass: if no GPU needed, prefer CPU-only workers.
+        if needed.gpu == 0.0 {
+            for (i, w) in workers.iter_mut().enumerate() {
+                if w.total.gpu == 0.0 && w.available.can_fit(needed) {
+                    w.available.subtract(needed);
+                    return Some(i);
+                }
+            }
+        }
+        // Second pass: any worker that fits.
         for (i, w) in workers.iter_mut().enumerate() {
             if w.available.can_fit(needed) {
                 w.available.subtract(needed);

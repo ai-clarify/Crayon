@@ -130,10 +130,13 @@ impl<S: Send + 'static> ActorHandle<S> {
     }
 }
 
-/// Spawn a new actor with the given initial state.
-pub fn spawn_actor<S: Send + 'static>(
+/// Spawn a new actor with the given initial state. If `max_restarts > 0`,
+/// the actor will be restarted from its initial state on panic (Ray's
+/// `max_restarts`). Each restart resets the state to the original value.
+pub fn spawn_actor<S: Send + Clone + 'static>(
     name: &str,
     state: S,
+    max_restarts: u32,
     gcs: Gcs,
     store: ObjectStore,
 ) -> ActorHandle<S> {
@@ -149,34 +152,45 @@ pub fn spawn_actor<S: Send + 'static>(
 
     let (tx, mut rx) = mpsc::channel::<Call>(ACTOR_MAILBOX_SIZE);
     let gcs_clone = gcs.clone();
+    let initial_state = state.clone();
 
     tokio::spawn(async move {
+        let mut restarts = 0;
         let mut state: Box<dyn Any + Send> = Box::new(state);
-        while let Some(call) = rx.recv().await {
-            gcs_clone.set_actor_state(id, ActorState::Running);
-            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (call.func)(state.as_mut())
-            })) {
-                Ok(v) => v,
-                Err(p) => {
-                    // Actor method panicked. State may be corrupted — mark the
-                    // actor dead and stop processing (Ray's default behavior).
-                    // Callers get ActorDead on subsequent calls.
-                    let msg = if let Some(s) = p.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = p.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "actor method panicked".into()
-                    };
-                    let _ = call.reply.send(bincode::serialize(&msg).unwrap());
-                    gcs_clone.set_actor_state(id, ActorState::Dead);
-                    break;
-                }
-            };
-            let _ = call.reply.send(result);
+        loop {
+            while let Some(call) = rx.recv().await {
+                gcs_clone.set_actor_state(id, ActorState::Running);
+                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (call.func)(state.as_mut())
+                })) {
+                    Ok(v) => v,
+                    Err(p) => {
+                        let msg = if let Some(s) = p.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = p.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "actor method panicked".into()
+                        };
+                        let _ = call.reply.send(bincode::serialize(&msg).unwrap());
+                        if restarts < max_restarts {
+                            // Reset to initial state and keep going.
+                            restarts += 1;
+                            state = Box::new(initial_state.clone());
+                            gcs_clone.set_actor_state(id, ActorState::Running);
+                        } else {
+                            gcs_clone.set_actor_state(id, ActorState::Dead);
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                let _ = call.reply.send(result);
+            }
+            // Mailbox closed — actor is done.
+            gcs_clone.set_actor_state(id, ActorState::Dead);
+            return;
         }
-        gcs_clone.set_actor_state(id, ActorState::Dead);
     });
 
     ActorHandle {

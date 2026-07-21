@@ -4,7 +4,7 @@
 
 use crayon::Ray;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Counter {
     n: i64,
 }
