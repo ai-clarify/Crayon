@@ -8,7 +8,7 @@ repository = "https://github.com/cklxx/crayon"
 homepage = "https://github.com/cklxx/crayon"
 documentation = "https://docs.rs/crayon"
 readme = "README.md"
-keywords = ["ray", "distributed", "rl", "reinforcement-learning", "actor"]
+keywords = ["ray", "distributed", "rl", "actor", "scheduling"]
 categories = ["concurrency", "distributed-computing", "science"]
 
 [lib]
