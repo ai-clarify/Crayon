@@ -23,19 +23,27 @@ pub(crate) struct Call {
     reply: oneshot::Sender<Vec<u8>>,
 }
 
+/// Default mailbox size for actors. When full, `call` awaits — this is the
+/// backpressure that prevents a slow actor (e.g. a parameter server) from
+/// being flooded by fast producers (e.g. rollout workers).
+const ACTOR_MAILBOX_SIZE: usize = 256;
+
 /// Type-erased actor handle internals. Stored in the named-actor registry so
 /// that `get_actor` can look an actor up by name without knowing its state
 /// type `S` at registration time.
 pub struct ActorHandleInner {
     pub id: ActorID,
-    tx: mpsc::UnboundedSender<Call>,
+    tx: mpsc::Sender<Call>,
     store: ObjectStore,
     gcs: Gcs,
 }
 
 impl ActorHandleInner {
-    pub(crate) fn send_call(&self, call: Call) -> Result<(), CrayonError> {
-        self.tx.send(call).map_err(|_| CrayonError::ActorDead(self.id))
+    pub(crate) async fn send_call(&self, call: Call) -> Result<(), CrayonError> {
+        self.tx
+            .send(call)
+            .await
+            .map_err(|_| CrayonError::ActorDead(self.id))
     }
 
     pub(crate) fn store(&self) -> &ObjectStore {
@@ -96,7 +104,7 @@ impl<S: Send + 'static> ActorHandle<S> {
         });
 
         let (reply, rx) = oneshot::channel();
-        self.inner.send_call(Call { func: erased, reply })?;
+        self.inner.send_call(Call { func: erased, reply }).await?;
 
         let store = self.inner.store().clone();
         let gcs = self.inner.gcs().clone();
@@ -139,7 +147,7 @@ pub fn spawn_actor<S: Send + 'static>(
         completed_tasks: 0,
     });
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Call>();
+    let (tx, mut rx) = mpsc::channel::<Call>(ACTOR_MAILBOX_SIZE);
     let gcs_clone = gcs.clone();
 
     tokio::spawn(async move {
@@ -151,6 +159,9 @@ pub fn spawn_actor<S: Send + 'static>(
             })) {
                 Ok(v) => v,
                 Err(p) => {
+                    // Actor method panicked. State may be corrupted — mark the
+                    // actor dead and stop processing (Ray's default behavior).
+                    // Callers get ActorDead on subsequent calls.
                     let msg = if let Some(s) = p.downcast_ref::<&str>() {
                         s.to_string()
                     } else if let Some(s) = p.downcast_ref::<String>() {
@@ -158,7 +169,9 @@ pub fn spawn_actor<S: Send + 'static>(
                     } else {
                         "actor method panicked".into()
                     };
-                    bincode::serialize(&msg).unwrap()
+                    let _ = call.reply.send(bincode::serialize(&msg).unwrap());
+                    gcs_clone.set_actor_state(id, ActorState::Dead);
+                    break;
                 }
             };
             let _ = call.reply.send(result);

@@ -186,12 +186,15 @@ impl Ray {
         let output_id = ObjectID::new();
         let args = Arc::new(args);
         let func = Arc::new(func);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task = Task {
             id,
             output_id,
             resources,
             max_retries,
             retries: 0,
+            priority: 0,
+            cancelled,
             func: Arc::new(move |store: ObjectStore| {
                 let args = args.clone();
                 let func = func.clone();
@@ -242,6 +245,15 @@ impl Ray {
     /// Snapshot the current system status.
     pub fn status(&self) -> SystemStatus {
         SystemStatus::snapshot(&self.inner.gcs)
+    }
+
+    /// Cancel a task by id. The task will be skipped if pending, or its result
+    /// discarded if already running. Returns `false` if the id is unknown.
+    ///
+    /// Critical for RL: stale rollouts from an outdated policy must be killed
+    /// to free resources for the new policy.
+    pub fn cancel(&self, task_id: crate::common::TaskID) -> bool {
+        self.inner.scheduler.cancel_task(task_id)
     }
 
     /// Access the object store directly (advanced).

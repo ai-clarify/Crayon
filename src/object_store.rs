@@ -84,6 +84,16 @@ impl ObjectStore {
         ObjectRef::new(id, refcount, self.downgrade())
     }
 
+    /// Store many objects at once. Returns one `ObjectRef` per input. Amortizes
+    /// lock acquisition — critical for high-throughput workloads like RL
+    /// experience replay, where thousands of samples are pushed per step.
+    pub fn put_batch<T: serde::Serialize + Send + 'static>(
+        &self,
+        values: Vec<T>,
+    ) -> Vec<ObjectRef<T>> {
+        values.into_iter().map(|v| self.put(v)).collect()
+    }
+
     pub fn put_with_id<T: serde::Serialize + Send + 'static>(&self, id: ObjectID, value: T) {
         let bytes = bincode::serialize(&value).expect("bincode serialize should not fail");
         self.put_bytes(id, bytes, None);
@@ -131,6 +141,24 @@ impl ObjectStore {
     ) -> Result<T, CrayonError> {
         let bytes = self.get_bytes(id).await?;
         bincode::deserialize(&bytes).map_err(|e| CrayonError::Serialize(e.to_string()))
+    }
+
+    /// Fetch many objects concurrently. Returns results in input order. For RL
+    /// training this is the hot path: pulling a batch of rollout samples should
+    /// be one concurrent fan-out, not N sequential RPCs.
+    pub async fn get_batch<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        ids: &[ObjectID],
+    ) -> Vec<Result<T, CrayonError>> {
+        let store = self.clone();
+        let futs: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let store = store.clone();
+                async move { store.get::<T>(*id).await }
+            })
+            .collect();
+        futures::future::join_all(futs).await
     }
 
     pub async fn get_bytes(&self, id: ObjectID) -> Result<Vec<u8>, CrayonError> {

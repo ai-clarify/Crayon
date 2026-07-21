@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use std::sync::atomic::AtomicBool;
+
 use futures::future::BoxFuture;
 use parking_lot::Mutex as PlMutex;
 use tokio::sync::mpsc;
@@ -25,9 +27,31 @@ pub struct Task {
     pub resources: Resources,
     pub max_retries: u32,
     pub retries: u32,
+    pub priority: u8,
+    pub cancelled: Arc<AtomicBool>,
     pub func: Arc<
         dyn Fn(ObjectStore) -> BoxFuture<'static, Result<Vec<u8>, CrayonError>> + Send + Sync,
     >,
+}
+
+impl PartialEq for Task {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority
+    }
+}
+
+impl Eq for Task {}
+
+impl PartialOrd for Task {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Task {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority.cmp(&other.priority)
+    }
 }
 
 impl std::fmt::Debug for Task {
@@ -42,13 +66,15 @@ impl std::fmt::Debug for Task {
 /// A pool of workers that pull tasks from per-worker queues.
 pub struct WorkerPool {
     worker_tx: Vec<mpsc::UnboundedSender<Task>>,
-    pending: Arc<PlMutex<Vec<Task>>>,
+    pending: Arc<PlMutex<std::collections::BinaryHeap<Task>>>,
     gcs: Gcs,
     store: ObjectStore,
     tracker: Arc<ResourceTracker>,
     num_workers: usize,
     /// Workers send a signal here when they finish a task (releasing resources).
     done_tx: mpsc::UnboundedSender<()>,
+    /// Maps task id -> cancellation flag. Set by `cancel_task`.
+    cancel_tokens: Arc<PlMutex<std::collections::HashMap<TaskID, Arc<AtomicBool>>>>,
 }
 
 impl WorkerPool {
@@ -62,7 +88,10 @@ impl WorkerPool {
         let tracker = Arc::new(ResourceTracker::new(num_workers, per_worker));
         let mut worker_tx = Vec::with_capacity(num_workers);
         let (done_tx, done_rx) = mpsc::unbounded_channel::<()>();
-        let pending: Arc<PlMutex<Vec<Task>>> = Arc::new(PlMutex::new(Vec::new()));
+        let pending: Arc<PlMutex<std::collections::BinaryHeap<Task>>> =
+            Arc::new(PlMutex::new(std::collections::BinaryHeap::new()));
+        let cancel_tokens: Arc<PlMutex<std::collections::HashMap<TaskID, Arc<AtomicBool>>>> =
+            Arc::new(PlMutex::new(std::collections::HashMap::new()));
 
         for i in 0..num_workers {
             gcs.add_worker(i);
@@ -78,6 +107,19 @@ impl WorkerPool {
                 while let Some(mut task) = rx.recv().await {
                     let res = task.resources;
                     gcs.set_worker_busy(i, true);
+
+                    // Check for cancellation before running.
+                    if task.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        let msg = "task cancelled".to_string();
+                        let bytes = bincode::serialize(&msg).unwrap();
+                        store.put_bytes(task.output_id, bytes, None);
+                        gcs.set_task_state(task.id, TaskState::Failed, Some(task.output_id));
+                        gcs.set_worker_busy(i, false);
+                        tracker.release(i, &res);
+                        let _ = done_tx.send(());
+                        continue;
+                    }
+
                     gcs.set_task_state(task.id, TaskState::Running, None);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         (task.func)(store.clone())
@@ -104,7 +146,15 @@ impl WorkerPool {
                             if task.retries < task.max_retries {
                                 task.retries += 1;
                                 gcs.set_task_state(task.id, TaskState::Pending, None);
-                                pending.lock().push(task);
+                                // Exponential backoff: 100ms * 2^retries, capped at 5s.
+                                let delay = std::time::Duration::from_millis(
+                                    100 * (1 << task.retries.min(6)),
+                                );
+                                let pending = pending.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(delay).await;
+                                    pending.lock().push(task);
+                                });
                                 let _ = done_tx.send(());
                                 gcs.set_worker_busy(i, false);
                                 tracker.release(i, &res);
@@ -130,6 +180,7 @@ impl WorkerPool {
             tracker,
             num_workers,
             done_tx,
+            cancel_tokens,
         });
 
         // Background task: when a worker finishes, retry pending tasks that
@@ -148,6 +199,17 @@ impl WorkerPool {
     /// Submit a task to the pool. Tries to acquire resources; if no worker can
     /// fit the task right now, it's queued and retried when resources free up.
     pub fn submit(self: &Arc<Self>, task: Task) -> Result<(), CrayonError> {
+        // Deadlock guard: if no worker has enough *total* resources to ever
+        // fit this task, it would queue forever. Fail fast instead.
+        if !self.tracker.can_any_worker_fit(&task.resources) {
+            return Err(CrayonError::TaskFailed(format!(
+                "task requires {:?} but no worker has enough total resources",
+                task.resources
+            )));
+        }
+        self.cancel_tokens
+            .lock()
+            .insert(task.id, task.cancelled.clone());
         self.gcs.add_task(crate::gcs::TaskMeta {
             id: task.id,
             state: TaskState::Pending,
@@ -158,6 +220,18 @@ impl WorkerPool {
         self.store.reserve(task.output_id);
         self.dispatch(task);
         Ok(())
+    }
+
+    /// Cancel a task by id. If the task is pending or running, it will be
+    /// skipped (or aborted at the next checkpoint) and its output will be
+    /// marked as failed. Returns `false` if the task id is unknown.
+    pub fn cancel_task(&self, id: TaskID) -> bool {
+        if let Some(token) = self.cancel_tokens.lock().get(&id) {
+            token.store(true, std::sync::atomic::Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// Try to send a task to a worker with sufficient resources.
@@ -172,10 +246,14 @@ impl WorkerPool {
         }
     }
 
-    /// Called when resources are released; retries pending tasks.
+    /// Called when resources are released; retries pending tasks in priority
+    /// order (highest priority first).
     pub fn pump_pending(self: &Arc<Self>) {
-        let pending: Vec<Task> = std::mem::take(&mut *self.pending.lock());
-        for task in pending {
+        let tasks: Vec<Task> = {
+            let mut p = self.pending.lock();
+            std::iter::from_fn(|| p.pop()).collect()
+        };
+        for task in tasks {
             self.dispatch(task);
         }
     }
@@ -201,6 +279,11 @@ impl Scheduler {
 
     pub fn schedule(&self, task: Task) -> Result<(), CrayonError> {
         self.pool.submit(task)
+    }
+
+    /// Cancel a task by id. See [`WorkerPool::cancel_task`].
+    pub fn cancel_task(&self, id: crate::common::TaskID) -> bool {
+        self.pool.cancel_task(id)
     }
 
     /// Retry any tasks that were queued waiting for resources.

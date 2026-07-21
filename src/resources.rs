@@ -90,4 +90,11 @@ impl ResourceTracker {
     pub fn snapshot(&self) -> Vec<Resources> {
         self.inner.lock().iter().map(|w| w.available).collect()
     }
+
+    /// Returns true if at least one worker has enough *total* resources to
+    /// ever fit this request. If false, the task can never be scheduled and
+    /// would deadlock — the caller should fail fast instead of queueing.
+    pub fn can_any_worker_fit(&self, needed: &Resources) -> bool {
+        self.inner.lock().iter().any(|w| w.total.can_fit(needed))
+    }
 }
