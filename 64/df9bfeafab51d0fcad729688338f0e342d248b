@@ -1,0 +1,37 @@
+examples/bench.rs
+  s_3ed83973de6379::t_1c8b231cb00a6e 22-40,57,64
+src/actor.rs
+  s_3ed83973de6379::t_3460f2abc8cf80 205-208
+src/bin/multi_node_demo.rs
+  s_3ed83973de6379::t_d9f76740b5f419 42,63
+src/common.rs
+  s_3ed83973de6379::t_b5eec08408acbd 233-247
+src/lib.rs
+  s_3ed83973de6379::t_289d7a806896d1 123
+src/object_store.rs
+  s_3ed83973de6379::t_bb799fb468c548 91,94,101,111-114
+src/resources.rs
+  s_3ed83973de6379::t_6bb3e057c0cc44 47-51,61-62,66-68,73-74,79,81
+src/scheduler.rs
+  s_3ed83973de6379::t_f8c0daa4fc7a86 138
+tests/e2e.rs
+  s_3ed83973de6379::t_2416bc3f4a1414 36,54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "64df9bfeafab51d0fcad729688338f0e342d248b",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
