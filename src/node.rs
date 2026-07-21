@@ -55,11 +55,13 @@ pub enum Message {
     GetObject(ObjectID),
     ObjectData(ObjectID, Vec<u8>),
     ObjectNotFound(ObjectID),
-    /// Periodic GCS sync: object locations + task states from the sender.
-    /// Only carries serializable fields (no Instant timestamps).
+    /// Periodic GCS sync: object locations, task states, and actor metadata
+    /// from the sender. Only carries serializable fields (no Instant timestamps).
     GcsSync {
         objects: Vec<(ObjectID, usize)>, // (id, size_bytes)
         tasks: Vec<(crate::common::TaskID, crate::common::TaskState)>,
+        /// (id, name, state) — lets peers discover named actors across nodes.
+        actors: Vec<(crate::common::ActorID, String, crate::common::ActorState)>,
     },
 }
 
@@ -281,7 +283,16 @@ impl Node {
             .into_iter()
             .map(|t| (t.id, t.state))
             .collect();
-        let msg = Message::GcsSync { objects, tasks };
+        let actors: Vec<_> = gcs
+            .actors()
+            .into_iter()
+            .map(|a| (a.id, a.name, a.state))
+            .collect();
+        let msg = Message::GcsSync {
+            objects,
+            tasks,
+            actors,
+        };
         let peers: Vec<_> = self.peers.lock().values().map(|p| p.addr.clone()).collect();
         for addr in peers {
             let pool = self.pool.clone();
@@ -391,9 +402,13 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                     conn.send(&Message::ObjectNotFound(id)).await?;
                 }
             }
-            Message::GcsSync { objects, tasks } => {
+            Message::GcsSync {
+                objects,
+                tasks,
+                actors,
+            } => {
                 // Merge peer's metadata into our GCS so we know object
-                // locations and task states across the cluster.
+                // locations, task states, and actor locations across the cluster.
                 if let Some(gcs) = node.gcs.lock().clone() {
                     for (id, size_bytes) in objects {
                         gcs.add_object(crate::gcs::ObjectMeta {
@@ -411,6 +426,22 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                             finished_at: None,
                             output: None,
                         });
+                    }
+                    for (id, name, state) in actors {
+                        // Upsert: insert if new, otherwise just update state so
+                        // we don't clobber local task counters.
+                        if gcs.get_actor(id).is_some() {
+                            gcs.set_actor_state(id, state);
+                        } else {
+                            gcs.add_actor(crate::gcs::ActorMeta {
+                                id,
+                                name,
+                                state,
+                                created_at: std::time::Instant::now(),
+                                pending_tasks: 0,
+                                completed_tasks: 0,
+                            });
+                        }
                     }
                 }
             }

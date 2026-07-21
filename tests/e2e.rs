@@ -79,6 +79,77 @@ async fn distributed_metadata_sync() {
     assert_eq!(obj.unwrap().size_bytes, 4); // i32 = 4 bytes in bincode
 }
 
+/// Test that named actors are discoverable across nodes via GCS sync.
+/// An actor created on the head node should appear in the worker's GCS
+/// with the correct name and state, and state changes (e.g. kill) propagate.
+#[tokio::test]
+async fn distributed_actor_discovery() {
+    use crayon::common::ActorState;
+    use crayon::gcs::Gcs;
+
+    let store1 = ObjectStore::new();
+    let store2 = ObjectStore::new();
+    let gcs1 = Gcs::new();
+    let gcs2 = Gcs::new();
+
+    let head = Node::start("127.0.0.1:0", None, store1.clone())
+        .await
+        .unwrap();
+    let head_addr = head.addr.clone();
+    head.with_gcs(gcs1.clone());
+
+    let worker = Node::start("127.0.0.1:0", Some(&head_addr), store2.clone())
+        .await
+        .unwrap();
+    worker.with_gcs(gcs2.clone());
+
+    // Create a named actor on the head node
+    #[derive(Clone, Default)]
+    #[allow(dead_code)]
+    struct Counter(u64);
+    let ray = crayon::Ray::init_with_memory(1, 1024 * 1024, std::env::temp_dir().join("crayon_actor_test"));
+    let actor = ray.create_actor("counter", Counter(0));
+    let actor_id = actor.id();
+
+    // Manually register the actor in head's GCS (Ray::create_actor does this
+    // via spawn_actor, but that uses a different Gcs instance — replicate here
+    // so the head's synced GCS knows about it).
+    gcs1.add_actor(crayon::gcs::ActorMeta {
+        id: actor_id,
+        name: "counter".to_string(),
+        state: ActorState::Running,
+        created_at: std::time::Instant::now(),
+        pending_tasks: 0,
+        completed_tasks: 0,
+    });
+
+    // Wait for periodic sync (every 2s) + registration
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    // Worker's GCS should now know about the actor from head
+    let meta = gcs2.get_actor(actor_id);
+    assert!(
+        meta.is_some(),
+        "worker GCS should have synced actor metadata from head"
+    );
+    let meta = meta.unwrap();
+    assert_eq!(meta.name, "counter");
+    assert_eq!(meta.state, ActorState::Running);
+
+    // Kill the actor on head — state change should propagate to worker
+    actor.kill();
+    gcs1.set_actor_state(actor_id, ActorState::Dead);
+
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    let meta = gcs2.get_actor(actor_id).unwrap();
+    assert_eq!(
+        meta.state,
+        ActorState::Dead,
+        "actor state change (Dead) should propagate to worker"
+    );
+}
+
 #[tokio::test]
 async fn disk_spilling() {
     let spill_dir = std::env::temp_dir().join("crayon_spill_test");
