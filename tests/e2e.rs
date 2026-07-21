@@ -198,11 +198,11 @@ async fn cross_node_actor_call() {
 
     let actor = ray_head.create_actor("counter", Counter { count: 0 });
 
-    // Register a named method: takes serialized u64 (delta), returns serialized u64
-    actor.register_method("inc", |state: &mut Counter, args: Vec<u8>| {
-        let delta: u64 = bincode::deserialize(&args).unwrap_or(0);
+    // Register a typed method: takes u64 delta, returns u64 count.
+    // Serialization is handled automatically — no bincode boilerplate.
+    actor.register_method_typed("inc", |state: &mut Counter, delta: u64| -> u64 {
         state.count += delta;
-        bincode::serialize(&state.count).unwrap()
+        state.count
     });
 
     // Wait for GCS sync (every 2s) so worker discovers the actor
@@ -216,20 +216,18 @@ async fn cross_node_actor_call() {
         "discovered actor should have an owner node"
     );
 
-    // Call the method remotely — routes worker -> head -> actor task.
-    // call_named now returns an ObjectRef, same as local call().
-    let args = bincode::serialize(&42u64).unwrap();
+    // Call the method remotely with typed args — routes worker -> head -> actor.
+    // call_typed returns ObjectRef<u64>, same as local call().
     let r = remote_actor
-        .call_named::<u64>("inc", args)
+        .call_typed::<u64, u64>("inc", 42u64)
         .await
         .expect("cross-node actor call should succeed");
     let result: u64 = ray_worker.get(&r).await.unwrap();
     assert_eq!(result, 42, "first call should return 0 + 42 = 42");
 
     // Call again to verify stateful behavior across the network
-    let args = bincode::serialize(&8u64).unwrap();
     let r = remote_actor
-        .call_named::<u64>("inc", args)
+        .call_typed::<u64, u64>("inc", 8u64)
         .await
         .expect("second cross-node actor call should succeed");
     let result: u64 = ray_worker.get(&r).await.unwrap();
