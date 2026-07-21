@@ -49,19 +49,44 @@ pub struct ResourceTracker {
 struct WorkerResources {
     available: Resources,
     total: Resources,
+    /// GPU device id assigned to this worker, if it has GPU resources.
+    gpu_device: Option<usize>,
 }
 
 impl ResourceTracker {
+    /// Create a tracker with `num_workers` workers, each with `per_worker`
+    /// resources. Workers with GPU resources are assigned sequential device ids
+    /// (0, 1, 2, ...) up to the number of GPUs detected on this node.
     pub fn new(num_workers: usize, per_worker: Resources) -> Self {
+        let gpu_count = crate::device::detect_gpu_count();
+        let mut next_device = 0usize;
         let workers = (0..num_workers)
-            .map(|_| WorkerResources {
-                available: per_worker,
-                total: per_worker,
+            .map(|_| {
+                let gpu_device = if per_worker.gpu > 0.0 && next_device < gpu_count {
+                    let d = next_device;
+                    next_device += 1;
+                    Some(d)
+                } else {
+                    None
+                };
+                WorkerResources {
+                    available: per_worker,
+                    total: per_worker,
+                    gpu_device,
+                }
             })
             .collect();
         ResourceTracker {
             inner: Mutex::new(workers),
         }
+    }
+
+    /// The GPU device id assigned to `worker_id`, or `None` if it has no GPU.
+    pub fn gpu_device(&self, worker_id: usize) -> Option<usize> {
+        self.inner
+            .lock()
+            .get(worker_id)
+            .and_then(|w| w.gpu_device)
     }
 
     /// Try to reserve `needed` resources on some worker. Returns the worker id

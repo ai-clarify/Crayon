@@ -21,8 +21,10 @@
 //! ```
 
 pub mod actor;
+pub mod affinity;
 pub mod args;
 pub mod common;
+pub mod device;
 pub mod gcs;
 pub mod memory;
 pub mod node;
@@ -119,9 +121,10 @@ impl Ray {
     /// reference. When the last clone is dropped, the object is evicted.
     pub fn put<T: serde::Serialize + Send + 'static>(&self, value: T) -> ObjectRef<T> {
         let r = self.inner.store.put(value);
+        let size = self.inner.store.object_size(r.id);
         self.inner.gcs.add_object(crate::gcs::ObjectMeta {
             id: r.id,
-            size_bytes: 0, // ponytail: track real size when serializing
+            size_bytes: size,
             created_at: std::time::Instant::now(),
             owner: None,
         });

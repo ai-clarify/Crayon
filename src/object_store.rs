@@ -46,6 +46,8 @@ struct Entry {
     /// True while the object is being asynchronously written to disk.
     /// Readers must wait for it to finish (or fail) before reading from disk.
     spilling: bool,
+    /// Size in bytes, for GCS metadata and memory accounting.
+    size_bytes: usize,
 }
 
 pub(crate) struct StoreInner {
@@ -120,6 +122,7 @@ impl ObjectStore {
         {
             let mut e = entry.lock();
             e.value = Some(bytes);
+            e.size_bytes = size;
             e.spilled = false;
             e.notify.notify_waiters();
         }
@@ -425,6 +428,16 @@ impl ObjectStore {
         }
     }
 
+    /// Size in bytes of a stored object, or 0 if not found / not yet materialized.
+    pub fn object_size(&self, id: ObjectID) -> usize {
+        self.inner
+            .map
+            .lock()
+            .get(&id)
+            .map(|e| e.lock().size_bytes)
+            .unwrap_or(0)
+    }
+
     fn entry(&self, id: ObjectID, owner_node: Option<crate::node::NodeID>) -> Arc<Mutex<Entry>> {
         let mut map = self.inner.map.lock();
         map.entry(id)
@@ -437,6 +450,7 @@ impl ObjectStore {
                     owner_node,
                     spilled: false,
                     spilling: false,
+                    size_bytes: 0,
                 }))
             })
             .clone()

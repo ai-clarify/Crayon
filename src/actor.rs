@@ -24,7 +24,7 @@ pub(crate) type ActorMethod = Box<dyn FnOnce(&mut dyn Any) -> Vec<u8> + Send>;
 
 pub(crate) struct Call {
     func: ActorMethod,
-    reply: oneshot::Sender<Vec<u8>>,
+    reply: oneshot::Sender<Result<Vec<u8>, CrayonError>>,
 }
 
 /// Default mailbox size for actors. When full, `call` awaits — this is the
@@ -130,12 +130,18 @@ impl<S: Send + 'static> ActorHandle<S> {
         let id = self.inner.id;
         tokio::spawn(async move {
             match rx.await {
-                Ok(bytes) => {
+                Ok(Ok(bytes)) => {
                     store.put_bytes(output_id, bytes, None);
                     gcs.record_actor_task(id, true);
                 }
+                Ok(Err(e)) => {
+                    store.put_error(output_id, e);
+                    gcs.record_actor_task(id, true);
+                }
                 Err(_) => {
-                    // ponytail: surface a proper error to the caller.
+                    // Actor died (mailbox closed). Surface the error to the caller
+                    // instead of leaving them hanging on `get()`.
+                    store.put_error(output_id, CrayonError::ActorDead(id));
                 }
             }
         });
@@ -194,7 +200,7 @@ pub fn spawn_actor<S: Send + Clone + 'static>(
                 let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     (call.func)(state.as_mut())
                 })) {
-                    Ok(v) => v,
+                    Ok(v) => Ok(v),
                     Err(p) => {
                         let msg = if let Some(s) = p.downcast_ref::<&str>() {
                             s.to_string()
@@ -203,7 +209,7 @@ pub fn spawn_actor<S: Send + Clone + 'static>(
                         } else {
                             "actor method panicked".into()
                         };
-                        let _ = call.reply.send(bincode::serialize(&msg).unwrap());
+                        let _ = call.reply.send(Err(CrayonError::TaskFailed(msg)));
                         if restarts < max_restarts {
                             // Reset to initial state and keep going.
                             restarts += 1;

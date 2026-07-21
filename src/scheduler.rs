@@ -127,6 +127,10 @@ impl WorkerPool {
                     }
 
                     gcs.set_task_state(task.id, TaskState::Running, None);
+                    // Pin the GPU device for this task, if the worker has one.
+                    // Set before every task because tokio may migrate the task
+                    // across worker threads.
+                    crate::device::set_current_device(tracker.gpu_device(i));
                     use futures::FutureExt;
                     let fut = std::panic::AssertUnwindSafe((task.func)(store.clone()));
                     let outcome = match fut.catch_unwind().await {
