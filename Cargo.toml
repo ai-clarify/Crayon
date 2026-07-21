@@ -11,6 +11,9 @@ readme = "README.md"
 keywords = ["ray", "distributed", "rl", "reinforcement-learning", "actor"]
 categories = ["concurrency", "distributed-computing", "science"]
 
+[lib]
+name = "crayon"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
