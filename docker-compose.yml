@@ -1,0 +1,20 @@
+services:
+  head:
+    build: .
+    command: ["crayon-multi", "--head", "--addr", "0.0.0.0:7000"]
+    ports:
+      - "7000:7000"
+    networks:
+      - crayon-net
+
+  worker:
+    build: .
+    command: ["crayon-multi", "--worker", "head:7000", "--addr", "0.0.0.0:7001"]
+    depends_on:
+      - head
+    networks:
+      - crayon-net
+
+networks:
+  crayon-net:
+    driver: bridge

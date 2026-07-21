@@ -1,0 +1,25 @@
+[package]
+name = "crayon"
+version = "0.1.0"
+edition = "2021"
+description = "Crayon: a Rust reimplementation of Ray's core (object store, actors, tasks, status)"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+futures = "0.3"
+
+[[bin]]
+name = "crayon-demo"
+path = "src/bin/demo.rs"
+
+[[bin]]
+name = "crayon-multi"
+path = "src/bin/multi_node_demo.rs"
