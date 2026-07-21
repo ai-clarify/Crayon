@@ -1,0 +1,23 @@
+src/bin/rl_sim.rs
+  s_3ed83973de6379::t_8ff5370320a8a3 127-128,162-163,165
+src/lib.rs
+  s_3ed83973de6379::t_1fa73a309f1b43 224-233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "287a91c80d9e4ee85c2ffbccf88cff4d436cf289",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
