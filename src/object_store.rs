@@ -33,7 +33,10 @@ pub trait RemoteFetcher: Send + Sync {
 }
 
 struct Entry {
-    value: Option<Vec<u8>>,
+    /// Stored as `bytes::Bytes` so clones are zero-copy (refcount bump only).
+    /// Critical for `get_batch` and spill paths that would otherwise copy
+    /// large RL objects (model weights, trajectories) multiple times.
+    value: Option<bytes::Bytes>,
     notify: Arc<Notify>,
     refcount: Arc<AtomicUsize>,
     owner_node: Option<crate::node::NodeID>,
@@ -110,6 +113,7 @@ impl ObjectStore {
 
     pub fn put_bytes(&self, id: ObjectID, bytes: Vec<u8>, owner_node: Option<crate::node::NodeID>) {
         let size = bytes.len();
+        let bytes = bytes::Bytes::from(bytes);
         let entry = self.entry(id, owner_node);
         {
             let mut e = entry.lock();
@@ -170,7 +174,7 @@ impl ObjectStore {
         futures::future::join_all(futs).await
     }
 
-    pub async fn get_bytes(&self, id: ObjectID) -> Result<Vec<u8>, CrayonError> {
+    pub async fn get_bytes(&self, id: ObjectID) -> Result<bytes::Bytes, CrayonError> {
         self.get_bytes_timeout(id, std::time::Duration::from_secs(30))
             .await
     }
@@ -180,12 +184,12 @@ impl ObjectStore {
         &self,
         id: ObjectID,
         timeout: std::time::Duration,
-    ) -> Result<Vec<u8>, CrayonError> {
+    ) -> Result<bytes::Bytes, CrayonError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut tried_remote = false;
 
         loop {
-            // Fast path: in memory
+            // Fast path: in memory (zero-copy clone)
             if let Some(bytes) = self.try_get_in_memory(&id) {
                 self.touch(&id);
                 return Ok(bytes);
@@ -195,8 +199,9 @@ impl ObjectStore {
             if self.is_spilled(&id) {
                 match self.load_from_disk(&id) {
                     Ok(bytes) => {
-                        self.put_bytes(id, bytes.clone(), None);
-                        return Ok(bytes);
+                        let b = bytes::Bytes::from(bytes);
+                        self.put_bytes(id, b.to_vec(), None);
+                        return Ok(b);
                     }
                     Err(_) => {
                         // Spilled but file is gone; fall through to remote fetch
@@ -220,8 +225,9 @@ impl ObjectStore {
                 let remote = self.inner.remote.lock().clone();
                 if let Some(remote) = remote {
                     if let Ok(bytes) = remote.fetch_remote(id).await {
-                        self.put_bytes(id, bytes.clone(), None);
-                        return Ok(bytes);
+                        let b = bytes::Bytes::from(bytes);
+                        self.put_bytes(id, b.to_vec(), None);
+                        return Ok(b);
                     }
                 }
             }
@@ -241,7 +247,7 @@ impl ObjectStore {
         }
     }
 
-    fn try_get_in_memory(&self, id: &ObjectID) -> Option<Vec<u8>> {
+    fn try_get_in_memory(&self, id: &ObjectID) -> Option<bytes::Bytes> {
         self.inner
             .map
             .lock()

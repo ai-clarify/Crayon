@@ -1,11 +1,10 @@
 //! Multi-node networking — Crayon's analog of Ray's raylet + GCS client.
 //!
-//! Each [`Node`] runs a TCP server. A head node hosts the GCS; worker nodes
-//! connect to the head and register themselves. Objects can be fetched from
-//! remote nodes; tasks can be submitted to remote workers.
+//! Each [`Node`] runs a TCP server. A head node tracks peers; worker nodes
+//! register and receive the peer list. Objects are fetched from remote peers
+//! via a pooled connection (see [`ConnectionPool`]).
 //!
-//! Wire format: 4-byte big-endian length prefix + bincode-serialized
-//! [`Message`]. Simple and robust.
+//! Wire format: 4-byte BE length + bincode [`Message`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,10 +13,12 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
 
 use crate::common::{ActorID, ObjectID};
 use crate::object_store::ObjectStore;
+
+/// Maximum allowed message size (256 MiB).
+const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 
 /// Unique identifier for a node.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -47,76 +48,118 @@ impl std::fmt::Display for NodeID {
 /// Messages exchanged between nodes.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
-    // ---- node lifecycle ----
-    RegisterNode {
-        addr: String,
-    },
+    RegisterNode { addr: String },
     NodeList(Vec<(NodeID, String)>),
-    Ping {
-        addr: String,
-    },
+    Ping { addr: String },
     Pong,
-    // ---- object store ----
     GetObject(ObjectID),
     ObjectData(ObjectID, Vec<u8>),
     ObjectNotFound(ObjectID),
-    // ---- task submission ----
-    SubmitTask {
-        id: [u8; 16],
-        output_id: ObjectID,
-        resources: (f64, f64), // (cpu, gpu)
-        func_bytes: Vec<u8>,
-    },
-    TaskAck,
-    // ---- actor ----
-    CreateActor {
-        name: String,
-        state_bytes: Vec<u8>,
-    },
-    ActorCall {
-        actor_id: ActorID,
-        method_bytes: Vec<u8>,
-    },
 }
 
-/// A remote node connection.
+type NodeError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A pooled TCP connection that can send/receive [`Message`]s.
+struct Connection {
+    stream: TcpStream,
+}
+
+impl Connection {
+    async fn connect(addr: &str) -> Result<Self, NodeError> {
+        Ok(Connection {
+            stream: TcpStream::connect(addr).await?,
+        })
+    }
+
+    async fn send(&mut self, msg: &Message) -> Result<(), NodeError> {
+        let bytes = bincode::serialize(msg)?;
+        let len = (bytes.len() as u32).to_be_bytes();
+        self.stream.write_all(&len).await?;
+        self.stream.write_all(&bytes).await?;
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Option<Message>, NodeError> {
+        let mut len_buf = [0u8; 4];
+        if self.stream.read_exact(&mut len_buf).await.is_err() {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_MESSAGE_SIZE {
+            return Err(format!("message too large: {len} bytes (max {MAX_MESSAGE_SIZE})").into());
+        }
+        let mut buf = vec![0u8; len];
+        self.stream.read_exact(&mut buf).await?;
+        Ok(Some(bincode::deserialize(&buf)?))
+    }
+}
+
+/// A simple LIFO connection pool keyed by address. Reusing connections avoids
+/// the TCP handshake cost on every remote object fetch — critical for RL
+/// workloads that pull many small samples.
+#[derive(Default)]
+struct ConnectionPool {
+    inner: Mutex<HashMap<String, Vec<Connection>>>,
+}
+
+impl ConnectionPool {
+    fn new() -> Arc<Self> {
+        Arc::new(ConnectionPool::default())
+    }
+
+    /// Get a connection from the pool, or open a new one.
+    async fn get(self: &Arc<Self>, addr: &str) -> Result<Connection, NodeError> {
+        if let Some(c) = self.inner.lock().get_mut(addr).and_then(|v| v.pop()) {
+            return Ok(c);
+        }
+        Connection::connect(addr).await
+    }
+
+    /// Return a connection to the pool for reuse.
+    fn put(&self, addr: &str, conn: Connection) {
+        self.inner
+            .lock()
+            .entry(addr.to_string())
+            .or_default()
+            .push(conn);
+    }
+}
+
+/// A remote node's address + last-seen timestamp (for heartbeat eviction).
 struct RemoteNode {
     addr: String,
     last_seen: std::time::Instant,
 }
 
 /// The local node's networking state.
+#[derive(Clone)]
 pub struct Node {
     pub id: NodeID,
     pub addr: String,
     store: ObjectStore,
     peers: Arc<Mutex<HashMap<NodeID, RemoteNode>>>,
-    head_addr: Option<String>,
-    pending: Arc<Mutex<HashMap<ObjectID, oneshot::Sender<Vec<u8>>>>>,
+    pool: Arc<ConnectionPool>,
 }
 
 impl Node {
-    /// Start a node. If `head_addr` is `None`, this is the head node (hosts
-    /// the GCS). Otherwise, connect to the head and register.
+    /// Start a node. If `head_addr` is `None`, this is the head node.
     pub async fn start(
         addr: &str,
         head_addr: Option<&str>,
         store: ObjectStore,
     ) -> Result<Arc<Self>, NodeError> {
-        // Start TCP server first to get the actual bound address
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?.to_string();
 
-        let id = NodeID::new();
         let node = Arc::new(Node {
-            id,
+            id: NodeID::new(),
             addr: local_addr.clone(),
             store,
             peers: Arc::new(Mutex::new(HashMap::new())),
-            head_addr: head_addr.map(|s| s.to_string()),
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pool: ConnectionPool::new(),
         });
 
+        // Accept loop
         let node_clone = node.clone();
         tokio::spawn(async move {
             loop {
@@ -131,16 +174,19 @@ impl Node {
             }
         });
 
-        // If worker, register with head
-        let my_addr = local_addr.clone();
+        // Worker: register with head + send heartbeats
         if let Some(head) = head_addr {
-            let mut stream = TcpStream::connect(head).await?;
-            send_message(&mut stream, &Message::RegisterNode { addr: local_addr }).await?;
-            // Receive peer list (includes head's address)
-            if let Some(Message::NodeList(peers)) = recv_message(&mut stream).await? {
+            let mut conn = Connection::connect(head).await?;
+            conn.send(&Message::RegisterNode {
+                addr: local_addr.clone(),
+            })
+            .await?;
+            if let Some(Message::NodeList(peers)) = conn.recv().await? {
                 let mut p = node.peers.lock();
                 for (pid, paddr) in peers {
-                    if pid != node.id {
+                    // Filter out ourselves by address (head assigns us a new
+                    // NodeID we don't know about, so we can't filter by ID).
+                    if paddr != node.addr {
                         p.insert(
                             pid,
                             RemoteNode {
@@ -151,31 +197,30 @@ impl Node {
                     }
                 }
             }
+            // Don't pool the registration connection — the head's
+            // handle_connection owns it and will close it on disconnect.
+            drop(conn);
 
-            // Worker: send periodic heartbeats to head
             let head = head.to_string();
-            let node_clone = node.clone();
-            let my_addr_clone = my_addr.clone();
+            let my_addr = local_addr;
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
                     ticker.tick().await;
-                    if let Ok(mut stream) = TcpStream::connect(&head).await {
-                        let _ = send_message(
-                            &mut stream,
-                            &Message::Ping {
-                                addr: my_addr_clone.clone(),
-                            },
-                        )
-                        .await;
+                    // Use a fresh connection for heartbeats — don't pollute the
+                    // fetch pool with Ping/Pong traffic.
+                    if let Ok(mut conn) = Connection::connect(&head).await {
+                        let _ = conn
+                            .send(&Message::Ping {
+                                addr: my_addr.clone(),
+                            })
+                            .await;
                     }
-                    // If head is unreachable, peer will be cleaned up by head's check
-                    let _ = node_clone; // keep node alive
                 }
             });
         }
 
-        // Head (and everyone): periodically evict dead peers
+        // Evict dead peers
         let node_clone = node.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -192,19 +237,37 @@ impl Node {
         Ok(node)
     }
 
-    /// Fetch an object from a remote node by ID. Tries all peers.
+    /// Fetch an object from a remote node by ID. Queries all peers concurrently
+    /// and returns the first successful result. This avoids the latency of
+    /// trying peers one-by-one when some are slow or unreachable.
     pub async fn fetch_remote_object(&self, id: ObjectID) -> Result<Vec<u8>, NodeError> {
         let peers: Vec<_> = self.peers.lock().values().map(|p| p.addr.clone()).collect();
-        for addr in peers {
-            if let Ok(mut stream) = TcpStream::connect(&addr).await {
-                send_message(&mut stream, &Message::GetObject(id)).await?;
-                match recv_message(&mut stream).await? {
-                    Some(Message::ObjectData(_, bytes)) => return Ok(bytes),
-                    _ => continue,
+        let pool = self.pool.clone();
+
+        let futs: Vec<_> = peers
+            .into_iter()
+            .map(|addr| {
+                let pool = pool.clone();
+                async move {
+                    let mut conn = pool.get(&addr).await?;
+                    conn.send(&Message::GetObject(id)).await?;
+                    match conn.recv().await? {
+                        Some(Message::ObjectData(_, bytes)) => {
+                            pool.put(&addr, conn);
+                            Ok::<_, NodeError>(bytes)
+                        }
+                        _ => Err("object not found on peer".into()),
+                    }
                 }
-            }
-        }
-        Err("object not found on any peer".into())
+            })
+            .collect();
+
+        // Run all fetches concurrently; return the first success.
+        let results = futures::future::join_all(futs).await;
+        results
+            .into_iter()
+            .find_map(|r| r.ok())
+            .ok_or_else(|| "object not found on any peer".into())
     }
 
     pub fn peers(&self) -> Vec<(NodeID, String)> {
@@ -227,38 +290,23 @@ impl crate::object_store::RemoteFetcher for Node {
                 > + Send,
         >,
     > {
-        let peers: Vec<_> = self.peers.lock().values().map(|p| p.addr.clone()).collect();
-        Box::pin(async move {
-            for addr in peers {
-                if let Ok(mut stream) = TcpStream::connect(&addr).await {
-                    let _ = send_message(&mut stream, &Message::GetObject(id)).await;
-                    if let Ok(Some(Message::ObjectData(_, bytes))) = recv_message(&mut stream).await
-                    {
-                        return Ok(bytes);
-                    }
-                }
-            }
-            Err("object not found on any peer".into())
-        })
+        let this = self.clone();
+        Box::pin(async move { this.fetch_remote_object(id).await })
     }
 }
 
-type NodeError = Box<dyn std::error::Error + Send + Sync>;
-
 async fn handle_connection(mut stream: TcpStream, node: Arc<Node>) -> Result<(), NodeError> {
-    while let Some(msg) = recv_message(&mut stream).await? {
+    let mut conn = Connection { stream };
+    while let Some(msg) = conn.recv().await? {
         match msg {
             Message::RegisterNode { addr } => {
-                let peer_id = NodeID::new();
                 node.peers.lock().insert(
-                    peer_id,
+                    NodeID::new(),
                     RemoteNode {
                         addr: addr.clone(),
                         last_seen: std::time::Instant::now(),
                     },
                 );
-                // Send back peer list, including this node (the head) so the
-                // worker knows where to fetch objects from.
                 let mut peers: Vec<_> = node
                     .peers
                     .lock()
@@ -266,57 +314,27 @@ async fn handle_connection(mut stream: TcpStream, node: Arc<Node>) -> Result<(),
                     .map(|(id, p)| (*id, p.addr.clone()))
                     .collect();
                 peers.push((node.id, node.addr.clone()));
-                send_message(&mut stream, &Message::NodeList(peers)).await?;
+                conn.send(&Message::NodeList(peers)).await?;
             }
             Message::Ping { addr } => {
-                // Update last_seen for the peer with this addr
                 let now = std::time::Instant::now();
-                {
-                    let mut peers = node.peers.lock();
-                    for p in peers.values_mut() {
-                        if p.addr == addr {
-                            p.last_seen = now;
-                        }
+                for p in node.peers.lock().values_mut() {
+                    if p.addr == addr {
+                        p.last_seen = now;
                     }
                 }
-                send_message(&mut stream, &Message::Pong).await?;
+                conn.send(&Message::Pong).await?;
             }
             Message::GetObject(id) => {
                 if node.store.contains(id) {
                     let bytes = node.store.get_bytes(id).await?;
-                    send_message(&mut stream, &Message::ObjectData(id, bytes)).await?;
+                    conn.send(&Message::ObjectData(id, bytes.to_vec())).await?;
                 } else {
-                    send_message(&mut stream, &Message::ObjectNotFound(id)).await?;
+                    conn.send(&Message::ObjectNotFound(id)).await?;
                 }
             }
             _ => {}
         }
     }
     Ok(())
-}
-
-async fn send_message(stream: &mut TcpStream, msg: &Message) -> Result<(), NodeError> {
-    let bytes = bincode::serialize(msg)?;
-    let len = (bytes.len() as u32).to_be_bytes();
-    stream.write_all(&len).await?;
-    stream.write_all(&bytes).await?;
-    Ok(())
-}
-
-/// Maximum allowed message size (256 MiB). Protects against corrupted length
-/// prefixes that would otherwise cause a huge allocation (OOM).
-const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
-
-async fn recv_message(stream: &mut TcpStream) -> Result<Option<Message>, NodeError> {
-    let mut len_buf = [0u8; 4];
-    if stream.read_exact(&mut len_buf).await.is_err() {
-        return Ok(None);
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_MESSAGE_SIZE {
-        return Err(format!("message too large: {len} bytes (max {MAX_MESSAGE_SIZE})").into());
-    }
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(Some(bincode::deserialize(&buf)?))
 }
