@@ -1,6 +1,6 @@
 [package]
 name = "crayon-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A Rust reimplementation of Ray's core: distributed object store, actors, task scheduling, and multi-node execution for RL training infrastructure"
 license = "MIT"

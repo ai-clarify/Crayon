@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "crayon-dist"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python bindings for Crayon — a Rust reimplementation of Ray's core distributed computing framework for RL training infrastructure"
 requires-python = ">=3.8"
 license = { text = "MIT" }
