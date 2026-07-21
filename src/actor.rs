@@ -33,6 +33,18 @@ type MethodFn = Arc<dyn Fn(&mut dyn Any, Vec<u8>) -> Vec<u8> + Send + Sync>;
 pub(crate) struct Call {
     func: ActorMethod,
     reply: oneshot::Sender<Result<Vec<u8>, CrayonError>>,
+    /// The reply receiver, held here so it can be extracted before the Call
+    /// is sent into the mailbox (which moves the Call). `send_and_store` and
+    /// `call_method` pull it out via [`Call::reply_rx`].
+    rx: Option<oneshot::Receiver<Result<Vec<u8>, CrayonError>>>,
+}
+
+impl Call {
+    /// Extract the reply receiver. Must be called before the Call is sent
+    /// (which moves it). Panics if called more than once.
+    pub(crate) fn reply_rx(&mut self) -> oneshot::Receiver<Result<Vec<u8>, CrayonError>> {
+        self.rx.take().expect("reply_rx called more than once")
+    }
 }
 
 /// Default mailbox size for actors. When full, `call` awaits — this is the
@@ -109,13 +121,15 @@ impl ActorHandleInner {
         self.methods.lock().insert(name.to_string(), func);
     }
 
-    /// Invoke a registered method by name (called by the node when it receives
-    /// a remote `ActorCall` message).
-    pub(crate) async fn call_method(
+    /// Look up a registered named method and build a [`Call`] that invokes it
+    /// with the given serialized args. Shared by the local `call_named` path
+    /// (which sends via [`Self::send_and_store`]) and the remote `call_method`
+    /// path (which awaits the reply directly).
+    pub(crate) fn build_method_call(
         &self,
         name: &str,
         args: Vec<u8>,
-    ) -> Result<Vec<u8>, CrayonError> {
+    ) -> Result<Call, CrayonError> {
         if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(CrayonError::ActorDead(self.id));
         }
@@ -126,10 +140,71 @@ impl ActorHandleInner {
             .cloned()
             .ok_or_else(|| CrayonError::ActorMethodNotFound(self.id, name.to_string()))?;
         let (reply, rx) = oneshot::channel();
-        let call = Call {
+        Ok(Call {
             func: Box::new(move |state| func(state, args)),
             reply,
-        };
+            rx: Some(rx),
+        })
+    }
+
+    /// Send a [`Call`] to the actor mailbox and spawn a background task that
+    /// stores the result (or error) in the object store when it arrives.
+    /// Returns an [`ObjectRef`] that resolves when the result is stored —
+    /// the caller never blocks on the actor's execution.
+    ///
+    /// This is the single concurrency primitive for local actor calls: both
+    /// [`ActorHandle::call`] and [`ActorHandle::call_named`] route through it,
+    /// so they share the same fire-and-forget behavior.
+    pub(crate) async fn send_and_store<T>(
+        &self,
+        mut call: Call,
+    ) -> Result<crate::common::ObjectRef<T>, CrayonError>
+    where
+        T: Send + 'static,
+    {
+        let output_id = ObjectID::new();
+        let r = self.store.reserve_ref(output_id);
+        self.gcs.record_actor_task(self.id, false);
+
+        // Extract the reply receiver before sending — the Call owns the
+        // sender half, and we can't get it back after `send_call` takes it.
+        let rx = call.reply_rx();
+        self.send_call(call).await?;
+
+        let store = self.store.clone();
+        let gcs = self.gcs.clone();
+        let id = self.id;
+        tokio::spawn(async move {
+            match rx.await {
+                Ok(Ok(bytes)) => {
+                    store.put_bytes(output_id, bytes, None);
+                    gcs.record_actor_task(id, true);
+                }
+                Ok(Err(e)) => {
+                    store.put_error(output_id, e);
+                    gcs.record_actor_task(id, true);
+                }
+                Err(_) => {
+                    // Actor died (mailbox closed). Surface the error to the
+                    // caller instead of leaving them hanging on `get()`.
+                    store.put_error(output_id, CrayonError::ActorDead(id));
+                }
+            }
+        });
+
+        Ok(r)
+    }
+
+    /// Invoke a registered method by name and await the serialized result.
+    /// Used by the node when it receives a remote `ActorCall` message — the
+    /// caller (remote node) needs the bytes to store in its own object store.
+    pub(crate) async fn call_method(
+        &self,
+        name: &str,
+        args: Vec<u8>,
+    ) -> Result<Vec<u8>, CrayonError> {
+        let mut call = self.build_method_call(name, args)?;
+        let rx = call.reply_rx();
         self.send_call(call).await?;
         rx.await.map_err(|_| CrayonError::ActorDead(self.id))?
     }
@@ -172,10 +247,6 @@ impl<S: Send + 'static> ActorHandle<S> {
         T: serde::Serialize + Send + 'static,
         F: FnOnce(&mut S) -> T + Send + 'static,
     {
-        let output_id = ObjectID::new();
-        let r = self.inner.store().reserve_ref(output_id);
-        self.inner.gcs().record_actor_task(self.inner.id, false);
-
         let erased: ActorMethod = Box::new(move |state: &mut dyn Any| {
             let s = state
                 .downcast_mut::<S>()
@@ -184,35 +255,14 @@ impl<S: Send + 'static> ActorHandle<S> {
         });
 
         let (reply, rx) = oneshot::channel();
-        self.inner
-            .send_call(Call {
-                func: erased,
-                reply,
-            })
-            .await?;
-
-        let store = self.inner.store().clone();
-        let gcs = self.inner.gcs().clone();
-        let id = self.inner.id;
-        tokio::spawn(async move {
-            match rx.await {
-                Ok(Ok(bytes)) => {
-                    store.put_bytes(output_id, bytes, None);
-                    gcs.record_actor_task(id, true);
-                }
-                Ok(Err(e)) => {
-                    store.put_error(output_id, e);
-                    gcs.record_actor_task(id, true);
-                }
-                Err(_) => {
-                    // Actor died (mailbox closed). Surface the error to the caller
-                    // instead of leaving them hanging on `get()`.
-                    store.put_error(output_id, CrayonError::ActorDead(id));
-                }
-            }
-        });
-
-        Ok(r)
+        let call = Call {
+            func: erased,
+            reply,
+            rx: Some(rx),
+        };
+        // send_and_store handles mailbox send + background result storage,
+        // so local calls never block the caller on actor execution time.
+        self.inner.send_and_store(call).await
     }
 
     /// Kill the actor: signals the actor task to shut down and rejects new
@@ -319,20 +369,11 @@ impl<S: Send + 'static> ActorHandle<S> {
                     .map_err(|e| CrayonError::TaskFailed(e.to_string()))?;
                 Ok(self.inner.store().reserve_ref(id))
             }
-            // Local actor (or no node attached): call through the mailbox in the
-            // background, store the result when ready — mirrors `call`.
+            // Local actor (or no node attached): build the Call and route it
+            // through send_and_store — identical concurrency to `call`.
             _ => {
-                let output_id = ObjectID::new();
-                let r = self.inner.store().reserve_ref(output_id);
-                let inner = self.inner.clone();
-                let method = method.to_string();
-                tokio::spawn(async move {
-                    match inner.call_method(&method, args).await {
-                        Ok(bytes) => inner.store().put_bytes(output_id, bytes, None),
-                        Err(e) => inner.store().put_error(output_id, e),
-                    }
-                });
-                Ok(r)
+                let call = self.inner.build_method_call(method, args)?;
+                self.inner.send_and_store(call).await
             }
         }
     }

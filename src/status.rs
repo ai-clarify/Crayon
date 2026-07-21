@@ -59,22 +59,18 @@ impl SystemStatus {
 
         let tasks = gcs.tasks();
         let tasks_total = tasks.len();
-        let tasks_finished = tasks
-            .iter()
-            .filter(|t| matches!(t.state, crate::common::TaskState::Finished))
-            .count();
-        let tasks_failed = tasks
-            .iter()
-            .filter(|t| matches!(t.state, crate::common::TaskState::Failed))
-            .count();
-        let tasks_pending = tasks
-            .iter()
-            .filter(|t| matches!(t.state, crate::common::TaskState::Pending))
-            .count();
-        let tasks_running = tasks
-            .iter()
-            .filter(|t| matches!(t.state, crate::common::TaskState::Running))
-            .count();
+        let mut tasks_finished = 0;
+        let mut tasks_failed = 0;
+        let mut tasks_pending = 0;
+        let mut tasks_running = 0;
+        for t in &tasks {
+            match t.state {
+                crate::common::TaskState::Finished => tasks_finished += 1,
+                crate::common::TaskState::Failed => tasks_failed += 1,
+                crate::common::TaskState::Pending => tasks_pending += 1,
+                crate::common::TaskState::Running => tasks_running += 1,
+            }
+        }
 
         let workers: Vec<WorkerStatus> = gcs
             .workers()

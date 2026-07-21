@@ -340,9 +340,13 @@ impl Node {
         // Pool guarantees one request/response per checkout — the next message
         // is always our reply.
         let reply = conn.recv().await?;
-        self.pool.put(&addr, conn);
         match reply {
-            Some(Message::ActorCallReply { result }) => result.map_err(|e| e.into()),
+            Some(Message::ActorCallReply { result }) => {
+                // Only return the connection to the pool on success — if we got
+                // an unexpected message, the connection may be in a bad state.
+                self.pool.put(&addr, conn);
+                result.map_err(|e| e.into())
+            }
             _ => Err("unexpected reply to actor call".into()),
         }
     }
@@ -377,8 +381,10 @@ impl Node {
             let msg = msg.clone();
             tokio::spawn(async move {
                 if let Ok(mut conn) = pool.get(&addr).await {
-                    let _ = conn.send(&msg).await;
-                    pool.put(&addr, conn);
+                    if conn.send(&msg).await.is_ok() {
+                        pool.put(&addr, conn);
+                    }
+                    // else: send failed, drop the (possibly broken) connection
                 }
             });
         }

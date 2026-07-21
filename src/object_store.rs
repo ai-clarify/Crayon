@@ -50,6 +50,17 @@ struct Entry {
     size_bytes: usize,
 }
 
+/// Snapshot of an [`Entry`]'s relevant fields, taken under a single lock
+/// acquisition in [`ObjectStore::get_bytes_timeout`] to avoid repeated
+/// map-lock contention on the hot path.
+struct EntrySnapshot {
+    error: Option<CrayonError>,
+    value: Option<bytes::Bytes>,
+    spilled: bool,
+    spilling: bool,
+    notify: Arc<Notify>,
+}
+
 pub(crate) struct StoreInner {
     map: Mutex<HashMap<ObjectID, Arc<Mutex<Entry>>>>,
     mem: Mutex<Option<Arc<MemoryManager>>>,
@@ -93,12 +104,9 @@ impl ObjectStore {
         let bytes = bincode::serialize(&value).expect("bincode serialize should not fail");
         let size = bytes.len();
         self.put_bytes(id, bytes, None);
-        let entry = self.entry(id, None);
-        let e = entry.lock();
-        e.refcount.fetch_add(1, Ordering::Relaxed);
-        let refcount = e.refcount.clone();
-        drop(e);
-        (ObjectRef::new(id, refcount, self.downgrade()), size)
+        // put_bytes already created the entry; reserve_ref bumps the refcount
+        // and builds the ObjectRef without re-looking-up the entry.
+        (self.reserve_ref(id), size)
     }
 
     /// Store many objects at once. Returns one `ObjectRef` per input. Amortizes
@@ -207,42 +215,63 @@ impl ObjectStore {
         let mut tried_remote = false;
 
         loop {
-            // Check if the task producing this object failed.
-            if let Some(err) = self.try_get_error(&id) {
-                return Err(err);
-            }
+            // One lock acquisition to check all entry state: error, value,
+            // spilled, spilling. The old code acquired the map lock 4-5 times
+            // per loop iteration — this is the hot path for every `get`.
+            //
+            // If the entry doesn't exist locally, we skip straight to remote
+            // fetch (the object may live on a peer). Only if remote fetch also
+            // fails do we return ObjectNotFound.
+            let snapshot = {
+                let map = self.inner.map.lock();
+                match map.get(&id) {
+                    Some(entry) => {
+                        let e = entry.lock();
+                        Some(EntrySnapshot {
+                            error: e.error.clone(),
+                            value: e.value.clone(),
+                            spilled: e.spilled,
+                            spilling: e.spilling,
+                            notify: e.notify.clone(),
+                        })
+                    }
+                    None => None,
+                }
+            };
 
-            // Fast path: in memory (zero-copy clone)
-            if let Some(bytes) = self.try_get_in_memory(&id) {
-                self.touch(&id);
-                return Ok(bytes);
-            }
+            // If we have a local entry, check its state first.
+            if let Some(snapshot) = &snapshot {
+                // Task failed — don't wait for a value that will never arrive.
+                if let Some(err) = &snapshot.error {
+                    return Err(err.clone());
+                }
 
-            // Check if spilled to disk
-            if self.is_spilled(&id) {
-                match self.load_from_disk(&id) {
-                    Ok(bytes) => {
+                // Fast path: in memory (zero-copy clone).
+                if let Some(bytes) = &snapshot.value {
+                    self.touch(&id);
+                    return Ok(bytes.clone());
+                }
+
+                // Spilled to disk — reload.
+                if snapshot.spilled {
+                    if let Ok(bytes) = self.load_from_disk(&id) {
                         let b = bytes::Bytes::from(bytes);
                         self.put_bytes(id, b.to_vec(), None);
                         return Ok(b);
                     }
-                    Err(_) => {
-                        // Spilled but file is gone; fall through to remote fetch
+                    // Spilled but file is gone — fall through to remote fetch.
+                }
+
+                // Currently spilling to disk — wait for it to finish.
+                if snapshot.spilling {
+                    match tokio::time::timeout_at(deadline, snapshot.notify.notified()).await {
+                        Ok(_) => continue,
+                        Err(_) => return Err(CrayonError::Timeout(id)),
                     }
                 }
             }
 
-            // If currently spilling to disk, wait for it to finish.
-            if self.is_spilling(&id) {
-                let entry = self.entry(id, None);
-                let notified = { entry.lock().notify.clone() };
-                match tokio::time::timeout_at(deadline, notified.notified()).await {
-                    Ok(_) => continue,
-                    Err(_) => return Err(CrayonError::Timeout(id)),
-                }
-            }
-
-            // Try remote fetch (once)
+            // Try remote fetch (once).
             if !tried_remote {
                 tried_remote = true;
                 let remote = self.inner.remote.lock().clone();
@@ -255,59 +284,23 @@ impl ObjectStore {
                 }
             }
 
-            // If the entry was pre-reserved (in-flight task output), wait for it.
-            let existed = self.inner.map.lock().contains_key(&id);
-            if !existed {
+            // No local entry and remote fetch failed — object doesn't exist.
+            let Some(snapshot) = snapshot else {
                 return Err(CrayonError::ObjectNotFound(id));
-            }
+            };
 
-            let entry = self.entry(id, None);
-            let notified = { entry.lock().notify.clone() };
-            match tokio::time::timeout_at(deadline, notified.notified()).await {
+            // Entry exists but value not yet materialized (in-flight task).
+            match tokio::time::timeout_at(deadline, snapshot.notify.notified()).await {
                 Ok(_) => continue,
                 Err(_) => return Err(CrayonError::Timeout(id)),
             }
         }
     }
 
-    fn try_get_in_memory(&self, id: &ObjectID) -> Option<bytes::Bytes> {
-        self.inner
-            .map
-            .lock()
-            .get(id)
-            .and_then(|e| e.lock().value.clone())
-    }
-
-    fn try_get_error(&self, id: &ObjectID) -> Option<CrayonError> {
-        self.inner
-            .map
-            .lock()
-            .get(id)
-            .and_then(|e| e.lock().error.clone())
-    }
-
-    fn is_spilled(&self, id: &ObjectID) -> bool {
-        self.inner
-            .map
-            .lock()
-            .get(id)
-            .map(|e| e.lock().spilled)
-            .unwrap_or(false)
-    }
-
     fn touch(&self, id: &ObjectID) {
         if let Some(mem) = self.inner.mem.lock().clone() {
             mem.touch(*id);
         }
-    }
-
-    fn is_spilling(&self, id: &ObjectID) -> bool {
-        self.inner
-            .map
-            .lock()
-            .get(id)
-            .map(|e| e.lock().spilling)
-            .unwrap_or(false)
     }
 
     /// Asynchronously spill an object to disk. Takes the bytes out of memory

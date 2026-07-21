@@ -6,9 +6,16 @@
 //! - Distributed rollout: N workers generate solutions in parallel (Crayon tasks)
 //! - Trainer: aggregates rollouts, computes REINFORCE gradient, updates the policy
 //!
-//! Run:
-//!   cargo run --release --example llm_gsm8k -- --steps 50 --workers 8
+//! Auto-detects CUDA (V100/A100) and falls back to CPU. Runs 3 full training
+//! rounds and records per-step timing + reward to a CSV for benchmarking.
+//!
+//! Run (CPU):
+//!   cargo run --release --example llm_gsm8k -- --steps 20 --workers 8
+//! Run (V100/A100):
+//!   cargo run --release --features cuda --example llm_gsm8k -- --steps 20 --workers 8
 
+use std::fs::File;
+use std::io::Write;
 use std::time::Instant;
 
 use candle_core::{Device, Tensor};
@@ -261,8 +268,7 @@ fn extract_answer(tokens: &[usize]) -> Option<f64> {
 
 // ---- Rollout: generate a solution and compute reward ----
 
-fn rollout(params: Vec<f32>, problem_idx: usize) -> (Vec<usize>, Vec<f32>, f64) {
-    let device = Device::Cpu;
+fn rollout(params: Vec<f32>, problem_idx: usize, device: Device) -> (Vec<usize>, Vec<f32>, f64) {
     let policy = PolicyNet::from_params(&params, &device).unwrap();
     let problem = &PROBLEMS[problem_idx % PROBLEMS.len()];
     let prompt = tokenize(problem.question);
@@ -286,13 +292,51 @@ struct PSState {
     step: u64,
 }
 
+// ---- Performance recording ----
+
+struct StepRecord {
+    run: u32,
+    step: u64,
+    avg_reward: f64,
+    step_time_ms: f64,
+    rollouts_per_sec: f64,
+}
+
+struct RunSummary {
+    run: u32,
+    total_time_sec: f64,
+    mean_reward: f64,
+    max_reward: f64,
+    final_reward: f64,
+    total_steps: u64,
+    total_rollouts: u64,
+    avg_step_ms: f64,
+    avg_rollouts_per_sec: f64,
+}
+
+fn write_csv_header(file: &mut File) -> std::io::Result<()> {
+    writeln!(
+        file,
+        "run,step,avg_reward,step_time_ms,rollouts_per_sec"
+    )
+}
+
+fn write_step_record(file: &mut File, r: &StepRecord) -> std::io::Result<()> {
+    writeln!(
+        file,
+        "{},{},{:.6},{:.3},{:.3}",
+        r.run, r.step, r.avg_reward, r.step_time_ms, r.rollouts_per_sec
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = std::env::args().collect();
-    let mut steps = 50u64;
+    let mut steps = 20u64;
     let mut workers = 8usize;
+    let mut rounds = 3u32;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -304,114 +348,213 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 i += 1;
                 workers = args[i].parse()?;
             }
+            "--rounds" => {
+                i += 1;
+                rounds = args[i].parse()?;
+            }
             _ => {}
         }
         i += 1;
     }
 
+    // Auto-detect CUDA (V100/A100), fall back to CPU.
+    let device = Device::cuda_if_available(0)?;
+    let device_name = match &device {
+        Device::Cpu => "CPU".to_string(),
+        Device::Cuda(_) => "CUDA (V100/A100)".to_string(),
+        Device::Metal(_) => "Metal".to_string(),
+    };
+
     println!("=== Crayon LLM RL (GSM8K + mini Transformer + REINFORCE) ===");
-    println!(
-        "steps={steps} workers={workers} problems={}",
-        PROBLEMS.len()
-    );
+    println!("device={device_name}");
+    println!("rounds={rounds} steps={steps} workers={workers} problems={}", PROBLEMS.len());
 
     let ray = Ray::init(4);
-    let device = Device::Cpu;
 
-    let policy = PolicyNet::new(&device)?;
-    let init_params = policy.params_flat();
-    println!("policy params: {} floats", init_params.len());
+    // Open CSV for per-step performance recording.
+    let csv_path = "gsm8k_rl_results.csv";
+    let mut csv = File::create(csv_path)?;
+    write_csv_header(&mut csv)?;
 
-    let ps = ray.create_actor(
-        "ps",
-        PSState {
-            params: init_params,
-            step: 0,
-        },
-    );
+    let mut run_summaries: Vec<RunSummary> = Vec::new();
 
-    let lr = 0.01;
-    let start = Instant::now();
-    let mut total_reward = 0.0;
-    let mut total_rollouts = 0u64;
+    for run in 0..rounds {
+        println!("\n--- Round {run}/{rounds} ---");
 
-    for step in 0..steps {
-        // 1. Get current params
-        let r = ps.call(|s| s.params.clone()).await.unwrap();
-        let params: Vec<f32> = ray.get(&r).await.unwrap();
-
-        // 2. Fan out: rollouts on different problems
-        let rollout_refs: Vec<_> = (0..workers)
-            .map(|i| {
-                let p = params.clone();
-                ray.spawn((), move |()| rollout(p.clone(), i))
-            })
-            .collect();
-
-        // 3. Fan in: collect rollouts
-        let results: Vec<(Vec<usize>, Vec<f32>, f64)> = ray
-            .get_batch(&rollout_refs)
-            .await
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let avg_reward: f64 = results.iter().map(|r| r.2).sum::<f64>() / results.len() as f64;
-        total_reward += results.iter().map(|r| r.2).sum::<f64>();
-        total_rollouts += results.len() as u64;
-
-        // 4. Compute REINFORCE gradient (numerical, per-parameter finite differences)
-        let mut grad = vec![0.0f32; params.len()];
-        let eps = 1e-3;
-
-        for (pi, g) in grad.iter_mut().enumerate() {
-            // Perturb up
-            let mut params_up = params.clone();
-            params_up[pi] += eps;
-            let r_up = rollout(params_up, step as usize % PROBLEMS.len());
-
-            // Perturb down
-            let mut params_down = params.clone();
-            params_down[pi] -= eps;
-            let r_down = rollout(params_down, step as usize % PROBLEMS.len());
-
-            // REINFORCE: dJ/dtheta ≈ (R_up - R_down) / (2*eps)
-            *g = (r_up.2 - r_down.2) as f32 / (2.0 * eps);
+        // Fresh random init each round (different seed via randn).
+        let policy = PolicyNet::new(&device)?;
+        let init_params = policy.params_flat();
+        let num_params = init_params.len();
+        if run == 0 {
+            println!("policy params: {num_params} floats");
         }
 
-        // 5. Update params (SGD)
-        let mut new_params = params.clone();
-        for (p, g) in new_params.iter_mut().zip(grad.iter()) {
-            *p += lr * g;
+        let ps = ray.create_actor(
+            "ps",
+            PSState {
+                params: init_params,
+                step: 0,
+            },
+        );
+
+        let lr = 0.01;
+        let run_start = Instant::now();
+        let mut total_reward = 0.0;
+        let mut total_rollouts = 0u64;
+        let mut max_reward = 0.0;
+        let mut final_reward = 0.0;
+        let mut step_times_ms: Vec<f64> = Vec::new();
+        let mut rollout_rates: Vec<f64> = Vec::new();
+
+        for step in 0..steps {
+            let step_start = Instant::now();
+
+            // 1. Get current params
+            let r = ps.call(|s| s.params.clone()).await.unwrap();
+            let params: Vec<f32> = ray.get(&r).await.unwrap();
+
+            // 2. Fan out: rollouts on different problems
+            let dev = device.clone();
+            let rollout_refs: Vec<_> = (0..workers)
+                .map(|i| {
+                    let p = params.clone();
+                    let d = dev.clone();
+                    ray.spawn((), move |()| rollout(p.clone(), i, d.clone()))
+                })
+                .collect();
+
+            // 3. Fan in: collect rollouts
+            let results: Vec<(Vec<usize>, Vec<f32>, f64)> = ray
+                .get_batch(&rollout_refs)
+                .await
+                .into_iter()
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let avg_reward: f64 =
+                results.iter().map(|r| r.2).sum::<f64>() / results.len() as f64;
+            total_reward += results.iter().map(|r| r.2).sum::<f64>();
+            total_rollouts += results.len() as u64;
+            if avg_reward > max_reward {
+                max_reward = avg_reward;
+            }
+            final_reward = avg_reward;
+
+            // 4. Compute REINFORCE gradient (numerical, per-parameter finite differences)
+            let mut grad = vec![0.0f32; params.len()];
+            let eps = 1e-3;
+            let dev = device.clone();
+
+            for (pi, g) in grad.iter_mut().enumerate() {
+                // Perturb up
+                let mut params_up = params.clone();
+                params_up[pi] += eps;
+                let r_up = rollout(params_up, step as usize % PROBLEMS.len(), dev.clone());
+
+                // Perturb down
+                let mut params_down = params.clone();
+                params_down[pi] -= eps;
+                let r_down = rollout(params_down, step as usize % PROBLEMS.len(), dev.clone());
+
+                // REINFORCE: dJ/dtheta ≈ (R_up - R_down) / (2*eps)
+                *g = (r_up.2 - r_down.2) as f32 / (2.0 * eps);
+            }
+
+            // 5. Update params (SGD)
+            let mut new_params = params.clone();
+            for (p, g) in new_params.iter_mut().zip(grad.iter()) {
+                *p += lr * g;
+            }
+
+            // 6. Push to PS
+            let new_params_clone = new_params.clone();
+            let r = ps
+                .call(move |s| {
+                    s.params = new_params_clone;
+                    s.step += 1;
+                    s.step
+                })
+                .await
+                .unwrap();
+            let new_step: u64 = ray.get(&r).await.unwrap();
+            assert_eq!(new_step, step + 1);
+
+            let step_time = step_start.elapsed();
+            let step_ms = step_time.as_secs_f64() * 1000.0;
+            let rollouts_per_sec = (workers as f64) / step_time.as_secs_f64();
+            step_times_ms.push(step_ms);
+            rollout_rates.push(rollouts_per_sec);
+
+            // Record to CSV
+            write_step_record(
+                &mut csv,
+                &StepRecord {
+                    run,
+                    step,
+                    avg_reward,
+                    step_time_ms: step_ms,
+                    rollouts_per_sec,
+                },
+            )?;
+            csv.flush()?;
+
+            if step % 5 == 0 || step == steps - 1 {
+                println!(
+                    "  step {step:>4}/{steps} | avg_reward={avg_reward:.3} | step_time={step_ms:.0}ms | rollouts/s={rollouts_per_sec:.1}",
+                );
+            }
         }
 
-        // 6. Push to PS
-        let new_params_clone = new_params.clone();
-        let r = ps
-            .call(move |s| {
-                s.params = new_params_clone;
-                s.step += 1;
-                s.step
-            })
-            .await
-            .unwrap();
-        let new_step: u64 = ray.get(&r).await.unwrap();
-        assert_eq!(new_step, step + 1);
+        let total_time = run_start.elapsed().as_secs_f64();
+        let mean_reward = total_reward / total_rollouts as f64;
+        let avg_step_ms = step_times_ms.iter().sum::<f64>() / step_times_ms.len() as f64;
+        let avg_rps = rollout_rates.iter().sum::<f64>() / rollout_rates.len() as f64;
 
-        if step % 5 == 0 || step == steps - 1 {
-            println!(
-                "step {step:>4}/{steps} | avg_reward={avg_reward:.3} | mean_reward={:.3} | {:.1?}",
-                total_reward / total_rollouts as f64,
-                start.elapsed()
-            );
-        }
+        let summary = RunSummary {
+            run,
+            total_time_sec: total_time,
+            mean_reward,
+            max_reward,
+            final_reward,
+            total_steps: steps,
+            total_rollouts,
+            avg_step_ms,
+            avg_rollouts_per_sec: avg_rps,
+        };
+        run_summaries.push(summary);
+
+        println!(
+            "  Round {run} done: {:.1}s total, mean_reward={:.3}, max_reward={:.3}, avg_step={:.0}ms, avg_rollouts/s={:.1}",
+            total_time, mean_reward, max_reward, avg_step_ms, avg_rps
+        );
     }
 
-    println!("\n=== Done ===");
+    // ---- Overall summary across all rounds ----
+    println!("\n=== Overall Summary ({rounds} rounds on {device_name}) ===");
+    println!("{:>4} {:>10} {:>10} {:>10} {:>10} {:>12} {:>14}", "run", "time(s)", "mean_r", "max_r", "final_r", "step_ms", "rollouts/s");
+    for s in &run_summaries {
+        println!(
+            "{:>4} {:>10.1} {:>10.3} {:>10.3} {:>10.3} {:>12.0} {:>14.1}",
+            s.run, s.total_time_sec, s.mean_reward, s.max_reward, s.final_reward, s.avg_step_ms, s.avg_rollouts_per_sec
+        );
+    }
+
+    let avg_time: f64 = run_summaries.iter().map(|s| s.total_time_sec).sum::<f64>() / run_summaries.len() as f64;
+    let avg_mean_r: f64 = run_summaries.iter().map(|s| s.mean_reward).sum::<f64>() / run_summaries.len() as f64;
+    let avg_step: f64 = run_summaries.iter().map(|s| s.avg_step_ms).sum::<f64>() / run_summaries.len() as f64;
+    let avg_rps: f64 = run_summaries.iter().map(|s| s.avg_rollouts_per_sec).sum::<f64>() / run_summaries.len() as f64;
     println!(
-        "trained {steps} steps, {total_rollouts} rollouts, mean_reward={:.3}",
-        total_reward / total_rollouts as f64
+        "{:>4} {:>10.1} {:>10.3} {:>10} {:>10} {:>12.0} {:>14.1}",
+        "avg", avg_time, avg_mean_r, "-", "-", avg_step, avg_rps
     );
+    let grand_rollouts: u64 = run_summaries.iter().map(|s| s.total_rollouts).sum();
+    println!(
+        "\nTotal across {rounds} rounds: {} steps, {} rollouts, {:.1}s wall-clock",
+        run_summaries.iter().map(|s| s.total_steps).sum::<u64>(),
+        grand_rollouts,
+        run_summaries.iter().map(|s| s.total_time_sec).sum::<f64>()
+    );
+    println!("\nPer-step results written to {csv_path}");
     println!("status: {:?}", ray.status());
     Ok(())
 }
