@@ -118,6 +118,7 @@ async fn distributed_actor_discovery() {
         id: actor_id,
         name: "counter".to_string(),
         state: ActorState::Running,
+        owner_node: None,
         created_at: std::time::Instant::now(),
         pending_tasks: 0,
         completed_tasks: 0,
@@ -148,6 +149,90 @@ async fn distributed_actor_discovery() {
         ActorState::Dead,
         "actor state change (Dead) should propagate to worker"
     );
+}
+
+/// Test cross-node actor method calls. An actor created on the head node with
+/// a registered method should be callable from the worker node via
+/// `call_named`, which transparently routes through the local node to the
+/// actor's owner node (Ray's cross-node actor call pattern).
+#[tokio::test]
+async fn cross_node_actor_call() {
+    let store1 = ObjectStore::new();
+    let store2 = ObjectStore::new();
+
+    // Head node: hosts the actor
+    let head = Node::start("127.0.0.1:0", None, store1.clone())
+        .await
+        .unwrap();
+    let head_addr = head.addr.clone();
+
+    // Worker node: will call the actor remotely
+    let worker = Node::start("127.0.0.1:0", Some(&head_addr), store2.clone())
+        .await
+        .unwrap();
+
+    // Create actor on head, attach node so it's registered + discoverable.
+    // Use ray_head's GCS for sync so the actor appears in the synced GCS.
+    #[derive(Clone, Default)]
+    #[allow(dead_code)]
+    struct Counter {
+        count: u64,
+    }
+    let ray_head = crayon::Ray::init_with_memory(
+        1,
+        1024 * 1024,
+        std::env::temp_dir().join("crayon_cross_node_head"),
+    );
+    ray_head.attach_node(head.clone());
+    head.with_gcs(ray_head.gcs().clone());
+
+    // Set up worker's Ray + GCS sync BEFORE the first broadcast (every 2s)
+    // so it receives the actor metadata from head.
+    let ray_worker = crayon::Ray::init_with_memory(
+        1,
+        1024 * 1024,
+        std::env::temp_dir().join("crayon_cross_node_worker"),
+    );
+    ray_worker.attach_node(worker.clone());
+    worker.with_gcs(ray_worker.gcs().clone());
+
+    let actor = ray_head.create_actor("counter", Counter { count: 0 });
+
+    // Register a named method: takes serialized u64 (delta), returns serialized u64
+    actor.register_method("inc", |state: &mut Counter, args: Vec<u8>| {
+        let delta: u64 = bincode::deserialize(&args).unwrap_or(0);
+        state.count += delta;
+        bincode::serialize(&state.count).unwrap()
+    });
+
+    // Wait for GCS sync (every 2s) so worker discovers the actor
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    let remote_actor = ray_worker
+        .get_actor::<Counter>("counter")
+        .expect("worker should discover actor from head via GCS sync");
+    assert!(
+        remote_actor.owner_node().is_some(),
+        "discovered actor should have an owner node"
+    );
+
+    // Call the method remotely — routes worker -> head -> actor task
+    let args = bincode::serialize(&42u64).unwrap();
+    let result_bytes = remote_actor
+        .call_named("inc", args)
+        .await
+        .expect("cross-node actor call should succeed");
+    let result: u64 = bincode::deserialize(&result_bytes).unwrap();
+    assert_eq!(result, 42, "first call should return 0 + 42 = 42");
+
+    // Call again to verify stateful behavior across the network
+    let args = bincode::serialize(&8u64).unwrap();
+    let result_bytes = remote_actor
+        .call_named("inc", args)
+        .await
+        .expect("second cross-node actor call should succeed");
+    let result: u64 = bincode::deserialize(&result_bytes).unwrap();
+    assert_eq!(result, 50, "second call should return 42 + 8 = 50");
 }
 
 #[tokio::test]

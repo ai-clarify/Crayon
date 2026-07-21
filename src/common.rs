@@ -211,6 +211,7 @@ pub enum CrayonError {
     Serialize(String),
     TaskFailed(String),
     ActorDead(ActorID),
+    ActorMethodNotFound(ActorID, String),
     Timeout(ObjectID),
 }
 
@@ -223,6 +224,9 @@ impl fmt::Display for CrayonError {
             CrayonError::Serialize(e) => write!(f, "serialization error: {e}"),
             CrayonError::TaskFailed(e) => write!(f, "task failed: {e}"),
             CrayonError::ActorDead(id) => write!(f, "actor dead: {id}"),
+            CrayonError::ActorMethodNotFound(id, name) => {
+                write!(f, "actor {id} has no registered method '{name}'")
+            }
             CrayonError::Timeout(id) => write!(f, "timeout waiting for object: {id}"),
         }
     }

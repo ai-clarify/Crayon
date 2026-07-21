@@ -56,6 +56,8 @@ struct RayInner {
     gcs: Gcs,
     scheduler: Scheduler,
     named_actors: parking_lot::Mutex<HashMap<String, Arc<ActorHandleInner>>>,
+    /// Optional node for distributed actor discovery + cross-node calls.
+    node: parking_lot::Mutex<Option<Arc<crate::node::Node>>>,
 }
 
 impl Ray {
@@ -113,8 +115,16 @@ impl Ray {
                 gcs,
                 scheduler,
                 named_actors: parking_lot::Mutex::new(HashMap::new()),
+                node: parking_lot::Mutex::new(None),
             }),
         }
+    }
+
+    /// Attach a [`Node`] for distributed actor discovery and cross-node calls.
+    /// Must be called before creating actors that should be reachable from
+    /// other nodes.
+    pub fn attach_node(&self, node: Arc<crate::node::Node>) {
+        *self.inner.node.lock() = Some(node);
     }
 
     /// Store an object in the object store. Returns a typed, refcounted
@@ -262,12 +272,18 @@ impl Ray {
         state: S,
         max_restarts: u32,
     ) -> ActorHandle<S> {
+        // If a node is attached, the actor lives on this node — register it so
+        // incoming ActorCall messages can be routed to it.
+        let node = self.inner.node.lock().clone();
+        let owner_node = node.as_ref().map(|n| n.id);
         let handle = spawn_actor(
             name,
             state,
             max_restarts,
             self.inner.gcs.clone(),
             self.inner.store.clone(),
+            owner_node,
+            node,
         );
         if !name.is_empty() {
             self.inner
@@ -275,19 +291,42 @@ impl Ray {
                 .lock()
                 .insert(name.to_string(), handle.inner.clone());
         }
+        if let Some(node) = self.inner.node.lock().clone() {
+            node.register_actor(handle.inner.clone());
+        }
         handle
     }
 
-    /// Look up a previously registered actor by name. The caller must specify
-    /// the actor's state type `S`; a mismatch will surface as a panic on the
-    /// first `call` (the actor task downcasts its state).
+    /// Look up a previously registered actor by name. If the actor is not
+    /// local, searches the GCS (which is synced from peers) and returns a
+    /// remote proxy handle — [`ActorHandle::call_named`] will transparently
+    /// forward calls to the actor's owner node.
+    ///
+    /// The caller must specify the actor's state type `S`; a mismatch will
+    /// surface as a panic on the first `call` (the actor task downcasts its
+    /// state).
     pub fn get_actor<S: Send + 'static>(&self, name: &str) -> Option<ActorHandle<S>> {
-        self.inner
-            .named_actors
-            .lock()
-            .get(name)
-            .cloned()
-            .map(ActorHandle::from_inner)
+        // 1. Local actor registry.
+        if let Some(inner) = self.inner.named_actors.lock().get(name).cloned() {
+            return Some(ActorHandle::from_inner(inner));
+        }
+        // 2. Remote actor discovered via GCS sync. Build a proxy handle whose
+        //    `call_named` routes through the local node to the owner node.
+        let node = self.inner.node.lock().clone()?;
+        let meta = self
+            .inner
+            .gcs
+            .actors()
+            .into_iter()
+            .find(|a| a.name == name && a.owner_node.is_some())?;
+        let inner = crate::actor::ActorHandleInner::remote_proxy(
+            meta.id,
+            meta.owner_node.unwrap(),
+            node,
+            self.inner.store.clone(),
+            self.inner.gcs.clone(),
+        );
+        Some(ActorHandle::from_inner(inner))
     }
 
     /// Remove a named actor from the registry and kill it. Returns `true` if

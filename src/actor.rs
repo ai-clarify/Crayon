@@ -9,18 +9,26 @@
 //! thread (by default) so its state is never accessed concurrently.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::common::{ActorID, ActorState, CrayonError, ObjectID};
 use crate::gcs::Gcs;
+use crate::node::NodeID;
 use crate::object_store::ObjectStore;
 
 /// A type-erased actor method: takes the actor's state (as `&mut dyn Any`),
 /// returns the serialized result.
 pub(crate) type ActorMethod = Box<dyn FnOnce(&mut dyn Any) -> Vec<u8> + Send>;
+
+/// A registered named method: takes state + serialized args, returns serialized
+/// result. Used for cross-node actor calls (closures can't be sent over the
+/// network, so remote callers address methods by name).
+type MethodFn = Arc<dyn Fn(&mut dyn Any, Vec<u8>) -> Vec<u8> + Send + Sync>;
 
 pub(crate) struct Call {
     func: ActorMethod,
@@ -41,9 +49,37 @@ pub struct ActorHandleInner {
     store: ObjectStore,
     gcs: Gcs,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Registered named methods for cross-node calls.
+    methods: Arc<Mutex<HashMap<String, MethodFn>>>,
+    /// The node that owns this actor. `None` means local (same process).
+    pub owner_node: Option<NodeID>,
+    /// The local node, used to route calls to remote actors.
+    pub node: Option<Arc<crate::node::Node>>,
 }
 
 impl ActorHandleInner {
+    /// Build a proxy handle for an actor that lives on a remote node. The
+    /// mailbox is never used — `call_named` routes through `node` instead.
+    pub(crate) fn remote_proxy(
+        id: ActorID,
+        owner_node: NodeID,
+        node: Arc<crate::node::Node>,
+        store: ObjectStore,
+        gcs: Gcs,
+    ) -> Arc<Self> {
+        let (tx, _rx) = mpsc::channel::<Call>(1);
+        Arc::new(ActorHandleInner {
+            id,
+            tx,
+            store,
+            gcs,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            methods: Arc::new(Mutex::new(HashMap::new())),
+            owner_node: Some(owner_node),
+            node: Some(node),
+        })
+    }
+
     pub(crate) async fn send_call(&self, call: Call) -> Result<(), CrayonError> {
         if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(CrayonError::ActorDead(self.id));
@@ -66,6 +102,36 @@ impl ActorHandleInner {
 
     pub(crate) fn gcs(&self) -> &Gcs {
         &self.gcs
+    }
+
+    /// Register a named method so it can be called from remote nodes.
+    pub(crate) fn register_method(&self, name: &str, func: MethodFn) {
+        self.methods.lock().insert(name.to_string(), func);
+    }
+
+    /// Invoke a registered method by name (called by the node when it receives
+    /// a remote `ActorCall` message).
+    pub(crate) async fn call_method(
+        &self,
+        name: &str,
+        args: Vec<u8>,
+    ) -> Result<Vec<u8>, CrayonError> {
+        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(CrayonError::ActorDead(self.id));
+        }
+        let func = self
+            .methods
+            .lock()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| CrayonError::ActorMethodNotFound(self.id, name.to_string()))?;
+        let (reply, rx) = oneshot::channel();
+        let call = Call {
+            func: Box::new(move |state| func(state, args)),
+            reply,
+        };
+        self.send_call(call).await?;
+        rx.await.map_err(|_| CrayonError::ActorDead(self.id))?
     }
 }
 
@@ -159,23 +225,77 @@ impl<S: Send + 'static> ActorHandle<S> {
             .gcs()
             .set_actor_state(self.inner.id, ActorState::Dead);
     }
+
+    /// Register a named method so it can be invoked from remote nodes via
+    /// [`ActorHandle::call_remote`]. The closure receives serialized args and
+    /// returns serialized bytes — this is the cross-network calling convention
+    /// (closures can't be sent over the wire).
+    pub fn register_method<F>(&self, name: &str, func: F)
+    where
+        F: Fn(&mut S, Vec<u8>) -> Vec<u8> + Send + Sync + 'static,
+    {
+        let erased: MethodFn = Arc::new(move |state: &mut dyn Any, args| {
+            let s = state
+                .downcast_mut::<S>()
+                .expect("actor state type mismatch");
+            func(s, args)
+        });
+        self.inner.register_method(name, erased);
+    }
+
+    /// The node that owns this actor, if it lives on a remote node.
+    pub fn owner_node(&self) -> Option<NodeID> {
+        self.inner.owner_node
+    }
+
+    /// Invoke a registered named method on the actor. Automatically routes to
+    /// the actor's owner node if it lives on a remote node (Ray's cross-node
+    /// actor call pattern). Returns the serialized result bytes.
+    ///
+    /// Use [`ActorHandle::register_method`] on the owner node to expose methods,
+    /// and [`ActorHandle::call_named`] on any node to invoke them.
+    pub async fn call_named(&self, method: &str, args: Vec<u8>) -> Result<Vec<u8>, CrayonError> {
+        // Local actor: call directly through the mailbox.
+        if self.inner.owner_node.is_none() || self.inner.node.is_none() {
+            return self.inner.call_method(method, args).await;
+        }
+        // Remote actor: forward via the local node to the owner node.
+        let node = self
+            .inner
+            .node
+            .clone()
+            .ok_or(CrayonError::ActorDead(self.inner.id))?;
+        let owner = self
+            .inner
+            .owner_node
+            .ok_or(CrayonError::ActorDead(self.inner.id))?;
+        node.remote_actor_call(self.inner.id, owner, method, args)
+            .await
+            .map_err(|e| CrayonError::TaskFailed(e.to_string()))
+    }
 }
 
 /// Spawn a new actor with the given initial state. If `max_restarts > 0`,
 /// the actor will be restarted from its initial state on panic (Ray's
 /// `max_restarts`). Each restart resets the state to the original value.
+///
+/// `owner_node` identifies the node hosting this actor (for cross-node
+/// discovery). Pass `None` for local-only actors.
 pub fn spawn_actor<S: Send + Clone + 'static>(
     name: &str,
     state: S,
     max_restarts: u32,
     gcs: Gcs,
     store: ObjectStore,
+    owner_node: Option<NodeID>,
+    node: Option<Arc<crate::node::Node>>,
 ) -> ActorHandle<S> {
     let id = ActorID::new();
     gcs.add_actor(crate::gcs::ActorMeta {
         id,
         name: name.to_string(),
         state: ActorState::Running,
+        owner_node,
         created_at: Instant::now(),
         pending_tasks: 0,
         completed_tasks: 0,
@@ -186,6 +306,7 @@ pub fn spawn_actor<S: Send + Clone + 'static>(
     let initial_state = state.clone();
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
+    let methods = Arc::new(Mutex::new(HashMap::new()));
 
     tokio::spawn(async move {
         let mut restarts = 0;
@@ -233,6 +354,9 @@ pub fn spawn_actor<S: Send + Clone + 'static>(
             store,
             gcs,
             shutdown,
+            methods,
+            owner_node,
+            node,
         }),
         _state: std::marker::PhantomData,
     }

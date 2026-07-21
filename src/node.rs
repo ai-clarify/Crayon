@@ -60,12 +60,38 @@ pub enum Message {
     GcsSync {
         objects: Vec<(ObjectID, usize)>, // (id, size_bytes)
         tasks: Vec<(crate::common::TaskID, crate::common::TaskState)>,
-        /// (id, name, state) — lets peers discover named actors across nodes.
-        actors: Vec<(crate::common::ActorID, String, crate::common::ActorState)>,
+        /// (id, name, state, owner_node) — lets peers discover named actors
+        /// across nodes and route calls to the right node.
+        actors: Vec<(
+            crate::common::ActorID,
+            String,
+            crate::common::ActorState,
+            Option<NodeID>,
+        )>,
+    },
+    /// Invoke a registered method on a remote actor. `call_id` lets the caller
+    /// match the reply.
+    ActorCall {
+        actor_id: crate::common::ActorID,
+        method: String,
+        args: Vec<u8>,
+        call_id: u64,
+    },
+    /// Reply to an [`Message::ActorCall`].
+    ActorCallReply {
+        call_id: u64,
+        result: Result<Vec<u8>, String>,
     },
 }
 
 type NodeError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Monotonic call ID generator for matching [`Message::ActorCall`] replies.
+fn rand_call_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A pooled TCP connection that can send/receive [`Message`]s.
 struct Connection {
@@ -150,6 +176,9 @@ pub struct Node {
     /// Optional GCS for metadata sync. When attached, the node periodically
     /// broadcasts object/task metadata to peers and merges incoming metadata.
     gcs: Arc<Mutex<Option<crate::gcs::Gcs>>>,
+    /// Locally-hosted actors, keyed by ID. Used to route incoming
+    /// [`Message::ActorCall`] messages to the right actor task.
+    local_actors: Arc<Mutex<HashMap<crate::common::ActorID, Arc<crate::actor::ActorHandleInner>>>>,
 }
 
 impl Node {
@@ -169,6 +198,7 @@ impl Node {
             peers: Arc::new(Mutex::new(HashMap::new())),
             pool: ConnectionPool::new(),
             gcs: Arc::new(Mutex::new(None)),
+            local_actors: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // Accept loop
@@ -267,7 +297,48 @@ impl Node {
         self.clone()
     }
 
-    /// Broadcast local GCS metadata to all peers.
+    /// Register a locally-hosted actor so incoming [`Message::ActorCall`]
+    /// messages can be routed to it.
+    pub fn register_actor(&self, inner: Arc<crate::actor::ActorHandleInner>) {
+        self.local_actors.lock().insert(inner.id, inner);
+    }
+
+    /// Invoke a registered method on a remote actor. Sends an
+    /// [`Message::ActorCall`] to the actor's owner node and waits for the reply.
+    pub async fn remote_actor_call(
+        &self,
+        actor_id: crate::common::ActorID,
+        owner: NodeID,
+        method: &str,
+        args: Vec<u8>,
+    ) -> Result<Vec<u8>, NodeError> {
+        let addr = self
+            .peers
+            .lock()
+            .get(&owner)
+            .map(|p| p.addr.clone())
+            .ok_or_else(|| format!("no peer with node id {owner}"))?;
+
+        let call_id = rand_call_id();
+        let mut conn = self.pool.get(&addr).await?;
+        conn.send(&Message::ActorCall {
+            actor_id,
+            method: method.to_string(),
+            args,
+            call_id,
+        })
+        .await?;
+        match conn.recv().await? {
+            Some(Message::ActorCallReply { call_id: rid, result }) if rid == call_id => {
+                self.pool.put(&addr, conn);
+                result.map_err(|e| e.into())
+            }
+            _ => {
+                self.pool.put(&addr, conn);
+                Err("unexpected reply to actor call".into())
+            }
+        }
+    }
     async fn broadcast_gcs(&self) {
         let gcs = match self.gcs.lock().clone() {
             Some(g) => g,
@@ -286,7 +357,7 @@ impl Node {
         let actors: Vec<_> = gcs
             .actors()
             .into_iter()
-            .map(|a| (a.id, a.name, a.state))
+            .map(|a| (a.id, a.name, a.state, a.owner_node))
             .collect();
         let msg = Message::GcsSync {
             objects,
@@ -427,9 +498,10 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                             output: None,
                         });
                     }
-                    for (id, name, state) in actors {
-                        // Upsert: insert if new, otherwise just update state so
-                        // we don't clobber local task counters.
+                    for (id, name, state, owner_node) in actors {
+                        // Upsert: insert if new (with owner_node for routing),
+                        // otherwise just update state so we don't clobber local
+                        // task counters.
                         if gcs.get_actor(id).is_some() {
                             gcs.set_actor_state(id, state);
                         } else {
@@ -437,6 +509,7 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                                 id,
                                 name,
                                 state,
+                                owner_node,
                                 created_at: std::time::Instant::now(),
                                 pending_tasks: 0,
                                 completed_tasks: 0,
@@ -444,6 +517,24 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                         }
                     }
                 }
+            }
+            Message::ActorCall {
+                actor_id,
+                method,
+                args,
+                call_id,
+            } => {
+                // Route the incoming call to the local actor task.
+                let actor = node.local_actors.lock().get(&actor_id).cloned();
+                let reply = match actor {
+                    Some(actor) => match actor.call_method(&method, args).await {
+                        Ok(bytes) => Ok(bytes),
+                        Err(e) => Err(e.to_string()),
+                    },
+                    None => Err(format!("actor {actor_id} not found on this node")),
+                };
+                conn.send(&Message::ActorCallReply { call_id, result: reply })
+                    .await?;
             }
             _ => {}
         }

@@ -27,6 +27,8 @@ pub struct ActorMeta {
     pub id: ActorID,
     pub name: String,
     pub state: ActorState,
+    /// The node that hosts this actor (for cross-node discovery/calls).
+    pub owner_node: Option<crate::node::NodeID>,
     pub created_at: Instant,
     pub pending_tasks: usize,
     pub completed_tasks: usize,
