@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crayon::resources::Resources;
 use crayon::Ray;
 
 /// Policy weights — a stand-in for a real neural network.
@@ -124,16 +123,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!("=== Crayon RL Simulation ===");
     println!("workers={workers} steps={steps} horizon={horizon} obs_dim={obs_dim}");
-    println!("GPU-aware scheduling: rollout tasks request 0.0 GPU (CPU-bound),");
-    println!("trainer requests 1.0 GPU (runs on GPU worker if available)");
 
-    // 4 workers: 3 CPU-only + 1 with GPU. GPU tasks go to the GPU worker.
-    let cpu_res = Resources::new(1.0, 0.0);
-    let gpu_res = Resources::new(1.0, 1.0);
-    let ray = Ray::init_with_resources(4, cpu_res);
-    // Override one worker to have a GPU (simulate a heterogeneous cluster).
-    // ponytail: ResourceTracker doesn't yet support per-worker resource
-    // overrides; we just validate scheduling with uniform resources here.
+    // 4 workers, each with 1 CPU. Rollout + trainer tasks all use 1 CPU.
+    let ray = Ray::init(4);
 
     let ps = ray.create_actor("ps", Policy::new(obs_dim));
 
@@ -167,11 +159,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let samples_this_step: u64 = trajs.iter().map(|t| t.obs.len() as u64).sum();
         total_samples.fetch_add(samples_this_step, Ordering::Relaxed);
 
-        // 4. Compute gradient (runs as a "GPU" task — would use the GPU in real life)
+        // 4. Compute gradient (CPU-bound in this simulation; in production this
+        //    would be a GPU task using the actual GPU for backprop)
         let trajs_ref = ray.put(trajs.clone());
-        let grad_ref = ray.spawn_with_resources(
+        let grad_ref = ray.spawn(
             (trajs_ref,),
-            gpu_res,
             move |(t,): (Vec<Trajectory>,)| compute_grad(&t, obs_dim),
         );
         let grad: Vec<f32> = ray.get(&grad_ref).await.unwrap();

@@ -221,7 +221,16 @@ impl Ray {
             }),
         };
         let r = self.inner.store.reserve_ref(output_id);
-        let _ = self.inner.scheduler.schedule(task);
+        if let Err(e) = self.inner.scheduler.schedule(task) {
+            // Scheduling failed (e.g. task resources exceed any worker's total).
+            // Store the error so the caller gets it on `get` instead of a
+            // timeout.
+            let bytes = bincode::serialize(&e.to_string()).unwrap();
+            self.inner.store.put_bytes(output_id, bytes, None);
+            self.inner
+                .gcs
+                .set_task_state(id, crate::common::TaskState::Failed, Some(output_id));
+        }
         r
     }
 
