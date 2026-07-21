@@ -76,3 +76,17 @@ impl_resolve_args!(A, B, C);
 impl_resolve_args!(A, B, C, D);
 impl_resolve_args!(A, B, C, D, E);
 impl_resolve_args!(A, B, C, D, E, F);
+
+/// A `Vec` of [`ResolveArg`]s resolves to a `Vec` of outputs, allowing a
+/// dynamic number of task arguments (used by the Python bindings).
+#[async_trait]
+impl<A: ResolveArg> ResolveArgs for Vec<A> {
+    type Output = Vec<A::Output>;
+    async fn resolve(self, store: &ObjectStore) -> Result<Self::Output, CrayonError> {
+        let mut out = Vec::with_capacity(self.len());
+        for arg in self {
+            out.push(arg.resolve(store).await?);
+        }
+        Ok(out)
+    }
+}

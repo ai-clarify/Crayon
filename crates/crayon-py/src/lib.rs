@@ -1,0 +1,444 @@
+//! PyO3 Python bindings for the Crayon distributed runtime.
+//!
+//! Exposes a Python API mirroring Ray's core: `Ray`, `ObjectRef`, `Resources`,
+//! and actor handles. Python objects are serialized via `pickle` and stored in
+//! Crayon's object store as raw bytes.
+
+use std::sync::Arc;
+
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+
+use crayon_rs::common::TaskID;
+use crayon_rs::resources::Resources as RustResources;
+use crayon_rs::Ray as RustRay;
+
+// ---------------------------------------------------------------------------
+// ObjectRef
+// ---------------------------------------------------------------------------
+
+/// A reference to an object stored in Crayon's object store.
+#[pyclass]
+#[derive(Clone)]
+struct ObjectRef {
+    inner: crayon_rs::common::ObjectRef<Vec<u8>>,
+}
+
+#[pymethods]
+impl ObjectRef {
+    /// The object's unique identifier (hex string).
+    #[getter]
+    fn id(&self) -> String {
+        format!("{}", self.inner.id)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ObjectRef({})", self.id())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+/// Resource requirements for a task or actor.
+#[pyclass]
+#[derive(Clone, Copy)]
+struct Resources {
+    #[pyo3(get, set)]
+    cpu: f64,
+    #[pyo3(get, set)]
+    gpu: f64,
+}
+
+#[pymethods]
+impl Resources {
+    #[new]
+    #[pyo3(signature = (cpu=1.0, gpu=0.0))]
+    fn new(cpu: f64, gpu: f64) -> Self {
+        Resources { cpu, gpu }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Resources(cpu={}, gpu={})", self.cpu, self.gpu)
+    }
+}
+
+impl From<Resources> for RustResources {
+    fn from(r: Resources) -> Self {
+        RustResources::new(r.cpu, r.gpu)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ActorHandle
+// ---------------------------------------------------------------------------
+
+/// A handle to a stateful actor created via `Ray.create_actor`.
+#[pyclass]
+struct ActorHandle {
+    inner: crayon_rs::actor::ActorHandle<Vec<u8>>,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+#[pymethods]
+impl ActorHandle {
+    /// Call a method on the actor's state object.
+    ///
+    /// `method` is the name of the method to invoke on the state object;
+    /// `args` are passed positionally. Returns an `ObjectRef` for the result.
+    #[pyo3(signature = (method, *args))]
+    fn call(&self, method: &str, args: Bound<'_, PyTuple>) -> PyResult<ObjectRef> {
+        let method = method.to_string();
+        let args_vec: Vec<PyObject> = args.iter().map(|a| a.unbind()).collect();
+
+        let inner = self.inner.clone();
+        let fut = async move {
+            inner
+                .call(move |state: &mut Vec<u8>| -> Vec<u8> {
+                    Python::with_gil(|py| {
+                        // Unpickle state
+                        let state_obj = pickle_loads(py, state).expect("failed to unpickle state");
+                        let state_bound = state_obj.bind(py);
+                        let method_obj = state_bound
+                            .getattr(method.as_str())
+                            .unwrap_or_else(|e| panic!("failed to get method '{method}': {e}"));
+                        let args_tuple =
+                            PyTuple::new_bound(py, &args_vec);
+                        let result = method_obj
+                            .call1(&args_tuple)
+                            .unwrap_or_else(|e| panic!("method '{method}' failed: {e}"));
+                        // Re-pickle state back (state may have mutated)
+                        let new_state = pickle_dumps(py, state_bound).expect("failed to pickle state");
+                        *state = new_state;
+                        pickle_dumps(py, &result).expect("failed to pickle result")
+                    })
+                })
+                .await
+        };
+
+        let obj_ref = Python::with_gil(|py| {
+            py.allow_threads(|| {
+                self.runtime
+                    .block_on(fut)
+                    .map_err(|e| PyRuntimeError::new_err(format!("actor call failed: {:?}", e)))
+            })
+        })?;
+
+        Ok(ObjectRef { inner: obj_ref })
+    }
+
+    /// Kill the actor. New calls will fail.
+    fn kill(&self) {
+        self.inner.kill();
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ActorHandle(id={})", self.inner.id())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ray
+// ---------------------------------------------------------------------------
+
+/// The Crayon runtime handle.
+#[pyclass]
+struct Ray {
+    inner: RustRay,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+#[pymethods]
+impl Ray {
+    /// Initialize the runtime with `num_workers` worker threads.
+    #[new]
+    fn new(num_workers: usize) -> PyResult<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to build tokio runtime: {e}")))?;
+        let runtime = Arc::new(runtime);
+
+        let inner = runtime.block_on(async { RustRay::init(num_workers) });
+
+        Ok(Ray { inner, runtime })
+    }
+
+    /// Store a Python object in the object store. Returns an `ObjectRef`.
+    fn put(&self, value: &Bound<'_, PyAny>) -> PyResult<ObjectRef> {
+        let py = value.py();
+        let bytes = pickle_dumps(py, value)?;
+        let obj_ref = self.inner.put(bytes);
+        Ok(ObjectRef { inner: obj_ref })
+    }
+
+    /// Fetch an object by reference. Blocks until the object is available.
+    fn get(&self, obj_ref: &ObjectRef) -> PyResult<PyObject> {
+        let inner = self.inner.clone();
+        let obj_ref = obj_ref.inner.clone();
+        // Release the GIL while blocking so worker threads can run Python code.
+        let bytes = Python::with_gil(|py| {
+            py.allow_threads(|| {
+                self.runtime
+                    .block_on(async move { inner.get::<Vec<u8>>(&obj_ref).await })
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("get failed: {:?}", e)))?;
+        Python::with_gil(|py| pickle_loads(py, &bytes))
+    }
+
+    /// Fetch many objects concurrently. Returns a list of results.
+    fn get_batch(&self, obj_refs: &Bound<'_, PyList>) -> PyResult<PyObject> {
+        let inner = self.inner.clone();
+        let refs: Vec<crayon_rs::common::ObjectRef<Vec<u8>>> = obj_refs
+            .iter()
+            .map(|r| {
+                let r: ObjectRef = r.extract().unwrap();
+                r.inner
+            })
+            .collect();
+        let results = Python::with_gil(|py| {
+            py.allow_threads(|| {
+                self.runtime.block_on(async move {
+                    let ids: Vec<_> = refs.iter().map(|r| r.id).collect();
+                    inner.store().get_batch::<Vec<u8>>(&ids).await
+                })
+            })
+        });
+        Python::with_gil(|py| {
+            let list = PyList::empty_bound(py);
+            for r in results {
+                match r {
+                    Ok(bytes) => {
+                        let obj = pickle_loads(py, &bytes)?;
+                        list.append(obj)?;
+                    }
+                    Err(e) => {
+                        let err = PyRuntimeError::new_err(format!("{:?}", e));
+                        list.append(err)?;
+                    }
+                }
+            }
+            Ok(list.unbind().into_any())
+        })
+    }
+
+    /// Run a Python callable as a remote task.
+    ///
+    /// `func` is called with the given positional `args`. Any `ObjectRef`
+    /// arguments are automatically fetched (resolved) before `func` runs,
+    /// mirroring Ray's automatic dependency resolution. Returns an `ObjectRef`
+    /// for the result.
+    #[pyo3(signature = (func, *args))]
+    fn spawn(&self, func: &Bound<'_, PyAny>, args: Bound<'_, PyTuple>) -> PyResult<ObjectRef> {
+        self.spawn_inner(func, args, None)
+    }
+
+    /// Like `spawn` but with explicit resource requirements.
+    #[pyo3(signature = (func, resources, *args))]
+    fn spawn_with_resources(
+        &self,
+        func: &Bound<'_, PyAny>,
+        resources: Resources,
+        args: Bound<'_, PyTuple>,
+    ) -> PyResult<ObjectRef> {
+        self.spawn_inner(func, args, Some(resources))
+    }
+
+    /// Shared implementation for `spawn` and `spawn_with_resources`.
+    #[pyo3(signature = (func, args, resources=None))]
+    fn spawn_inner(
+        &self,
+        func: &Bound<'_, PyAny>,
+        args: Bound<'_, PyTuple>,
+        resources: Option<Resources>,
+    ) -> PyResult<ObjectRef> {
+        let func_obj = Arc::new(func.clone().unbind());
+
+        // Collect ObjectRef args into a Vec for Rust-side resolution.
+        // Non-ObjectRef args are captured directly as Python objects.
+        let mut ref_args: Vec<crayon_rs::common::ObjectRef<Vec<u8>>> = Vec::new();
+        let mut plain_args: Vec<PyObject> = Vec::new();
+        // For each arg, track whether it came from an ObjectRef (true) or was
+        // passed directly (false), so we can interleave them back in order.
+        let mut is_ref: Vec<bool> = Vec::new();
+        for arg in args.iter() {
+            if let Ok(obj_ref) = arg.extract::<ObjectRef>() {
+                ref_args.push(obj_ref.inner);
+                is_ref.push(true);
+            } else {
+                plain_args.push(arg.unbind());
+                is_ref.push(false);
+            }
+        }
+        let plain_args = Arc::new(plain_args);
+
+        let inner = self.inner.clone();
+        let res = resources.map(RustResources::from);
+        let obj_ref = match res {
+            None => inner.spawn(ref_args, move |resolved: Vec<Vec<u8>>| -> Vec<u8> {
+                run_task(
+                    func_obj.clone(),
+                    resolved,
+                    plain_args.clone(),
+                    is_ref.clone(),
+                )
+            }),
+            Some(res) => inner.spawn_with_resources(
+                ref_args,
+                res,
+                move |resolved: Vec<Vec<u8>>| -> Vec<u8> {
+                    run_task(
+                        func_obj.clone(),
+                        resolved,
+                        plain_args.clone(),
+                        is_ref.clone(),
+                    )
+                },
+            ),
+        };
+
+        Ok(ObjectRef { inner: obj_ref })
+    }
+
+    /// Create a stateful actor with the given name and initial state.
+    fn create_actor(&self, name: &str, state: &Bound<'_, PyAny>) -> PyResult<ActorHandle> {
+        let py = state.py();
+        let state_bytes = pickle_dumps(py, state)?;
+        // Enter the runtime context so tokio::spawn inside spawn_actor works.
+        let _guard = self.runtime.enter();
+        let handle = self.inner.create_actor(name, state_bytes);
+        Ok(ActorHandle {
+            inner: handle,
+            runtime: self.runtime.clone(),
+        })
+    }
+
+    /// Snapshot the current system status as a Python dict.
+    fn status(&self) -> PyResult<PyObject> {
+        let status = self.inner.status();
+        Python::with_gil(|py| {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("objects", status.objects)?;
+            dict.set_item("tasks_total", status.tasks_total)?;
+            dict.set_item("tasks_finished", status.tasks_finished)?;
+            dict.set_item("tasks_failed", status.tasks_failed)?;
+            dict.set_item("tasks_pending", status.tasks_pending)?;
+            dict.set_item("tasks_running", status.tasks_running)?;
+            dict.set_item("worker_utilization", status.worker_utilization)?;
+
+            let actors_list = PyList::empty_bound(py);
+            for a in &status.actors {
+                let entry = (a.id.clone(), a.name.clone(), a.state.clone(), a.pending, a.completed);
+                actors_list.append(entry)?;
+            }
+            dict.set_item("actors", actors_list)?;
+
+            let workers_list = PyList::empty_bound(py);
+            for w in &status.workers {
+                let entry = (w.id, w.busy, w.tasks_done);
+                workers_list.append(entry)?;
+            }
+            dict.set_item("workers", workers_list)?;
+
+            Ok(dict.unbind().into_any())
+        })
+    }
+
+    /// Cancel a task by its id (hex string). Returns `False` if unknown.
+    fn cancel(&self, task_id: &str) -> PyResult<bool> {
+        let id = parse_task_id(task_id)?;
+        Ok(self.inner.cancel(id))
+    }
+
+    fn __repr__(&self) -> String {
+        "Ray(...)".to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Serialize a Python object to bytes via `pickle.dumps`.
+fn pickle_dumps(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let pickle = py.import_bound("pickle")?;
+    let bytes_obj = pickle.call_method1("dumps", (obj,))?;
+    let bytes = bytes_obj.downcast::<PyBytes>()?;
+    Ok(bytes.as_bytes().to_vec())
+}
+
+/// Deserialize bytes back to a Python object via `pickle.loads`.
+fn pickle_loads(py: Python, bytes: &[u8]) -> PyResult<PyObject> {
+    let pickle = py.import_bound("pickle")?;
+    let py_bytes = PyBytes::new_bound(py, bytes);
+    let obj = pickle.call_method1("loads", (py_bytes,))?;
+    Ok(obj.unbind())
+}
+
+/// Execute a Python task function with the given resolved and plain arguments.
+///
+/// `resolved` contains the pickled bytes of ObjectRef args (in order), and
+/// `plain_args` contains directly-passed Python objects (in order). `is_ref`
+/// has one entry per original argument, indicating whether that slot is filled
+/// from `resolved` (true) or `plain_args` (false). The two cursors walk
+/// `resolved`/`plain_args` in lockstep with `is_ref` to reconstruct the full
+/// argument list in its original order.
+fn run_task(
+    func_obj: Arc<PyObject>,
+    resolved: Vec<Vec<u8>>,
+    plain_args: Arc<Vec<PyObject>>,
+    is_ref: Vec<bool>,
+) -> Vec<u8> {
+    Python::with_gil(|py| {
+        let func = func_obj.bind(py);
+        let mut call_args: Vec<PyObject> = Vec::with_capacity(is_ref.len());
+        let mut ref_idx = 0;
+        let mut plain_idx = 0;
+        for &is_r in &is_ref {
+            if is_r {
+                let bytes = &resolved[ref_idx];
+                ref_idx += 1;
+                let obj = pickle_loads(py, bytes).expect("failed to unpickle task arg");
+                call_args.push(obj);
+            } else {
+                call_args.push(plain_args[plain_idx].clone_ref(py));
+                plain_idx += 1;
+            }
+        }
+        let args_tuple = PyTuple::new_bound(py, &call_args);
+        let result = func
+            .call1(&args_tuple)
+            .unwrap_or_else(|e| panic!("task function raised: {e}"));
+        pickle_dumps(py, &result).expect("failed to pickle task result")
+    })
+}
+
+/// Parse a hex string into a `TaskID`.
+fn parse_task_id(s: &str) -> PyResult<TaskID> {
+    let bytes = hex::decode(s)
+        .map_err(|e| PyRuntimeError::new_err(format!("invalid task id '{s}': {e}")))?;
+    if bytes.len() != 16 {
+        return Err(PyRuntimeError::new_err(format!(
+            "task id must be 32 hex chars, got {}",
+            bytes.len() * 2
+        )));
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(&bytes);
+    let id: TaskID = bincode::deserialize(&arr)
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to parse task id: {e}")))?;
+    Ok(id)
+}
+
+/// Module definition.
+#[pymodule]
+fn crayon(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<Ray>()?;
+    m.add_class::<ObjectRef>()?;
+    m.add_class::<Resources>()?;
+    m.add_class::<ActorHandle>()?;
+    Ok(())
+}

@@ -26,6 +26,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 futures = "0.3"
 
+[dev-dependencies]
+candle-core = "0.10"
+rand = "0.8"
+
 [[bin]]
 name = "crayon-demo"
 path = "src/bin/demo.rs"
