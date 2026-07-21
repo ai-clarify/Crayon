@@ -49,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         let head = head_addr.expect("--worker <head_addr> required");
         let node = Node::start(&bind_addr, Some(&head), store.clone()).await?;
-        println!("worker node started at {}, connected to head {head}", node.addr);
+        println!(
+            "worker node started at {}, connected to head {head}",
+            node.addr
+        );
         let store = store.with_remote(node.clone());
 
         // Wait for registration, then try to fetch the head's object

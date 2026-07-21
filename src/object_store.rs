@@ -23,7 +23,13 @@ pub trait RemoteFetcher: Send + Sync {
     fn fetch_remote(
         &self,
         id: ObjectID,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>> + Send>>;
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>,
+                > + Send,
+        >,
+    >;
 }
 
 struct Entry {

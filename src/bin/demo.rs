@@ -73,9 +73,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(v2, 11);
 
     // 4b. named actor lookup
-    let counter2: crayon::actor::ActorHandle<Counter> = ray
-        .get_actor("counter")
-        .expect("named actor should exist");
+    let counter2: crayon::actor::ActorHandle<Counter> =
+        ray.get_actor("counter").expect("named actor should exist");
     let r3 = counter2.call(|c| c.increment()).await?;
     let v3: i64 = ray.get(&r3).await?;
     println!("named actor increment -> {v3}");

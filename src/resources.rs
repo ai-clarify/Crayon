@@ -5,7 +5,6 @@
 //! (`num_cpus`, `num_gpus`). The raylet only schedules a task onto a worker
 //! that has enough free resources, and accounts for them while the task runs.
 
-
 use parking_lot::Mutex;
 
 /// A set of compute resources. Uses `f64` so tasks can request fractional

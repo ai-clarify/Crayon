@@ -100,15 +100,21 @@ impl<S: Send + 'static> ActorHandle<S> {
         let r = self.inner.store().reserve_ref(output_id);
         self.inner.gcs().record_actor_task(self.inner.id, false);
 
-        let erased: Box<dyn FnOnce(&mut dyn Any) -> Vec<u8> + Send> = Box::new(move |state: &mut dyn Any| {
-            let s = state
-                .downcast_mut::<S>()
-                .expect("actor state type mismatch");
-            bincode::serialize(&func(s)).expect("serialize actor result")
-        });
+        let erased: Box<dyn FnOnce(&mut dyn Any) -> Vec<u8> + Send> =
+            Box::new(move |state: &mut dyn Any| {
+                let s = state
+                    .downcast_mut::<S>()
+                    .expect("actor state type mismatch");
+                bincode::serialize(&func(s)).expect("serialize actor result")
+            });
 
         let (reply, rx) = oneshot::channel();
-        self.inner.send_call(Call { func: erased, reply }).await?;
+        self.inner
+            .send_call(Call {
+                func: erased,
+                reply,
+            })
+            .await?;
 
         let store = self.inner.store().clone();
         let gcs = self.inner.gcs().clone();
@@ -134,7 +140,9 @@ impl<S: Send + 'static> ActorHandle<S> {
         self.inner
             .shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.inner.gcs().set_actor_state(self.inner.id, ActorState::Dead);
+        self.inner
+            .gcs()
+            .set_actor_state(self.inner.id, ActorState::Dead);
     }
 }
 

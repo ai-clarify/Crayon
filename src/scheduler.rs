@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use crate::common::{CrayonError, ObjectID, TaskID, TaskState};
 use crate::gcs::Gcs;
 use crate::object_store::ObjectStore;
-use crate::resources::{Resources, ResourceTracker};
+use crate::resources::{ResourceTracker, Resources};
 
 /// A unit of work a worker can execute. The closure receives the object store
 /// (so it can resolve task dependencies) and returns serialized bytes that get
@@ -29,9 +29,8 @@ pub struct Task {
     pub retries: u32,
     pub priority: u8,
     pub cancelled: Arc<AtomicBool>,
-    pub func: Arc<
-        dyn Fn(ObjectStore) -> BoxFuture<'static, Result<Vec<u8>, CrayonError>> + Send + Sync,
-    >,
+    pub func:
+        Arc<dyn Fn(ObjectStore) -> BoxFuture<'static, Result<Vec<u8>, CrayonError>> + Send + Sync>,
 }
 
 impl PartialEq for Task {

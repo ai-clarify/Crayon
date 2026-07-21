@@ -48,9 +48,13 @@ impl std::fmt::Display for NodeID {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
     // ---- node lifecycle ----
-    RegisterNode { addr: String },
+    RegisterNode {
+        addr: String,
+    },
     NodeList(Vec<(NodeID, String)>),
-    Ping { addr: String },
+    Ping {
+        addr: String,
+    },
     Pong,
     // ---- object store ----
     GetObject(ObjectID),
@@ -131,13 +135,7 @@ impl Node {
         let my_addr = local_addr.clone();
         if let Some(head) = head_addr {
             let mut stream = TcpStream::connect(head).await?;
-            send_message(
-                &mut stream,
-                &Message::RegisterNode {
-                    addr: local_addr,
-                },
-            )
-            .await?;
+            send_message(&mut stream, &Message::RegisterNode { addr: local_addr }).await?;
             // Receive peer list (includes head's address)
             if let Some(Message::NodeList(peers)) = recv_message(&mut stream).await? {
                 let mut p = node.peers.lock();
@@ -184,7 +182,10 @@ impl Node {
             loop {
                 ticker.tick().await;
                 let deadline = std::time::Instant::now() - std::time::Duration::from_secs(15);
-                node_clone.peers.lock().retain(|_, p| p.last_seen > deadline);
+                node_clone
+                    .peers
+                    .lock()
+                    .retain(|_, p| p.last_seen > deadline);
             }
         });
 
@@ -192,10 +193,7 @@ impl Node {
     }
 
     /// Fetch an object from a remote node by ID. Tries all peers.
-    pub async fn fetch_remote_object(
-        &self,
-        id: ObjectID,
-    ) -> Result<Vec<u8>, NodeError> {
+    pub async fn fetch_remote_object(&self, id: ObjectID) -> Result<Vec<u8>, NodeError> {
         let peers: Vec<_> = self.peers.lock().values().map(|p| p.addr.clone()).collect();
         for addr in peers {
             if let Ok(mut stream) = TcpStream::connect(&addr).await {
@@ -222,8 +220,13 @@ impl crate::object_store::RemoteFetcher for Node {
     fn fetch_remote(
         &self,
         id: ObjectID,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>> + Send>>
-    {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>,
+                > + Send,
+        >,
+    > {
         let peers: Vec<_> = self.peers.lock().values().map(|p| p.addr.clone()).collect();
         Box::pin(async move {
             for addr in peers {
@@ -242,10 +245,7 @@ impl crate::object_store::RemoteFetcher for Node {
 
 type NodeError = Box<dyn std::error::Error + Send + Sync>;
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    node: Arc<Node>,
-) -> Result<(), NodeError> {
+async fn handle_connection(mut stream: TcpStream, node: Arc<Node>) -> Result<(), NodeError> {
     while let Some(msg) = recv_message(&mut stream).await? {
         match msg {
             Message::RegisterNode { addr } => {
@@ -295,10 +295,7 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn send_message(
-    stream: &mut TcpStream,
-    msg: &Message,
-) -> Result<(), NodeError> {
+async fn send_message(stream: &mut TcpStream, msg: &Message) -> Result<(), NodeError> {
     let bytes = bincode::serialize(msg)?;
     let len = (bytes.len() as u32).to_be_bytes();
     stream.write_all(&len).await?;
@@ -310,9 +307,7 @@ async fn send_message(
 /// prefixes that would otherwise cause a huge allocation (OOM).
 const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 
-async fn recv_message(
-    stream: &mut TcpStream,
-) -> Result<Option<Message>, NodeError> {
+async fn recv_message(stream: &mut TcpStream) -> Result<Option<Message>, NodeError> {
     let mut len_buf = [0u8; 4];
     if stream.read_exact(&mut len_buf).await.is_err() {
         return Ok(None);

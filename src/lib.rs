@@ -87,7 +87,12 @@ impl Ray {
         let mem = crate::memory::MemoryManager::new(max_memory_bytes, spill_dir);
         let store = ObjectStore::new().with_memory(mem);
         let gcs = Gcs::new();
-        let pool = WorkerPool::new(num_workers, Resources::new(1.0, 0.0), gcs.clone(), store.clone());
+        let pool = WorkerPool::new(
+            num_workers,
+            Resources::new(1.0, 0.0),
+            gcs.clone(),
+            store.clone(),
+        );
         let scheduler = Scheduler::new(pool);
         Ray {
             inner: Arc::new(RayInner {
@@ -201,8 +206,7 @@ impl Ray {
                 Box::pin(async move {
                     let resolved = (*args).clone().resolve(&store).await?;
                     let result = func(resolved);
-                    bincode::serialize(&result)
-                        .map_err(|e| CrayonError::Serialize(e.to_string()))
+                    bincode::serialize(&result).map_err(|e| CrayonError::Serialize(e.to_string()))
                 })
             }),
         };

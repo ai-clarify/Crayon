@@ -108,10 +108,22 @@ async fn actor_as_parameter_server() {
     }
 
     let ray = Ray::init(2);
-    let ps = ray.create_actor("ps", Params { weights: vec![0.0; 4], step: 0 });
+    let ps = ray.create_actor(
+        "ps",
+        Params {
+            weights: vec![0.0; 4],
+            step: 0,
+        },
+    );
 
     // Worker updates parameters
-    let r = ps.call(|p| { p.update(vec![0.1; 4]); p.get() }).await.unwrap();
+    let r = ps
+        .call(|p| {
+            p.update(vec![0.1; 4]);
+            p.get()
+        })
+        .await
+        .unwrap();
     let (w, step): (Vec<f32>, u64) = ray.get(&r).await.unwrap();
     assert_eq!(step, 1);
     assert!((w[0] - 0.1).abs() < 1e-6);
