@@ -1,0 +1,23 @@
+src/actor.rs
+  s_3ed83973de6379::t_1c7918870be90d 39,44-46,131-132,134-136,164-165,170,172-175,195,211-217
+src/node.rs
+  s_3ed83973de6379::t_5464f12254d657 123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4518c47c3f449b02ceb585e4d02438e35bafda30",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
