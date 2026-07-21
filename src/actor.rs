@@ -243,26 +243,97 @@ impl<S: Send + 'static> ActorHandle<S> {
         self.inner.register_method(name, erased);
     }
 
+    /// Register a named method so it can be invoked from remote nodes via
+    /// [`ActorHandle::call_typed`]. The closure receives typed args and returns
+    /// a typed value — serialization is handled automatically.
+    ///
+    /// This is the ergonomic wrapper around [`ActorHandle::register_method`];
+    /// prefer it unless you need raw byte control.
+    pub fn register_method_typed<F, Args, Ret>(&self, name: &str, func: F)
+    where
+        F: Fn(&mut S, Args) -> Ret + Send + Sync + 'static,
+        Args: serde::de::DeserializeOwned + Send + 'static,
+        Ret: serde::Serialize + Send + 'static,
+    {
+        let erased: MethodFn = Arc::new(move |state: &mut dyn Any, args_bytes| {
+            let s = state
+                .downcast_mut::<S>()
+                .expect("actor state type mismatch");
+            let args: Args = bincode::deserialize(&args_bytes)
+                .expect("actor method args deserialize failed");
+            let ret = func(s, args);
+            bincode::serialize(&ret).expect("actor method result serialize failed")
+        });
+        self.inner.register_method(name, erased);
+    }
+
     /// The node that owns this actor, if it lives on a remote node.
     pub fn owner_node(&self) -> Option<NodeID> {
         self.inner.owner_node
     }
 
+    /// Invoke a registered named method with typed args. Serializes `args`
+    /// automatically and returns an [`ObjectRef`] for the typed result — same
+    /// calling convention as [`ActorHandle::call`], transparent to local vs
+    /// remote.
+    ///
+    /// Pair with [`ActorHandle::register_method_typed`] on the owner node.
+    pub async fn call_typed<Args, Ret>(
+        &self,
+        method: &str,
+        args: Args,
+    ) -> Result<crate::common::ObjectRef<Ret>, CrayonError>
+    where
+        Args: serde::Serialize + Send + 'static,
+        Ret: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let args_bytes =
+            bincode::serialize(&args).map_err(|e| CrayonError::Serialize(e.to_string()))?;
+        self.call_named(method, args_bytes).await
+    }
+
     /// Invoke a registered named method on the actor. Automatically routes to
     /// the actor's owner node if it lives on a remote node (Ray's cross-node
-    /// actor call pattern). Returns the serialized result bytes.
+    /// actor call pattern). Returns an [`ObjectRef`] for the result — same
+    /// calling convention as [`ActorHandle::call`], so callers don't need to
+    /// know whether the actor is local or remote.
+    ///
+    /// Local calls return immediately (method runs in the background); remote
+    /// calls await the network round-trip to learn the result's [`ObjectID`].
     ///
     /// Use [`ActorHandle::register_method`] on the owner node to expose methods,
     /// and [`ActorHandle::call_named`] on any node to invoke them.
-    pub async fn call_named(&self, method: &str, args: Vec<u8>) -> Result<Vec<u8>, CrayonError> {
+    pub async fn call_named<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        method: &str,
+        args: Vec<u8>,
+    ) -> Result<crate::common::ObjectRef<T>, CrayonError> {
         match (self.inner.owner_node, self.inner.node.clone()) {
             // Remote actor: forward via the local node to the owner node.
-            (Some(owner), Some(node)) => node
-                .remote_actor_call(self.inner.id, owner, method, args)
-                .await
-                .map_err(|e| CrayonError::TaskFailed(e.to_string())),
-            // Local actor (or no node attached): call directly through the mailbox.
-            _ => self.inner.call_method(method, args).await,
+            // The owner stores the result in its object store; we get the
+            // ObjectID back and fetch it through the store's remote-fetch path.
+            (Some(owner), Some(node)) => {
+                let id = node
+                    .remote_actor_call(self.inner.id, owner, method, args)
+                    .await
+                    .map_err(|e| CrayonError::TaskFailed(e.to_string()))?;
+                Ok(self.inner.store().reserve_ref(id))
+            }
+            // Local actor (or no node attached): call through the mailbox in the
+            // background, store the result when ready — mirrors `call`.
+            _ => {
+                let output_id = ObjectID::new();
+                let r = self.inner.store().reserve_ref(output_id);
+                let inner = self.inner.clone();
+                let method = method.to_string();
+                tokio::spawn(async move {
+                    match inner.call_method(&method, args).await {
+                        Ok(bytes) => inner.store().put_bytes(output_id, bytes, None),
+                        Err(e) => inner.store().put_error(output_id, e),
+                    }
+                });
+                Ok(r)
+            }
         }
     }
 }

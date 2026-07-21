@@ -77,9 +77,11 @@ pub enum Message {
         method: String,
         args: Vec<u8>,
     },
-    /// Reply to an [`Message::ActorCall`].
+    /// Reply to an [`Message::ActorCall`]. On success, carries the
+    /// [`ObjectID`] of the method's result, stored in the owner node's object
+    /// store — the caller fetches it via the existing remote-fetch path.
     ActorCallReply {
-        result: Result<Vec<u8>, String>,
+        result: Result<ObjectID, String>,
     },
 }
 
@@ -123,10 +125,17 @@ impl Connection {
 /// A simple LIFO connection pool keyed by address. Reusing connections avoids
 /// the TCP handshake cost on every remote object fetch — critical for RL
 /// workloads that pull many small samples.
+///
+/// Bounded per address to prevent file-descriptor leaks under high concurrency:
+/// excess connections are dropped (closed) on return instead of cached forever.
 #[derive(Default)]
 struct ConnectionPool {
     inner: Mutex<HashMap<String, Vec<Connection>>>,
 }
+
+/// Max idle connections cached per peer address. Beyond this, returned
+/// connections are closed to bound resource usage.
+const MAX_CONNS_PER_ADDR: usize = 16;
 
 impl ConnectionPool {
     fn new() -> Arc<Self> {
@@ -141,13 +150,15 @@ impl ConnectionPool {
         Connection::connect(addr).await
     }
 
-    /// Return a connection to the pool for reuse.
+    /// Return a connection to the pool for reuse. If the pool for this address
+    /// is full, the connection is dropped (closed) instead of cached.
     fn put(&self, addr: &str, conn: Connection) {
-        self.inner
-            .lock()
-            .entry(addr.to_string())
-            .or_default()
-            .push(conn);
+        let mut inner = self.inner.lock();
+        let v = inner.entry(addr.to_string()).or_default();
+        if v.len() < MAX_CONNS_PER_ADDR {
+            v.push(conn);
+        }
+        // else: conn drops here, closing the socket
     }
 }
 
@@ -296,14 +307,15 @@ impl Node {
     }
 
     /// Invoke a registered method on a remote actor. Sends an
-    /// [`Message::ActorCall`] to the actor's owner node and waits for the reply.
+    /// [`Message::ActorCall`] to the actor's owner node and waits for the reply,
+    /// which carries the [`ObjectID`] of the result stored on the owner node.
     pub async fn remote_actor_call(
         &self,
         actor_id: crate::common::ActorID,
         owner: NodeID,
         method: &str,
         args: Vec<u8>,
-    ) -> Result<Vec<u8>, NodeError> {
+    ) -> Result<ObjectID, NodeError> {
         let addr = self
             .peers
             .lock()
@@ -511,11 +523,17 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                 method,
                 args,
             } => {
-                // Route the incoming call to the local actor task.
+                // Route the incoming call to the local actor task. Store the
+                // result in the object store so the caller can fetch it via the
+                // existing remote-fetch path (same as task outputs).
                 let actor = node.local_actors.lock().get(&actor_id).cloned();
                 let reply = match actor {
                     Some(actor) => match actor.call_method(&method, args).await {
-                        Ok(bytes) => Ok(bytes),
+                        Ok(bytes) => {
+                            let id = crate::common::ObjectID::new();
+                            node.store.put_bytes(id, bytes, None);
+                            Ok(id)
+                        }
                         Err(e) => Err(e.to_string()),
                     },
                     None => Err(format!("actor {actor_id} not found on this node")),

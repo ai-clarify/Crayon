@@ -121,10 +121,17 @@ impl Ray {
     }
 
     /// Attach a [`Node`] for distributed actor discovery and cross-node calls.
+    /// Also wires the node into the object store as a remote fetcher, so
+    /// results from remote actor methods (and remote objects) are transparently
+    /// fetched across the network.
+    ///
     /// Must be called before creating actors that should be reachable from
     /// other nodes.
     pub fn attach_node(&self, node: Arc<crate::node::Node>) {
-        *self.inner.node.lock() = Some(node);
+        *self.inner.node.lock() = Some(node.clone());
+        // ObjectStore::with_remote modifies the shared inner (Arc), so this
+        // makes remote fetch work for every clone of the store.
+        self.inner.store.clone().with_remote(node);
     }
 
     /// Store an object in the object store. Returns a typed, refcounted

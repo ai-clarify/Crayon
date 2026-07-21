@@ -216,22 +216,23 @@ async fn cross_node_actor_call() {
         "discovered actor should have an owner node"
     );
 
-    // Call the method remotely — routes worker -> head -> actor task
+    // Call the method remotely — routes worker -> head -> actor task.
+    // call_named now returns an ObjectRef, same as local call().
     let args = bincode::serialize(&42u64).unwrap();
-    let result_bytes = remote_actor
-        .call_named("inc", args)
+    let r = remote_actor
+        .call_named::<u64>("inc", args)
         .await
         .expect("cross-node actor call should succeed");
-    let result: u64 = bincode::deserialize(&result_bytes).unwrap();
+    let result: u64 = ray_worker.get(&r).await.unwrap();
     assert_eq!(result, 42, "first call should return 0 + 42 = 42");
 
     // Call again to verify stateful behavior across the network
     let args = bincode::serialize(&8u64).unwrap();
-    let result_bytes = remote_actor
-        .call_named("inc", args)
+    let r = remote_actor
+        .call_named::<u64>("inc", args)
         .await
         .expect("second cross-node actor call should succeed");
-    let result: u64 = bincode::deserialize(&result_bytes).unwrap();
+    let result: u64 = ray_worker.get(&r).await.unwrap();
     assert_eq!(result, 50, "second call should return 42 + 8 = 50");
 }
 
