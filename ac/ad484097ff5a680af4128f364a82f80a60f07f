@@ -1,0 +1,23 @@
+src/node.rs
+  s_3ed83973de6379::t_4497b0fd32c6f8 3-5,7,20-22,51,53,60-128,135,141,145,155,159,162,177,179-184,187-189,200-202,205,210-217,223,240-242,245-260,262-270,293-294,299-300,304,317,321-323,326,331,333
+src/object_store.rs
+  s_3ed83973de6379::t_8a50a5a84d1079 36-39,116,177,187,192,202-204,228-230,250
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "acad484097ff5a680af4128f364a82f80a60f07f",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
