@@ -1,0 +1,21 @@
+src/object_store.rs
+  s_3ed83973de6379::t_cf63d705a985a3 276-280
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ede98092515f51233a3b3c16e5de5c657a122591",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
