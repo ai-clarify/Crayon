@@ -118,7 +118,16 @@ impl Gcs {
 
     // ---- tasks ----
     pub fn add_task(&self, meta: TaskMeta) {
-        self.inner.lock().tasks.insert(meta.id, meta);
+        let mut inner = self.inner.lock();
+        inner.tasks.insert(meta.id, meta);
+        // Prevent unbounded growth (#52081 analog): if too many tasks
+        // accumulate, prune completed ones. Keeps pending/running tasks.
+        const MAX_TASKS: usize = 100_000;
+        if inner.tasks.len() > MAX_TASKS {
+            inner.tasks.retain(|_, t| {
+                t.state == TaskState::Pending || t.state == TaskState::Running
+            });
+        }
     }
 
     pub fn set_task_state(&self, id: TaskID, state: TaskState, output: Option<ObjectID>) {
