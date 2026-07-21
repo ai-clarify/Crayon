@@ -6,7 +6,7 @@
 
 **Ray 的核心，用 Rust 重写。** 分布式对象存储 · Actor · 任务调度 · 资源管理 · 多节点
 
-为 RL 训练基础设施而生。
+为 RL 训练基础设施而生。Rust 核心 + Python 绑定。
 
 </div>
 
@@ -14,17 +14,20 @@
 
 ## 为什么是 Crayon
 
-| | Ray (Python) | Crayon (Rust) |
+| | Ray (Python) | Crayon (Rust + Python) |
 |---|---|---|
-| 语言 | Python + C++ | 纯 Rust |
+| 语言 | Python + C++ | Rust 核心 + PyO3 绑定 |
 | GIL | 有，吞吐瓶颈 | 无 |
 | 内存安全 | 依赖 GC | 编译期保证 |
-| 代码量 | ~1,000,000 行 | ~2,500 行 |
+| 代码量 | ~1,000,000 行 | ~3,000 行 |
 | 核心能力 | 完整 | 完整 |
+| Python API | ✅ | ✅ (兼容 Ray 心智) |
 
 **同样的 API 心智，零 Python 开销。**
 
 ## 快速开始
+
+### Rust
 
 ```rust
 use crayon::Ray;
@@ -47,12 +50,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c = ray.create_actor("c", Counter(0));
     c.call(|c| { c.0 += 1; c.0 }).await?;
 
-    // 资源感知调度 (CPU/GPU)
-    use crayon::resources::Resources;
-    ray.spawn_with_resources((), Resources::new(0.0, 1.0), |()| 42);
-
     Ok(())
 }
+```
+
+### Python
+
+```python
+from crayon import Ray
+
+ray = Ray.init(4)
+
+# 对象存储
+r = ray.put(42)
+v = ray.get(r)  # 42
+
+# 远程任务
+r = ray.spawn(lambda: 42)
+v = ray.get(r)  # 42
+
+# 带参数的任务
+a = ray.put(10)
+r = ray.spawn(lambda x: x + 1, a)
+v = ray.get(r)  # 11
+
+# Actor
+counter = ray.create_actor("c", {"n": 0})
+r = counter.call(lambda c: c.__setitem__("n", c["n"] + 1) or c["n"])
 ```
 
 ## 核心能力
@@ -63,6 +87,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **Resources** — CPU/GPU 记账，分数资源，GPU-aware 调度（CPU 任务优先用 CPU 节点）
 - **Multi-Node** — TCP 点对点，心跳检测，透明远程拉取，消息大小上限
 - **Robustness** — 超时保护，死锁检测，背压（bounded mailbox），spill 文件自动清理
+
+## 运行
+
+```bash
+# Rust
+cargo run --bin crayon-demo          # 单节点 demo
+cargo run --bin crayon-rl            # RL 训练模拟
+cargo run --example rl_cartpole      # 真实 CartPole 训练 (candle)
+cargo test                           # 全部测试 (unit + e2e)
+
+# Python
+pip install crayon                   # 安装 Python 包
+python examples/rl_cartpole.py       # Python RL 训练
+
+# 多节点
+docker compose up --build            # head + worker
+```
+
+## 文档
+
+- [使用手册](docs/guide.md) — 完整 API 文档和示例
+- [架构](docs/architecture.md) — 系统设计
 
 ## 解决的 Ray 核心 Issue
 
@@ -77,14 +123,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | #62093 plasma 死锁 | 超时 + 死锁检测（资源超 worker 总量时报错）|
 | #32952 actor 清理不可靠 | `kill()` 真正关闭 actor task |
 | #27499 idle worker 无限 spawn | 固定 worker pool，无动态创建 |
-
-## 运行
-
-```bash
-cargo run --bin crayon-demo     # 单节点 demo
-cargo test                       # 全部测试 (unit + e2e)
-docker compose up --build        # 多节点 (head + worker)
-```
 
 ## 架构
 
