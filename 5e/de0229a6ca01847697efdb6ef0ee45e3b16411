@@ -1,0 +1,23 @@
+README.md
+  s_3ed83973de6379::t_7c3689428339c6 9,17,19,22,24,30-31,57-81,91-112
+docs/guide.md
+  s_3ed83973de6379::t_51ec8df3b4e873 1-407
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5ede0229a6ca01847697efdb6ef0ee45e3b16411",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
