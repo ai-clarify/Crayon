@@ -46,7 +46,7 @@ impl std::fmt::Display for NodeID {
 }
 
 /// Messages exchanged between nodes.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     RegisterNode { addr: String },
     NodeList(Vec<(NodeID, String)>),
@@ -55,6 +55,12 @@ pub enum Message {
     GetObject(ObjectID),
     ObjectData(ObjectID, Vec<u8>),
     ObjectNotFound(ObjectID),
+    /// Periodic GCS sync: object locations + task states from the sender.
+    /// Only carries serializable fields (no Instant timestamps).
+    GcsSync {
+        objects: Vec<(ObjectID, usize)>, // (id, size_bytes)
+        tasks: Vec<(crate::common::TaskID, crate::common::TaskState)>,
+    },
 }
 
 type NodeError = Box<dyn std::error::Error + Send + Sync>;
@@ -139,6 +145,9 @@ pub struct Node {
     store: ObjectStore,
     peers: Arc<Mutex<HashMap<NodeID, RemoteNode>>>,
     pool: Arc<ConnectionPool>,
+    /// Optional GCS for metadata sync. When attached, the node periodically
+    /// broadcasts object/task metadata to peers and merges incoming metadata.
+    gcs: Arc<Mutex<Option<crate::gcs::Gcs>>>,
 }
 
 impl Node {
@@ -157,6 +166,7 @@ impl Node {
             store,
             peers: Arc::new(Mutex::new(HashMap::new())),
             pool: ConnectionPool::new(),
+            gcs: Arc::new(Mutex::new(None)),
         });
 
         // Accept loop
@@ -235,6 +245,54 @@ impl Node {
         });
 
         Ok(node)
+    }
+
+    /// Attach a GCS for metadata sync. The node will periodically broadcast
+    /// object/task metadata to peers and merge incoming metadata.
+    pub fn with_gcs(self: &Arc<Self>, gcs: crate::gcs::Gcs) -> Arc<Self> {
+        *self.gcs.lock() = Some(gcs.clone());
+
+        // Periodically broadcast GCS state to all peers.
+        let node = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                ticker.tick().await;
+                node.broadcast_gcs().await;
+            }
+        });
+
+        self.clone()
+    }
+
+    /// Broadcast local GCS metadata to all peers.
+    async fn broadcast_gcs(&self) {
+        let gcs = match self.gcs.lock().clone() {
+            Some(g) => g,
+            None => return,
+        };
+        let objects: Vec<_> = gcs
+            .objects()
+            .into_iter()
+            .map(|o| (o.id, o.size_bytes))
+            .collect();
+        let tasks: Vec<_> = gcs
+            .tasks()
+            .into_iter()
+            .map(|t| (t.id, t.state))
+            .collect();
+        let msg = Message::GcsSync { objects, tasks };
+        let peers: Vec<_> = self.peers.lock().values().map(|p| p.addr.clone()).collect();
+        for addr in peers {
+            let pool = self.pool.clone();
+            let msg = msg.clone();
+            tokio::spawn(async move {
+                if let Ok(mut conn) = pool.get(&addr).await {
+                    let _ = conn.send(&msg).await;
+                    pool.put(&addr, conn);
+                }
+            });
+        }
     }
 
     /// Fetch an object from a remote node by ID. Queries all peers concurrently
@@ -331,6 +389,29 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                     conn.send(&Message::ObjectData(id, bytes.to_vec())).await?;
                 } else {
                     conn.send(&Message::ObjectNotFound(id)).await?;
+                }
+            }
+            Message::GcsSync { objects, tasks } => {
+                // Merge peer's metadata into our GCS so we know object
+                // locations and task states across the cluster.
+                if let Some(gcs) = node.gcs.lock().clone() {
+                    for (id, size_bytes) in objects {
+                        gcs.add_object(crate::gcs::ObjectMeta {
+                            id,
+                            size_bytes,
+                            created_at: std::time::Instant::now(),
+                            owner: None,
+                        });
+                    }
+                    for (id, state) in tasks {
+                        gcs.add_task(crate::gcs::TaskMeta {
+                            id,
+                            state,
+                            created_at: std::time::Instant::now(),
+                            finished_at: None,
+                            output: None,
+                        });
+                    }
                 }
             }
             _ => {}

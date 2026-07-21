@@ -41,6 +41,45 @@ async fn multi_node_object_transfer() {
 }
 
 #[tokio::test]
+async fn distributed_metadata_sync() {
+    use crayon::gcs::Gcs;
+
+    let store1 = ObjectStore::new();
+    let store2 = ObjectStore::new();
+    let gcs1 = Gcs::new();
+    let gcs2 = Gcs::new();
+
+    // Start head + worker, both with GCS attached for metadata sync
+    let head = Node::start("127.0.0.1:0", None, store1.clone())
+        .await
+        .unwrap();
+    let head_addr = head.addr.clone();
+    head.with_gcs(gcs1.clone());
+
+    let worker = Node::start("127.0.0.1:0", Some(&head_addr), store2.clone())
+        .await
+        .unwrap();
+    worker.with_gcs(gcs2.clone());
+
+    // Put an object on head — this adds metadata to gcs1
+    let (r, size) = store1.put(99i32);
+    gcs1.add_object(crayon::gcs::ObjectMeta {
+        id: r.id,
+        size_bytes: size,
+        created_at: std::time::Instant::now(),
+        owner: None,
+    });
+
+    // Wait for periodic sync (every 2s) + registration
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    // Worker's GCS should now know about the object from head
+    let obj = gcs2.get_object(r.id);
+    assert!(obj.is_some(), "worker GCS should have synced object metadata from head");
+    assert_eq!(obj.unwrap().size_bytes, 4); // i32 = 4 bytes in bincode
+}
+
+#[tokio::test]
 async fn disk_spilling() {
     let spill_dir = std::env::temp_dir().join("crayon_spill_test");
     let _ = std::fs::remove_dir_all(&spill_dir);
