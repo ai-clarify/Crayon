@@ -1,0 +1,29 @@
+src/bin/rl_sim.rs
+  s_3ed83973de6379::t_53850909f96d09 13,69-71,117-132,179-181
+src/common.rs
+  s_3ed83973de6379::t_2cca708a9ccf40 206
+src/lib.rs
+  s_3ed83973de6379::t_2b12e867b59136 228
+src/object_store.rs
+  s_3ed83973de6379::t_395dc474e3ece1 39-41,140-148,203-207,274-281,424
+src/scheduler.rs
+  s_3ed83973de6379::t_0a105410bdf28c 118-121,173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bbacbfd6bca929732d5b642917d4fb10e981a853",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
