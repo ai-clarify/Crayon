@@ -1,0 +1,37 @@
+Cargo.toml
+  s_3ed83973de6379::t_5b11494f1e041b 29-32
+crates/crayon-py/Cargo.toml
+  s_3ed83973de6379::t_c1f5828a06bced 1-19
+crates/crayon-py/pyproject.toml
+  s_3ed83973de6379::t_309f98da2f2fab 1-14
+crates/crayon-py/test_basic.py
+  s_14be051e82adeb::t_c40060feba450a 1-52
+examples/rl_cartpole.rs
+  s_3ed83973de6379::t_08f57f219488e1 1-388
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "362b9907ee4daf520de54604f5213bf4a4c3e027",
+  "prompts": {},
+  "sessions": {
+    "s_14be051e82adeb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aaceb6e53e57f9e74",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
