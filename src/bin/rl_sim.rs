@@ -9,8 +9,8 @@
 //! Run on a GPU node to validate GPU-aware scheduling:
 //!   `cargo run --release --bin crayon-rl -- --workers 64 --steps 50`
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crayon::Ray;
@@ -66,7 +66,9 @@ fn rollout(policy: Policy, horizon: usize, obs_dim: usize) -> Trajectory {
     };
     for _ in 0..horizon {
         // Pseudo-random observation
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         for (i, o) in obs.iter_mut().enumerate() {
             *o = ((rng >> (i % 32)) & 0xff) as f32 / 255.0;
         }
@@ -112,10 +114,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--workers" => { i += 1; workers = args[i].parse()?; }
-            "--steps" => { i += 1; steps = args[i].parse()?; }
-            "--horizon" => { i += 1; horizon = args[i].parse()?; }
-            "--obs-dim" => { i += 1; obs_dim = args[i].parse()?; }
+            "--workers" => {
+                i += 1;
+                workers = args[i].parse()?;
+            }
+            "--steps" => {
+                i += 1;
+                steps = args[i].parse()?;
+            }
+            "--horizon" => {
+                i += 1;
+                horizon = args[i].parse()?;
+            }
+            "--obs-dim" => {
+                i += 1;
+                obs_dim = args[i].parse()?;
+            }
             _ => {}
         }
         i += 1;
@@ -162,10 +176,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 4. Compute gradient (CPU-bound in this simulation; in production this
         //    would be a GPU task using the actual GPU for backprop)
         let trajs_ref = ray.put(trajs.clone());
-        let grad_ref = ray.spawn(
-            (trajs_ref,),
-            move |(t,): (Vec<Trajectory>,)| compute_grad(&t, obs_dim),
-        );
+        let grad_ref = ray.spawn((trajs_ref,), move |(t,): (Vec<Trajectory>,)| {
+            compute_grad(&t, obs_dim)
+        });
         let grad: Vec<f32> = ray.get(&grad_ref).await.unwrap();
 
         // 5. Update the parameter server

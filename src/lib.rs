@@ -225,8 +225,7 @@ impl Ray {
             // Scheduling failed (e.g. task resources exceed any worker's total).
             // Store the error so the caller gets it on `get` instead of a
             // timeout.
-            let bytes = bincode::serialize(&e.to_string()).unwrap();
-            self.inner.store.put_bytes(output_id, bytes, None);
+            self.inner.store.put_error(output_id, e);
             self.inner
                 .gcs
                 .set_task_state(id, crate::common::TaskState::Failed, Some(output_id));

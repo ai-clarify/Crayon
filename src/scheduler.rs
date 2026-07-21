@@ -115,9 +115,10 @@ impl WorkerPool {
 
                     // Check for cancellation before running.
                     if task.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                        let msg = "task cancelled".to_string();
-                        let bytes = bincode::serialize(&msg).unwrap();
-                        store.put_bytes(task.output_id, bytes, None);
+                        store.put_error(
+                            task.output_id,
+                            CrayonError::TaskFailed("task cancelled".to_string()),
+                        );
                         gcs.set_task_state(task.id, TaskState::Failed, Some(task.output_id));
                         gcs.set_worker_busy(i, false);
                         tracker.release(i, &res);
@@ -169,8 +170,7 @@ impl WorkerPool {
                                 tracker.release(i, &res);
                                 continue;
                             }
-                            let bytes = bincode::serialize(&e.to_string()).unwrap();
-                            store.put_bytes(task.output_id, bytes, None);
+                            store.put_error(task.output_id, e);
                             gcs.set_task_state(task.id, TaskState::Failed, Some(task.output_id));
                         }
                     }

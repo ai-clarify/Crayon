@@ -203,7 +203,7 @@ pub enum TaskState {
 }
 
 /// Errors returned by the Crayon runtime.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CrayonError {
     ObjectNotFound(ObjectID),
     ActorNotFound(ActorID),

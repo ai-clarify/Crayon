@@ -36,6 +36,9 @@ struct Entry {
     /// Critical for `get_batch` and spill paths that would otherwise copy
     /// large RL objects (model weights, trajectories) multiple times.
     value: Option<bytes::Bytes>,
+    /// If set, the task that produces this object failed. `get` returns this
+    /// error instead of waiting forever or returning garbage bytes.
+    error: Option<CrayonError>,
     notify: Arc<Notify>,
     refcount: Arc<AtomicUsize>,
     owner_node: Option<crate::node::NodeID>,
@@ -134,6 +137,15 @@ impl ObjectStore {
         }
     }
 
+    /// Mark an object as failed. Subsequent `get` calls return the error
+    /// instead of waiting for a value that will never arrive.
+    pub fn put_error(&self, id: ObjectID, error: CrayonError) {
+        let entry = self.entry(id, None);
+        let mut e = entry.lock();
+        e.error = Some(error);
+        e.notify.notify_waiters();
+    }
+
     pub fn reserve_ref<T>(&self, id: ObjectID) -> ObjectRef<T> {
         let entry = self.entry(id, None);
         let e = entry.lock();
@@ -188,6 +200,11 @@ impl ObjectStore {
         let mut tried_remote = false;
 
         loop {
+            // Check if the task producing this object failed.
+            if let Some(err) = self.try_get_error(&id) {
+                return Err(err);
+            }
+
             // Fast path: in memory (zero-copy clone)
             if let Some(bytes) = self.try_get_in_memory(&id) {
                 self.touch(&id);
@@ -252,6 +269,14 @@ impl ObjectStore {
             .lock()
             .get(id)
             .and_then(|e| e.lock().value.clone())
+    }
+
+    fn try_get_error(&self, id: &ObjectID) -> Option<CrayonError> {
+        self.inner
+            .map
+            .lock()
+            .get(id)
+            .and_then(|e| e.lock().error.clone())
     }
 
     fn is_spilled(&self, id: &ObjectID) -> bool {
@@ -396,6 +421,7 @@ impl ObjectStore {
             .or_insert_with(|| {
                 Arc::new(Mutex::new(Entry {
                     value: None,
+                    error: None,
                     notify: Arc::new(Notify::new()),
                     refcount: Arc::new(AtomicUsize::new(0)),
                     owner_node,
