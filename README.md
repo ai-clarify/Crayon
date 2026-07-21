@@ -1,127 +1,100 @@
+<div align="center">
+
+<img src="logo.svg" width="120" height="120" alt="Crayon">
+
 # Crayon
 
-A Rust reimplementation of [Ray](https://github.com/ray-project/ray)'s core:
-distributed object store, task scheduling, actor management, resource
-accounting, and multi-node execution. Designed as an RL training infrastructure
-backend.
+**Ray 的核心，用 Rust 重写。** 分布式对象存储 · Actor · 任务调度 · 资源管理 · 多节点
 
-> Ray in Rust. Grab the core, leave the rest.
+为 RL 训练基础设施而生。
 
-## Features
+</div>
 
-| Ray concept          | Crayon equivalent                          | Where            |
-|----------------------|--------------------------------------------|------------------|
-| Plasma store         | `ObjectStore` — serialized bytes + disk spill | `object_store.rs`|
-| `ray.put`/`get`      | `Ray::put` / `Ray::get`                    | `lib.rs`         |
-| `@ray.remote` fn     | `Ray::spawn(args, closure)`                | `lib.rs`         |
-| `@ray.remote` cls    | `Ray::create_actor` + `ActorHandle::call`  | `actor.rs`       |
-| Named actors         | `Ray::get_actor(name)`                     | `lib.rs`         |
-| Task dependencies    | `ObjectRef` args auto-resolved             | `args.rs`        |
-| GCS                  | `Gcs` — metadata for objects/tasks/actors  | `gcs.rs`         |
-| raylet/scheduler     | `Scheduler` + `WorkerPool` (resource-aware)| `scheduler.rs`   |
-| Resource tracking    | `Resources` (CPU/GPU) + `ResourceTracker`  | `resources.rs`   |
-| Memory/disk spilling | `MemoryManager` — LRU eviction to disk     | `memory.rs`      |
-| Multi-node           | `Node` — TCP server, peer discovery        | `node.rs`        |
-| `ray status`         | `Ray::status()` → `SystemStatus`           | `status.rs`      |
+---
 
-## Quick start
+## 为什么是 Crayon
+
+| | Ray (Python) | Crayon (Rust) |
+|---|---|---|
+| 语言 | Python + C++ | 纯 Rust |
+| GIL | 有，吞吐瓶颈 | 无 |
+| 内存安全 | 依赖 GC | 编译期保证 |
+| 代码量 | ~1,000,000 行 | ~2,500 行 |
+| 核心能力 | 完整 | 完整 |
+
+**同样的 API 心智，零 Python 开销。**
+
+## 快速开始
 
 ```rust
 use crayon::Ray;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ray = Ray::init(4); // 4 workers, 1 CPU each
+    let ray = Ray::init(4);
 
-    // Object store with reference counting + GC
+    // 对象存储 + 引用计数 GC
     let r = ray.put(42);
     let v: i32 = ray.get(&r).await?;
 
-    // Remote task with dependency resolution
+    // 远程任务 + 依赖自动解析
     let a = ray.put(10);
     let b = ray.put(20);
     let sum = ray.spawn((a, b), |(a, b): (i32, i32)| a + b);
-    let s: i32 = ray.get(&sum).await?;
 
-    // Named actor (stateful, serial execution)
+    // 有状态 Actor + 命名查找
     struct Counter(i64);
-    let counter = ray.create_actor("counter", Counter(0));
-    let r1 = counter.call(|c| { c.0 += 1; c.0 }).await?;
-    let n: i64 = ray.get(&r1).await?;
+    let c = ray.create_actor("c", Counter(0));
+    c.call(|c| { c.0 += 1; c.0 }).await?;
 
-    // Look up actor by name
-    let counter2 = ray.get_actor::<Counter>("counter").unwrap();
-
-    // Resource-aware scheduling
+    // 资源感知调度 (CPU/GPU)
     use crayon::resources::Resources;
-    let gpu_task = ray.spawn_with_resources((), Resources::new(0.0, 1.0), |()| {
-        // GPU work here
-        42
-    });
+    ray.spawn_with_resources((), Resources::new(0.0, 1.0), |()| 42);
 
-    // Disk spilling (when memory exceeds budget)
-    let ray = Ray::init_with_memory(4, 1024 * 1024, "/tmp/crayon_spill".into());
-
-    // Status
-    println!("{}", ray.status().pretty());
     Ok(())
 }
 ```
 
-## Multi-node
+## 核心能力
 
-```rust
-use crayon::node::Node;
-use crayon::object_store::ObjectStore;
+- **Object Store** — Plasma 风格，bincode 序列化，引用计数 GC，LRU 磁盘溢出
+- **Tasks** — 依赖自动解析，资源声明，失败自动重试
+- **Actors** — 串行邮箱，命名查找，参数服务器模式
+- **Resources** — CPU/GPU 记账，分数资源，调度器只派给能 fit 的 worker
+- **Multi-Node** — TCP 点对点，心跳检测，透明远程拉取
 
-// Head node
-let store1 = ObjectStore::new();
-let head = Node::start("127.0.0.1:0", None, store1.clone()).await?;
-
-// Worker node connects to head
-let store2 = ObjectStore::new();
-let worker = Node::start("127.0.0.1:0", Some(&head.addr), store2.clone()).await?;
-
-// Attach remote fetchers
-let store1 = store1.with_remote(head.clone());
-let store2 = store2.with_remote(worker.clone());
-
-// Put on head, fetch from worker (transparent remote fetch)
-let r = store1.put(42i32);
-let v: i32 = store2.get(r.id).await?;
-```
-
-## RL training pattern
-
-Crayon supports the common RL training pattern:
-- **Parameter server** actor holds model weights, updated by trainers
-- **Rollout workers** generate experience using current weights
-- **Object store** transfers weights and trajectories between nodes
-- **Resource scheduling** assigns GPUs to training/inference tasks
-
-See `tests/e2e.rs::actor_as_parameter_server` for a minimal example.
-
-## Run
+## 运行
 
 ```bash
-cargo run --bin crayon-demo   # single-node demo
-cargo test                     # all tests (unit + e2e)
+cargo run --bin crayon-demo     # 单节点 demo
+cargo test                       # 全部测试 (unit + e2e)
+docker compose up --build        # 多节点 (head + worker)
 ```
 
-## Design notes
+## 架构
 
-- **Objects** stored as bincode-serialized bytes (matching Plasma's design),
-  enabling zero-copy cross-node transfer.
-- **Reference counting**: each `ObjectRef` holds a refcount; the object is
-  evicted when the last ref drops (Plasma-style GC).
-- **Disk spilling**: `MemoryManager` tracks per-object sizes and evicts LRU
-  objects to disk when memory exceeds `max_memory_bytes`. Evicted objects are
-  transparently reloaded on next access.
-- **Actors** run as a single tokio task with a mpsc mailbox — state is never
-  accessed concurrently (Ray's default model).
-- **Scheduler** is resource-aware: tasks declare CPU/GPU requirements; the
-  `ResourceTracker` only assigns a task to a worker with sufficient free
-  resources. Tasks that don't fit are queued and retried when resources free.
-- **Multi-node**: each `Node` runs a TCP server. A head node tracks peers;
-  worker nodes register and receive the peer list. `ObjectStore` with a
-  `RemoteFetcher` attached transparently fetches objects from remote peers.
+```
+┌─────────────────────────────────────────────┐
+│  Ray (lib.rs)                               │
+│  ┌──────────┐ ┌──────────┐ ┌──────────────┐ │
+│  │  Store   │ │Scheduler│ │   Actors     │ │
+│  │ (Plasma) │ │ (raylet) │ │  (mailbox)   │ │
+│  └────┬─────┘ └────┬─────┘ └──────┬───────┘ │
+│       │            │              │         │
+│  ┌────▼────────────▼──────────────▼───────┐ │
+│  │              GCS (metadata)            │ │
+│  └────────────────────────────────────────┘ │
+└──────────────────┬──────────────────────────┘
+                   │ TCP
+          ┌────────▼────────┐
+          │  Node (peers)   │
+          └─────────────────┘
+```
+
+---
+
+<div align="center">
+
+*Grab the core, leave the rest.*
+
+</div>

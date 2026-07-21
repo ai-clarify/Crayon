@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none">
+  <rect width="120" height="120" rx="24" fill="#0f1117"/>
+  <!-- crayon body -->
+  <rect x="44" y="28" width="32" height="64" rx="6" fill="#ff6b6b"/>
+  <rect x="44" y="28" width="32" height="14" rx="6" fill="#ff8787"/>
+  <!-- crayon tip -->
+  <path d="M44 92 L60 108 L76 92 Z" fill="#ffd93d"/>
+  <path d="M52 92 L60 100 L68 92 Z" fill="#f4a261"/>
+  <!-- wrapper lines -->
+  <rect x="44" y="50" width="32" height="3" fill="#e63946"/>
+  <rect x="44" y="58" width="32" height="3" fill="#e63946"/>
+</svg>
