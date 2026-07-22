@@ -1,0 +1,55 @@
+tests/test_benchmark_rl.py
+  s_549c9bc8bea5f9::t_9610ecd7ac8b1a 1-20
+docs/benchmark_rl.md
+  s_549c9bc8bea5f9::t_4be27d04b3b2ac 1,3,5-8,10,12,14-23,25-34,36,38,40,42,44,46,48-52,54,56,58
+benchmark_rl.py
+  s_549c9bc8bea5f9::t_d15ec87fe2d80c 1-7,10-11,14-20,22-160,162-165,167-210,212-214,216-220,222-223,225-226,228,230-233,235-236,238,240-254,256-274,276-322
+src/lib.rs
+  s_4854aaee89b37c::t_9a6c560679dfc7 109,140-224,309,312,320,326-332,337-344
+docs/guide.md
+  s_549c9bc8bea5f9::t_e7ae2b9972d683 144,206-207,216-217,339-341
+.gitignore
+  s_549c9bc8bea5f9::t_e2f0bd193700b5 5-9
+crates/crayon-py/Cargo.toml
+  s_549c9bc8bea5f9::t_cf0cbf9f68935f 19
+README.md
+  s_549c9bc8bea5f9::t_fc6b4813c2b981 20-22,83-87,104,106-108,110-114,116
+crates/crayon-py/src/lib.rs
+  s_3ed83973de6379::t_d204051a6a9860 281-282
+  s_4854aaee89b37c::t_c53d6d3d3bc25b 36-40,104-127,191-194,205,235-236,269-274,327-329,331-332,336,345-358,384,390,394-400,460,465-478,480-481,535,546-549,564-567
+  s_4854aaee89b37c::t_6108a13b0b4174 571-573
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "532c03e03954c48a8d41bbba2e48509def373d82",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_4854aaee89b37c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f92d4164-a0d1-4298-82d4-3032ced81ea5",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_549c9bc8bea5f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6970588b-ad57-4997-95fe-11a138746c2e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
