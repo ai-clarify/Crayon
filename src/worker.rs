@@ -37,6 +37,10 @@ impl OperationRegistry {
     pub fn descriptors(&self) -> Vec<OperationDescriptor> {
         self.entries.values().map(|(d, _)| d.clone()).collect()
     }
+    pub fn descriptor(&self, key: &OperationKey) -> Option<&OperationDescriptor> {
+        self.entries.get(key).map(|(descriptor, _)| descriptor)
+    }
+
     pub async fn execute(
         &self,
         assignment: &TaskAssignment,

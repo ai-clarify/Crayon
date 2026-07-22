@@ -1,6 +1,6 @@
 use crate::{error::Error, ids::ObjectId};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData};
 
 pub const MAX_OPERATION_COMPONENT_BYTES: usize = 128;
 pub const MAX_INLINE_ARG_BYTES: u64 = 64 * 1024;
@@ -104,23 +104,6 @@ impl<A, O> Operation<A, O> {
         &self.descriptor
     }
 }
-#[derive(Default)]
-pub struct OperationCatalog(HashMap<OperationKey, OperationDescriptor>);
-impl OperationCatalog {
-    pub fn register(&mut self, value: OperationDescriptor) -> Result<(), Error> {
-        value.validate()?;
-        if let Some(old) = self.0.get(&value.key) {
-            return if old == &value {
-                Ok(())
-            } else {
-                Err(Error::OperationConflict(value.key.to_string()))
-            };
-        }
-        self.0.insert(value.key.clone(), value);
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

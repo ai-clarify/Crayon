@@ -8,7 +8,6 @@ pub enum Error {
     InvalidResource(String),
     OperationUnavailable(String),
     OperationConflict(String),
-    QueueFull,
     IllegalTransition(String),
     StaleFence,
     TaskNotFound(TaskId),

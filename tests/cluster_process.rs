@@ -45,6 +45,7 @@ fn task_executes_in_a_separate_worker_process() {
             .spawn()
             .unwrap(),
     );
+    thread::sleep(Duration::from_millis(300));
     let mut last = None;
     for _ in 0..50 {
         let output = Command::new(binary)

@@ -1,10 +1,11 @@
 use std::{sync::Arc, time::Duration};
 
 use crayon::{
-    cluster::{checksum, envelope, now_ms, read_frame, request, write_frame, CoordinatorServer},
+    client::ClusterClient,
+    cluster::{envelope, now_ms, read_frame, request, write_frame, CoordinatorServer},
     data_plane::LocalObjectStore,
     error::Error,
-    ids::{ClusterId, NodeId, ObjectId, TaskId, WorkerEpoch},
+    ids::{ClusterId, NodeId, WorkerEpoch},
     operation::{Codec, OperationDescriptor, OperationKey, TaskArg},
     protocol::{
         ClientReply, ClientRequest, Envelope, RegisterWorker, RpcReply, RpcRequest, TaskAssignment,
@@ -160,7 +161,8 @@ async fn execute_assignment(
         },
     )
     .await?;
-    let inputs = match fetch_inputs(coordinator, &assignment).await {
+    let client = ClusterClient::connect_to(coordinator, CLUSTER_ID);
+    let inputs = match fetch_inputs(&client, &assignment).await {
         Ok(inputs) => inputs,
         Err(error) => {
             accept(
@@ -208,11 +210,10 @@ async fn execute_assignment(
     match result {
         Ok(bytes) => {
             let descriptor = registry
-                .descriptors()
-                .into_iter()
-                .find(|descriptor| descriptor.key == assignment.operation)
+                .descriptor(&assignment.operation)
                 .ok_or_else(|| Error::OperationUnavailable(assignment.operation.to_string()))?;
-            let object = objects.put(assignment.output_id, descriptor.output_codec, bytes)?;
+            let object =
+                objects.put(assignment.output_id, descriptor.output_codec.clone(), bytes)?;
             accept(
                 coordinator,
                 WorkerRequest::Completed {
@@ -245,76 +246,17 @@ async fn execute_assignment(
 }
 
 async fn fetch_inputs(
-    coordinator: &str,
+    client: &ClusterClient,
     assignment: &TaskAssignment,
 ) -> Result<Vec<Vec<u8>>, Error> {
     let mut inputs = Vec::with_capacity(assignment.args.len());
     for arg in &assignment.args {
         match arg {
             TaskArg::Inline { bytes, .. } => inputs.push(bytes.clone()),
-            TaskArg::Object(id) => {
-                match rpc(coordinator, RpcRequest::Client(ClientRequest::Get(*id))).await? {
-                    RpcReply::Client(ClientReply::Object {
-                        id: returned,
-                        codec,
-                        bytes: Some(bytes),
-                        checksum: expected,
-                        size_bytes,
-                        ..
-                    }) => {
-                        verify_object(*id, returned, &bytes, expected, size_bytes)?;
-                        let _ = codec;
-                        inputs.push(bytes);
-                    }
-                    RpcReply::Client(ClientReply::Object {
-                        id: returned,
-                        location,
-                        checksum: expected,
-                        size_bytes,
-                        codec,
-                        ..
-                    }) => {
-                        let reply =
-                            rpc(&location, RpcRequest::Client(ClientRequest::GetLocal(*id)))
-                                .await?;
-                        match reply {
-                            RpcReply::Client(ClientReply::Object {
-                                id: local_id,
-                                codec: local_codec,
-                                bytes: Some(bytes),
-                                checksum: actual,
-                                size_bytes: local_size,
-                                ..
-                            }) if returned == *id
-                                && local_codec == codec
-                                && actual == expected
-                                && local_size == size_bytes =>
-                            {
-                                verify_object(*id, local_id, &bytes, expected, size_bytes)?;
-                                inputs.push(bytes);
-                            }
-                            _ => return Err(Error::ObjectConflict(*id)),
-                        }
-                    }
-                    _ => return Err(Error::ObjectNotFound(*id)),
-                }
-            }
+            TaskArg::Object(id) => inputs.push(client.get_bytes(*id).await?.1),
         }
     }
     Ok(inputs)
-}
-
-fn verify_object(
-    requested: ObjectId,
-    returned: ObjectId,
-    bytes: &[u8],
-    expected: [u8; 32],
-    size: u64,
-) -> Result<(), Error> {
-    if returned != requested || bytes.len() as u64 != size || checksum(bytes) != expected {
-        return Err(Error::ObjectConflict(requested));
-    }
-    Ok(())
 }
 
 async fn serve_objects(advertise: &str, objects: LocalObjectStore) -> Result<(), Error> {
@@ -384,76 +326,25 @@ async fn accept(coordinator: &str, request_body: WorkerRequest) -> Result<(), Er
 }
 
 async fn run_client(coordinator: &str, a: i64, b: i64) -> Result<(), Error> {
-    let args = vec![
-        TaskArg::Inline {
-            codec: Codec::BincodeV1,
-            bytes: bincode::serialize(&a)?,
-        },
-        TaskArg::Inline {
-            codec: Codec::BincodeV1,
-            bytes: bincode::serialize(&b)?,
-        },
-    ];
-    let (task_id, output_id) = match rpc(
-        coordinator,
-        RpcRequest::Client(ClientRequest::Submit {
-            operation: add_descriptor().key,
-            args,
-            resources: ResourceSet::cpu_gpu(1.0, 0.0)?,
-            max_attempts: 1,
-        }),
-    )
-    .await?
-    {
-        RpcReply::Client(ClientReply::Submitted { task_id, output_id }) => (task_id, output_id),
-        other => return Err(Error::Protocol(format!("submit failed: {other:?}"))),
-    };
-    wait_result(coordinator, task_id, output_id).await
-}
-
-async fn wait_result(coordinator: &str, _task: TaskId, output: ObjectId) -> Result<(), Error> {
-    for _ in 0..200 {
-        match rpc(coordinator, RpcRequest::Client(ClientRequest::Get(output))).await? {
-            RpcReply::Client(ClientReply::Object {
-                id,
-                bytes: Some(bytes),
-                checksum: expected,
-                size_bytes,
-                ..
-            }) => {
-                verify_object(output, id, &bytes, expected, size_bytes)?;
-                println!("{}", bincode::deserialize::<i64>(&bytes)?);
-                return Ok(());
-            }
-            RpcReply::Client(ClientReply::Object {
-                id,
-                location,
-                checksum: expected,
-                size_bytes,
-                ..
-            }) => {
-                match rpc(
-                    &location,
-                    RpcRequest::Client(ClientRequest::GetLocal(output)),
-                )
-                .await?
-                {
-                    RpcReply::Client(ClientReply::Object {
-                        id: local_id,
-                        bytes: Some(bytes),
-                        checksum: actual,
-                        size_bytes: local_size,
-                        ..
-                    }) if id == output && actual == expected && local_size == size_bytes => {
-                        verify_object(output, local_id, &bytes, expected, size_bytes)?;
-                        println!("{}", bincode::deserialize::<i64>(&bytes)?);
-                        return Ok(());
-                    }
-                    _ => return Err(Error::ObjectConflict(output)),
-                }
-            }
-            _ => tokio::time::sleep(Duration::from_millis(25)).await,
-        }
-    }
-    Err(Error::DeadlineExceeded("task result"))
+    let operation = crayon::Operation::<(i64, i64), i64>::new(add_descriptor())?;
+    let client = ClusterClient::connect_to(coordinator, CLUSTER_ID);
+    let task = client
+        .submit(
+            &operation,
+            vec![
+                TaskArg::Inline {
+                    codec: Codec::BincodeV1,
+                    bytes: bincode::serialize(&a)?,
+                },
+                TaskArg::Inline {
+                    codec: Codec::BincodeV1,
+                    bytes: bincode::serialize(&b)?,
+                },
+            ],
+            ResourceSet::cpu_gpu(1.0, 0.0)?,
+            1,
+        )
+        .await?;
+    println!("{}", task.result(Duration::from_secs(5)).await?);
+    Ok(())
 }

@@ -87,21 +87,24 @@ impl ClusterClient {
             _ => Err(Error::Protocol("unexpected status reply".into())),
         }
     }
-    pub async fn get<T: DeserializeOwned>(&self, reference: &ObjectRef<T>) -> Result<T, Error> {
-        match self.rpc(ClientRequest::Get(reference.id)).await? {
+    pub async fn get_bytes(&self, id: ObjectId) -> Result<(Codec, Vec<u8>), Error> {
+        match self.rpc(ClientRequest::Get(id)).await? {
             ClientReply::Object {
-                id,
+                id: returned,
                 codec,
                 bytes: Some(bytes),
-                checksum: expected,
+                checksum,
                 size_bytes,
                 ..
-            } => decode(reference.id, id, codec, bytes, expected, size_bytes),
+            } => {
+                verify_object(id, returned, &bytes, checksum, size_bytes)?;
+                Ok((codec, bytes))
+            }
             ClientReply::Object {
-                id,
+                id: returned,
                 codec,
                 location,
-                checksum: expected,
+                checksum,
                 size_bytes,
                 ..
             } => {
@@ -109,7 +112,7 @@ impl ClusterClient {
                     &location,
                     &envelope(
                         self.cluster_id,
-                        RpcRequest::Client(ClientRequest::GetLocal(reference.id)),
+                        RpcRequest::Client(ClientRequest::GetLocal(id)),
                     ),
                 )
                 .await?;
@@ -121,27 +124,28 @@ impl ClusterClient {
                         checksum: actual,
                         size_bytes: local_size,
                         ..
-                    }) if id == reference.id
-                        && local_id == reference.id
-                        && codec == local_codec
-                        && actual == expected
+                    }) if returned == id
+                        && local_codec == codec
+                        && actual == checksum
                         && local_size == size_bytes =>
                     {
-                        decode(
-                            reference.id,
-                            local_id,
-                            local_codec,
-                            bytes,
-                            expected,
-                            size_bytes,
-                        )
+                        verify_object(id, local_id, &bytes, checksum, size_bytes)?;
+                        Ok((codec, bytes))
                     }
-                    _ => Err(Error::ObjectConflict(reference.id)),
+                    _ => Err(Error::ObjectConflict(id)),
                 }
             }
             ClientReply::Error(message) => Err(Error::Protocol(message)),
             _ => Err(Error::Protocol("unexpected get reply".into())),
         }
+    }
+
+    pub async fn get<T: DeserializeOwned>(&self, reference: &ObjectRef<T>) -> Result<T, Error> {
+        let (codec, bytes) = self.get_bytes(reference.id).await?;
+        if codec != Codec::BincodeV1 {
+            return Err(Error::ObjectConflict(reference.id));
+        }
+        Ok(bincode::deserialize(&bytes)?)
     }
     pub async fn cancel(&self, task_id: TaskId) -> Result<(), Error> {
         match self.rpc(ClientRequest::Cancel(task_id)).await? {
@@ -152,22 +156,17 @@ impl ClusterClient {
     }
 }
 
-fn decode<T: DeserializeOwned>(
+fn verify_object(
     requested: ObjectId,
     returned: ObjectId,
-    codec: Codec,
-    bytes: Vec<u8>,
+    bytes: &[u8],
     expected: [u8; 32],
     size: u64,
-) -> Result<T, Error> {
-    if requested != returned
-        || codec != Codec::BincodeV1
-        || bytes.len() as u64 != size
-        || checksum(&bytes) != expected
-    {
+) -> Result<(), Error> {
+    if requested != returned || bytes.len() as u64 != size || checksum(bytes) != expected {
         return Err(Error::ObjectConflict(requested));
     }
-    Ok(bincode::deserialize(&bytes)?)
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
