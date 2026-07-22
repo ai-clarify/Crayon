@@ -217,17 +217,29 @@ def train_step(model, optimizer, all_prompts, all_completions, all_old_lps, grou
 # Backend wrappers — same rollout work, different distribution framework
 # ---------------------------------------------------------------------------
 class CrayonBackend:
-    """Crayon workers are in-process threads — pass the model by reference.
+    """Crayon workers are in-process threads.
 
-    No serialization, no copy, model stays on GPU. This is Crayon's structural
-    advantage over Ray (which uses separate processes and must pickle).
+    Two modes:
+    - serialize=False (default, Mode A): model passed by reference, zero copy.
+      This is Crayon's structural advantage over Ray.
+    - serialize=True (Mode B): model pickled through the object store, identical
+      data flow to Ray. Isolates framework overhead from architecture advantage.
     """
-    def __init__(self, workers):
+    def __init__(self, workers, serialize=False):
         import crayon
         self.ray = crayon.Ray(workers)
+        self.serialize = serialize
 
     def distribute(self, model, prompt_chunks):
-        refs = [self.ray.spawn(rollout_task, model, chunk) for chunk in prompt_chunks]
+        if self.serialize:
+            # Mode B: same data flow as Ray — pickle state_dict, put, spawn.
+            state_dict_bytes = pickle.dumps(model.state_dict())
+            state_ref = self.ray.put(state_dict_bytes)
+            refs = [self.ray.spawn(rollout_task_serialized, state_ref, chunk)
+                    for chunk in prompt_chunks]
+        else:
+            # Mode A: pass model by reference (in-process, zero copy).
+            refs = [self.ray.spawn(rollout_task, model, chunk) for chunk in prompt_chunks]
         results = self.ray.get_batch(refs)
         for r in results:
             if isinstance(r, Exception):
@@ -283,6 +295,9 @@ def main():
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default=None, help="CSV output path")
+    parser.add_argument("--crayon-serialize", action="store_true",
+                        help="Mode B: force Crayon to pickle the model (same as Ray). "
+                             "Default (Mode A): pass model by reference, zero copy.")
     args = parser.parse_args()
 
     # Apply sequence config overrides at module level so workers see them
@@ -293,8 +308,6 @@ def main():
     _mod.SEQ_LEN = args.prompt_len + args.gen_len
 
     backend = args.backend
-    if args.output is None:
-        args.output = f"benchmark_rl_{backend}.csv"
 
     print(f"=== GRPO RL Benchmark — backend={backend} ===")
     print(f"steps={args.steps} workers={args.workers} batch={args.batch} "
@@ -320,19 +333,26 @@ def main():
         f"batch ({args.batch}) must be divisible by group_size ({args.group_size})"
     num_prompts = args.batch // args.group_size
 
+    # Initialize distribution backend once (reused across all steps)
+    if backend == "crayon":
+        dist = CrayonBackend(args.workers, serialize=args.crayon_serialize)
+        mode = "serialized" if args.crayon_serialize else "local"
+    else:
+        dist = RayBackend(args.workers)
+        mode = "serialized"  # Ray always serializes (separate processes)
+    print(f"mode: {mode}")
+
+    # Output file includes mode so A/B results don't overwrite each other
+    if args.output is None:
+        args.output = f"benchmark_rl_{backend}_{mode}.csv"
+
     # CSV setup
     csv_file = open(args.output, "w", newline="")
     writer = csv.writer(csv_file)
     writer.writerow([
-        "backend", "step", "step_time_ms", "samples_per_sec",
+        "backend", "mode", "step", "step_time_ms", "samples_per_sec",
         "tokens_per_sec", "gpu_memory_mb", "loss", "num_samples",
     ])
-
-    # Initialize distribution backend once (reused across all steps)
-    if backend == "crayon":
-        dist = CrayonBackend(args.workers)
-    else:
-        dist = RayBackend(args.workers)
 
     total_start = time.time()
     rng = np.random.default_rng(args.seed)
@@ -377,7 +397,7 @@ def main():
         gpu_mem = gpu_memory_mb()
 
         writer.writerow([
-            backend, step, f"{step_ms:.3f}", f"{samples_per_sec:.3f}",
+            backend, mode, step, f"{step_ms:.3f}", f"{samples_per_sec:.3f}",
             f"{tokens_per_sec:.3f}", f"{gpu_mem:.3f}", f"{loss:.6f}",
             args.batch,
         ])

@@ -1,0 +1,6 @@
+backend,mode,step,step_time_ms,samples_per_sec,tokens_per_sec,gpu_memory_mb,loss,num_samples
+crayon,serialized,0,54216.126,0.148,2.361,11643.070,0.199262,8
+crayon,serialized,1,50628.073,0.158,2.528,18618.707,0.067516,8
+crayon,serialized,2,50208.724,0.159,2.549,18618.707,-0.000000,8
+crayon,serialized,3,49841.216,0.161,2.568,18618.707,-0.000000,8
+crayon,serialized,4,49846.323,0.160,2.568,18620.053,-0.000000,8
