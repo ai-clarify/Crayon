@@ -1,0 +1,29 @@
+src/bin/crayon_cluster.rs
+  s_4854aaee89b37c::t_8407c5110d443d 4-5,8,164-165,213,215-216,249,256,329-349
+src/client.rs
+  s_4854aaee89b37c::t_7e4ad5b82c9dc5 90-91,93,96,99-102,104,107,115,127-129,132-133,135,142-149,159,162,165-166,169
+src/operation.rs
+  s_4854aaee89b37c::t_ed30d5c9e15132 3
+src/worker.rs
+  s_4854aaee89b37c::t_63df3f7caf54e7 40-43
+tests/cluster_process.rs
+  s_4854aaee89b37c::t_e7dd822646250e 48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fe4eab6221acc94f4c451f416da3c74e84cd99b7",
+  "prompts": {},
+  "sessions": {
+    "s_4854aaee89b37c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f92d4164-a0d1-4298-82d4-3032ced81ea5",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
