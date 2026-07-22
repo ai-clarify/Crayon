@@ -94,16 +94,28 @@ r = counter.call(lambda c: c.__setitem__("n", c["n"] + 1) or c["n"])
 # Rust
 cargo run --bin crayon-demo          # 单节点 demo
 cargo run --bin crayon-rl            # RL 训练模拟
-cargo run --example rl_cartpole      # 真实 CartPole 训练 (candle)
 cargo test                           # 全部测试 (unit + e2e)
 
 # Python
 pip install crayon                   # 安装 Python 包
-python examples/rl_cartpole.py       # Python RL 训练
 
 # 多节点
 docker compose up --build            # head + worker
 ```
+
+## Benchmark: Crayon vs Ray
+
+0.6B Transformer · GRPO · PyTorch · V100 · 2 workers · batch=8
+
+| Mode | Crayon | Ray | 倍数 |
+|------|--------|-----|------|
+| **A 各自最优** | **1.67s** | 21.2s | **Crayon 12.7x** |
+| B 都序列化 | 50.0s | 21.2s | Ray 2.4x |
+
+**Mode A**：Crayon 传模型引用（进程内线程，零拷贝）；Ray 每步 pickle 2.4GB 权重。
+**Mode B**：Crayon 也走序列化，隔离框架开销。差距来自 bincode < plasma + 无模型缓存。
+
+详细数据和对抗式审核见 [docs/benchmark_rl.md](docs/benchmark_rl.md)。
 
 ## 文档
 
