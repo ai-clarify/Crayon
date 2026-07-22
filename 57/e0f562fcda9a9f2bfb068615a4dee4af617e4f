@@ -1,0 +1,31 @@
+src/bin/crayon_cluster.rs
+  s_4854aaee89b37c::t_8110c4c27f3991 1,8,23,32-37,45-52,62-68,83-107,111-141,144,147,209,260,361,364,366,369-371,388,395-490
+src/client.rs
+  s_4854aaee89b37c::t_7356f50e833b29 10,53,79,83,86,90-96,145,160,204,212,217
+src/cluster.rs
+  s_4854aaee89b37c::t_0e1d0ebb9e7c0c 18-20,91,101,110,112,118,124,130,140,146,160,175,178-185,199,201,203-223,227,237,247,290
+src/error.rs
+  s_4854aaee89b37c::t_df2604a3dcc960 2,5,19
+src/protocol.rs
+  s_4854aaee89b37c::t_6e9d01b67f5668 52,130,134-152,166-167,169,211
+tests/cluster_process.rs
+  s_4854aaee89b37c::t_6c0f2ebbde2a03 2-3,5,9-13,16-19,22-27,31-56,60-109,111,113,115-247
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "57e0f562fcda9a9f2bfb068615a4dee4af617e4f",
+  "prompts": {},
+  "sessions": {
+    "s_4854aaee89b37c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f92d4164-a0d1-4298-82d4-3032ced81ea5",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
