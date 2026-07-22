@@ -71,27 +71,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn add_descriptor() -> OperationDescriptor {
+fn builtin_descriptor(name: &str) -> OperationDescriptor {
     OperationDescriptor {
-        key: OperationKey::new("builtin", "add", 1),
-        input_codec: Codec::BincodeV1,
-        output_codec: Codec::BincodeV1,
-        max_inline_arg_bytes: 1024,
-    }
-}
-
-fn copy_descriptor() -> OperationDescriptor {
-    OperationDescriptor {
-        key: OperationKey::new("builtin", "copy", 1),
-        input_codec: Codec::BincodeV1,
-        output_codec: Codec::BincodeV1,
-        max_inline_arg_bytes: 1024,
-    }
-}
-
-fn sleep_descriptor() -> OperationDescriptor {
-    OperationDescriptor {
-        key: OperationKey::new("builtin", "sleep", 1),
+        key: OperationKey::new("builtin", name, 1),
         input_codec: Codec::BincodeV1,
         output_codec: Codec::BincodeV1,
         max_inline_arg_bytes: 1024,
@@ -109,7 +91,7 @@ async fn run_worker(
     serve_objects(advertise, objects.clone()).await?;
     let mut registry = OperationRegistry::default();
     if matches!(operations, "all" | "add") {
-        registry.register(add_descriptor(), |args| async move {
+        registry.register(builtin_descriptor("add"), |args| async move {
             if args.len() != 2 {
                 return Err(Error::Protocol("add expects two arguments".into()));
             }
@@ -119,15 +101,15 @@ async fn run_worker(
         })?;
     }
     if matches!(operations, "all" | "copy") {
-        registry.register(copy_descriptor(), |args| async move {
-            if args.len() != 1 {
-                return Err(Error::Protocol("copy expects one argument".into()));
-            }
-            Ok(args[0].clone())
+        registry.register(builtin_descriptor("copy"), |args| async move {
+            let [value]: [Vec<u8>; 1] = args
+                .try_into()
+                .map_err(|_| Error::Protocol("copy expects one argument".into()))?;
+            Ok(value)
         })?;
     }
     if matches!(operations, "all" | "sleep") {
-        registry.register(sleep_descriptor(), |args| async move {
+        registry.register(builtin_descriptor("sleep"), |args| async move {
             if args.len() != 1 {
                 return Err(Error::Protocol("sleep expects one argument".into()));
             }
@@ -401,8 +383,8 @@ async fn run_submit_detach(args: &[String]) -> Result<(), Error> {
         .parse()
         .map_err(|error| Error::Protocol(format!("invalid value: {error}")))?;
     let descriptor = match operation_name.as_str() {
-        "copy" => copy_descriptor(),
-        "sleep" => sleep_descriptor(),
+        "copy" => builtin_descriptor("copy"),
+        "sleep" => builtin_descriptor("sleep"),
         _ => return Err(Error::OperationUnavailable(operation_name.clone())),
     };
     let operation = crayon::Operation::<u64, u64>::new(descriptor)?;
@@ -445,7 +427,7 @@ async fn run_status(args: &[String]) -> Result<(), Error> {
     let view = ClusterClient::connect(coordinator).status(id).await?;
     println!(
         "{} {} {} {}",
-        view.task_id, view.output_id, view.state, view.attempt.0
+        id, view.output_id, view.state, view.attempt.0
     );
     Ok(())
 }
@@ -489,7 +471,7 @@ async fn run_get(args: &[String]) -> Result<(), Error> {
 }
 
 async fn run_client(coordinator: &str, a: i64, b: i64) -> Result<(), Error> {
-    let operation = crayon::Operation::<(i64, i64), i64>::new(add_descriptor())?;
+    let operation = crayon::Operation::<(i64, i64), i64>::new(builtin_descriptor("add"))?;
     let client = ClusterClient::connect_to(coordinator, CLUSTER_ID);
     let task = client
         .submit(

@@ -1,5 +1,5 @@
 use crate::{
-    error::Error,
+    error::{DeadlineContext, Error},
     ids::{
         Attempt, ClusterId, CoordinatorEpoch, LeaseId, NodeId, ObjectId, RequestId, Revision,
         TaskId, WorkerEpoch, WorkerSessionId,
@@ -8,7 +8,16 @@ use crate::{
     resources::ResourceSet,
 };
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
+
+impl fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
 
 pub const MAGIC: [u8; 4] = *b"CRYN";
 pub const PROTOCOL_MAJOR: u16 = 1;
@@ -49,7 +58,7 @@ impl Envelope {
             return Err(Error::Protocol("cluster id mismatch".into()));
         }
         if self.deadline_unix_ms <= now_ms {
-            return Err(Error::DeadlineExceeded("rpc request".into()));
+            return Err(Error::DeadlineExceeded(DeadlineContext::RpcRequest));
         }
         Ok(())
     }
@@ -130,11 +139,21 @@ pub enum ClientRequest {
     Workers,
     Cancel(TaskId),
 }
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TaskStatus {
+    Waiting,
+    Runnable,
+    Assigned,
+    Running,
+    CancelRequested,
+    Succeeded,
+    Failed(String),
+    Cancelled,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskView {
-    pub task_id: TaskId,
     pub output_id: ObjectId,
-    pub state: String,
+    pub state: TaskStatus,
     pub attempt: Attempt,
     pub worker: Option<NodeId>,
 }

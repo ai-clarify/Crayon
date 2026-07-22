@@ -5,7 +5,10 @@ use crate::{
         WorkerSessionId,
     },
     operation::{Codec, OperationDescriptor, OperationKey, TaskArg},
-    protocol::{RegisterWorker, TaskAssignment, TaskCompletion, TaskFence, WorkerIdentity},
+    protocol::{
+        RegisterWorker, TaskAssignment, TaskCompletion, TaskFence, TaskStatus as TaskState,
+        WorkerIdentity,
+    },
     resources::ResourceSet,
 };
 use std::collections::HashMap;
@@ -14,17 +17,6 @@ use std::collections::HashMap;
 pub enum WorkerState {
     Alive,
     Dead,
-}
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum TaskState {
-    Waiting,
-    Runnable,
-    Assigned,
-    Running,
-    CancelRequested,
-    Succeeded,
-    Failed(String),
-    Cancelled,
 }
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ObjectState {

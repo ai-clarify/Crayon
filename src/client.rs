@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     cluster::{checksum, envelope, request},
-    error::Error,
+    error::{DeadlineContext, Error},
     ids::{ClusterId, ObjectId, TaskId},
     operation::{Codec, Operation, TaskArg},
     protocol::{ClientReply, ClientRequest, RpcReply, RpcRequest, TaskView, WorkerView},
@@ -201,7 +201,7 @@ impl<T: DeserializeOwned> TaskHandle<T> {
         loop {
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(Error::DeadlineExceeded("task result".into()));
+                return Err(Error::DeadlineExceeded(DeadlineContext::TaskResult));
             }
             let remaining = deadline - now;
             match tokio::time::timeout(remaining, self.client.get(&self.output)).await {
@@ -209,12 +209,12 @@ impl<T: DeserializeOwned> TaskHandle<T> {
                 Ok(Err(Error::Protocol(message))) if message.contains("unavailable") => {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
-                        return Err(Error::DeadlineExceeded("task result".into()));
+                        return Err(Error::DeadlineExceeded(DeadlineContext::TaskResult));
                     }
                     tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
                 }
                 Ok(Err(error)) => return Err(error),
-                Err(_) => return Err(Error::DeadlineExceeded("task result".into())),
+                Err(_) => return Err(Error::DeadlineExceeded(DeadlineContext::TaskResult)),
             }
         }
     }

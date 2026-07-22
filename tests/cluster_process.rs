@@ -91,11 +91,12 @@ impl Cluster {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let values: Vec<_> = stdout(output)
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
-        (values[0].clone(), values[1].clone())
+        let text = stdout(output);
+        let mut values = text.split_whitespace();
+        let task = values.next().unwrap().to_owned();
+        let output = values.next().unwrap().to_owned();
+        assert!(values.next().is_none());
+        (task, output)
     }
 
     fn status(&self, task: &str) -> String {
@@ -214,7 +215,8 @@ fn worker_loss_retries_and_loses_owned_objects() {
     cluster.children[1].kill().unwrap();
     cluster.children[1].wait().unwrap();
     cluster.eventually(Duration::from_secs(5), || {
-        cluster.status(&task).contains("Succeeded") && cluster.status(&task).ends_with("2")
+        let status = cluster.status(&task);
+        status.contains("Succeeded") && status.ends_with('2')
     });
     assert_eq!(
         stdout(cluster.run(["get", &cluster.coordinator, &output])),
@@ -222,10 +224,10 @@ fn worker_loss_retries_and_loses_owned_objects() {
     );
     cluster.children[2].kill().unwrap();
     cluster.children[2].wait().unwrap();
-    thread::sleep(Duration::from_millis(500));
-    let lost = cluster.run(["get", &cluster.coordinator, &output]);
-    assert!(!lost.status.success());
-    assert!(String::from_utf8_lossy(&lost.stderr).contains("ObjectLost"));
+    cluster.eventually(Duration::from_secs(3), || {
+        let lost = cluster.run(["get", &cluster.coordinator, &output]);
+        !lost.status.success() && String::from_utf8_lossy(&lost.stderr).contains("ObjectLost")
+    });
 }
 
 #[test]
