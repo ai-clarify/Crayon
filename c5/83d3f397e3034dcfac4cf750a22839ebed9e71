@@ -1,0 +1,25 @@
+benchmark_rl.py
+  s_3ed83973de6379::t_5acf709f05fda5 110-111,114,147-148,235
+crates/crayon-py/src/lib.rs
+  s_3ed83973de6379::t_d204051a6a9860 193,204,206-210,214,222-223,237,240-241,243-244,246,250-251,253,255,260-265,267-272,276-282,316,327-328,343-355,454-466
+src/object_store.rs
+  s_3ed83973de6379::t_9611da9ec243bb 39-43,142,450,462-513
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c583d3f397e3034dcfac4cf750a22839ebed9e71",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
