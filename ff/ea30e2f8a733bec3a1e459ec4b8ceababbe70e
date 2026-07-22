@@ -1,0 +1,23 @@
+benchmark_rl.py
+  s_3ed83973de6379::t_fbfa71265e9c8b 6-22,24-29
+docs/benchmark_rl.md
+  s_3ed83973de6379::t_b343ebe2ffcfa9 1-143
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ffea30e2f8a733bec3a1e459ec4b8ceababbe70e",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
