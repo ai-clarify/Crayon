@@ -1,43 +1,26 @@
 [package]
 name = "crayon-rs"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
-description = "A Rust reimplementation of Ray's core: distributed object store, actors, task scheduling, and multi-node execution for RL training infrastructure"
+description = "A small coordinator-based distributed task runtime"
 license = "MIT"
 repository = "https://github.com/cklxx/crayon"
-homepage = "https://github.com/cklxx/crayon"
-documentation = "https://docs.rs/crayon"
 readme = "README.md"
-keywords = ["ray", "distributed", "rl", "actor", "scheduling"]
-categories = ["concurrency", "science", "algorithms"]
+keywords = ["distributed", "task", "scheduler", "rust"]
+categories = ["concurrency"]
 
 [lib]
 name = "crayon"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
-uuid = { version = "1", features = ["v4"] }
-bytes = "1"
+blake3 = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
 parking_lot = "0.12"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-async-trait = "0.1"
 futures = "0.3"
-core_affinity = "0.8"
-
-[dev-dependencies]
-rand = "0.8"
 
 [[bin]]
-name = "crayon-demo"
-path = "src/bin/demo.rs"
-
-[[bin]]
-name = "crayon-multi"
-path = "src/bin/multi_node_demo.rs"
-
-[[bin]]
-name = "crayon-rl"
-path = "src/bin/rl_sim.rs"
+name = "crayon-cluster"
+path = "src/bin/crayon_cluster.rs"

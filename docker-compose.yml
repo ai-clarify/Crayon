@@ -1,20 +1,23 @@
 services:
-  head:
+  coordinator:
     build: .
-    command: ["crayon-multi", "--head", "--addr", "0.0.0.0:7000"]
-    ports:
-      - "7000:7000"
-    networks:
-      - crayon-net
+    command: ["coordinator", "0.0.0.0:7000"]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/7000'"]
+      interval: 1s
+      timeout: 1s
+      retries: 20
 
   worker:
     build: .
-    command: ["crayon-multi", "--worker", "head:7000", "--addr", "0.0.0.0:7001"]
+    command: ["worker", "coordinator:7000", "worker:7001"]
     depends_on:
-      - head
-    networks:
-      - crayon-net
+      coordinator:
+        condition: service_healthy
 
-networks:
-  crayon-net:
-    driver: bridge
+  acceptance:
+    build: .
+    command: ["submit", "coordinator:7000", "20", "22"]
+    depends_on:
+      - worker
+    restart: "no"

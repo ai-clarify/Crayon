@@ -1,129 +1,111 @@
-//! Resource tracking for workers and tasks — Crayon's analog of Ray's
-//! resource model (CPU/GPU accounting).
-//!
-//! Ray allows tasks and actors to declare resource requirements
-//! (`num_cpus`, `num_gpus`). The raylet only schedules a task onto a worker
-//! that has enough free resources, and accounts for them while the task runs.
+use std::collections::BTreeMap;
 
-use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
-/// A set of compute resources. Uses `f64` so tasks can request fractional
-/// resources (e.g. `0.5` CPU), matching Ray's model.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Resources {
-    pub cpu: f64,
-    pub gpu: f64,
-}
+use crate::error::Error;
 
-impl Resources {
-    pub fn new(cpu: f64, gpu: f64) -> Self {
-        Resources { cpu, gpu }
-    }
-
-    /// Default task resource request: 1 CPU, 0 GPU (matches Ray's default).
-    pub fn default_task() -> Self {
-        Resources { cpu: 1.0, gpu: 0.0 }
-    }
-
-    /// Can `self` cover a request for `needed` resources?
-    pub fn can_fit(&self, needed: &Resources) -> bool {
-        self.cpu >= needed.cpu && self.gpu >= needed.gpu
-    }
-
-    pub fn subtract(&mut self, other: &Resources) {
-        self.cpu -= other.cpu;
-        self.gpu -= other.gpu;
-    }
-
-    pub fn add(&mut self, other: &Resources) {
-        self.cpu += other.cpu;
-        self.gpu += other.gpu;
-    }
-}
-
-/// Tracks available resources for a set of workers. Thread-safe.
-pub struct ResourceTracker {
-    inner: Mutex<Vec<WorkerResources>>,
-    /// Number of GPUs detected on this node. Immutable after construction,
-    /// so `gpu_device()` can read it without taking the mutex.
-    gpu_count: usize,
-    /// Per-worker resource totals (immutable after construction).
-    per_worker: Resources,
-}
-
-struct WorkerResources {
-    available: Resources,
-    total: Resources,
-}
-
-impl ResourceTracker {
-    /// Create a tracker with `num_workers` workers, each with `per_worker`
-    /// resources. GPU device ids are assigned sequentially (0, 1, 2, ...) to
-    /// workers with `per_worker.gpu > 0`, up to the number of detected GPUs.
-    pub fn new(num_workers: usize, per_worker: Resources) -> Self {
-        let gpu_count = crate::device::detect_gpu_count();
-        let workers = (0..num_workers)
-            .map(|_| WorkerResources {
-                available: per_worker,
-                total: per_worker,
-            })
-            .collect();
-        ResourceTracker {
-            inner: Mutex::new(workers),
-            gpu_count,
-            per_worker,
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct ResourceQuantity(i64);
+impl ResourceQuantity {
+    pub const SCALE: i64 = 1_000;
+    pub fn from_units(value: f64) -> Result<Self, Error> {
+        if !value.is_finite() || value < 0.0 || value > i64::MAX as f64 / Self::SCALE as f64 {
+            return Err(Error::InvalidResource(
+                "quantity must be finite, non-negative, and in range".into(),
+            ));
         }
+        let scaled = (value * Self::SCALE as f64).round() as i64;
+        if value > 0.0 && scaled == 0 {
+            return Err(Error::InvalidResource(
+                "positive quantity is below 0.001 unit".into(),
+            ));
+        }
+        Ok(Self(scaled))
     }
-
-    /// The GPU device id assigned to `worker_id`, or `None` if it has no GPU.
-    /// Lock-free: reads only immutable fields set at construction.
-    pub fn gpu_device(&self, worker_id: usize) -> Option<usize> {
-        (self.per_worker.gpu > 0.0 && worker_id < self.gpu_count).then_some(worker_id)
+    pub const fn milli(self) -> i64 {
+        self.0
     }
+}
 
-    /// Try to reserve `needed` resources on some worker. Returns the worker id
-    /// if one had enough free resources, else `None`.
-    ///
-    /// If the task needs no GPU, prefers workers with no GPU total to avoid
-    /// wasting expensive GPU nodes on CPU-only work (#47866 analog).
-    pub fn try_acquire(&self, needed: &Resources) -> Option<usize> {
-        let mut workers = self.inner.lock();
-        // First pass: if no GPU needed, prefer CPU-only workers.
-        if needed.gpu == 0.0 {
-            for (i, w) in workers.iter_mut().enumerate() {
-                if w.total.gpu == 0.0 && w.available.can_fit(needed) {
-                    w.available.subtract(needed);
-                    return Some(i);
-                }
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResourceSet(BTreeMap<String, ResourceQuantity>);
+impl ResourceSet {
+    pub fn cpu_gpu(cpu: f64, gpu: f64) -> Result<Self, Error> {
+        let mut result = Self::default();
+        for (name, value) in [("cpu", cpu), ("gpu", gpu)] {
+            let q = ResourceQuantity::from_units(value)?;
+            if q.milli() != 0 {
+                result.0.insert(name.into(), q);
             }
         }
-        // Second pass: any worker that fits.
-        for (i, w) in workers.iter_mut().enumerate() {
-            if w.available.can_fit(needed) {
-                w.available.subtract(needed);
-                return Some(i);
+        Ok(result)
+    }
+    pub fn get(&self, name: &str) -> ResourceQuantity {
+        self.0.get(name).copied().unwrap_or_default()
+    }
+    pub fn can_fit(&self, needed: &Self) -> bool {
+        needed
+            .0
+            .iter()
+            .all(|(name, value)| self.get(name) >= *value)
+    }
+    pub fn subtract(&mut self, needed: &Self) -> Result<(), Error> {
+        if !self.can_fit(needed) {
+            return Err(Error::InvalidResource("insufficient resources".into()));
+        }
+        for (name, value) in &needed.0 {
+            let remaining = self.get(name).milli() - value.milli();
+            if remaining == 0 {
+                self.0.remove(name);
+            } else {
+                self.0.insert(name.clone(), ResourceQuantity(remaining));
             }
         }
-        None
+        Ok(())
     }
-
-    /// Release previously-acquired resources back to a worker.
-    pub fn release(&self, worker_id: usize, resources: &Resources) {
-        let mut workers = self.inner.lock();
-        if let Some(w) = workers.get_mut(worker_id) {
-            w.available.add(resources);
+    pub fn add_capped(&mut self, returned: &Self, total: &Self) -> Result<(), Error> {
+        let mut next = self.clone();
+        for (name, value) in &returned.0 {
+            let quantity = next
+                .get(name)
+                .milli()
+                .checked_add(value.milli())
+                .ok_or_else(|| Error::InvalidResource("resource overflow".into()))?;
+            if quantity > total.get(name).milli() {
+                return Err(Error::InvalidResource(
+                    "resource release exceeds worker total".into(),
+                ));
+            }
+            if quantity == 0 {
+                next.0.remove(name);
+            } else {
+                next.0.insert(name.clone(), ResourceQuantity(quantity));
+            }
         }
+        *self = next;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_is_atomic_and_capped() {
+        let total = ResourceSet::cpu_gpu(1.0, 1.0).unwrap();
+        let mut available = ResourceSet::cpu_gpu(0.5, 0.5).unwrap();
+        let before = available.clone();
+        assert!(available
+            .add_capped(&ResourceSet::cpu_gpu(0.5, 1.0).unwrap(), &total)
+            .is_err());
+        assert_eq!(available, before);
     }
 
-    /// Snapshot of available resources per worker (for status reporting).
-    pub fn snapshot(&self) -> Vec<Resources> {
-        self.inner.lock().iter().map(|w| w.available).collect()
-    }
-
-    /// Returns true if at least one worker has enough *total* resources to
-    /// ever fit this request. If false, the task can never be scheduled and
-    /// would deadlock — the caller should fail fast instead of queueing.
-    pub fn can_any_worker_fit(&self, needed: &Resources) -> bool {
-        self.inner.lock().iter().any(|w| w.total.can_fit(needed))
+    #[test]
+    fn rejects_non_representable_quantities() {
+        assert!(ResourceQuantity::from_units(f64::NAN).is_err());
+        assert!(ResourceQuantity::from_units(-1.0).is_err());
+        assert!(ResourceQuantity::from_units(0.0001).is_err());
     }
 }
