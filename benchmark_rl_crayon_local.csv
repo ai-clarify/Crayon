@@ -1,0 +1,6 @@
+backend,mode,step,step_time_ms,samples_per_sec,tokens_per_sec,gpu_memory_mb,loss,num_samples
+crayon,local,0,2486.224,3.218,51.484,11630.909,0.248279,8
+crayon,local,1,1665.633,4.803,76.848,12429.723,-0.000000,8
+crayon,local,2,1662.772,4.811,76.980,12429.723,-0.000000,8
+crayon,local,3,1674.610,4.777,76.436,12429.723,0.246951,8
+crayon,local,4,1675.672,4.774,76.387,12430.473,0.048226,8
