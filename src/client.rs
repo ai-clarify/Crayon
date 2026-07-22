@@ -7,7 +7,7 @@ use crate::{
     error::Error,
     ids::{ClusterId, ObjectId, TaskId},
     operation::{Codec, Operation, TaskArg},
-    protocol::{ClientReply, ClientRequest, RpcReply, RpcRequest},
+    protocol::{ClientReply, ClientRequest, RpcReply, RpcRequest, TaskView, WorkerView},
     resources::ResourceSet,
 };
 
@@ -50,7 +50,7 @@ impl ClusterClient {
             .await?
         {
             ClientReply::Object { id, .. } => Ok(ObjectRef::new(id)),
-            ClientReply::Error(message) => Err(Error::Protocol(message)),
+            ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected put reply".into())),
         }
     }
@@ -76,15 +76,22 @@ impl ClusterClient {
                 output: ObjectRef::new(output_id),
                 client: self.clone(),
             }),
-            ClientReply::Error(message) => Err(Error::Protocol(message)),
+            ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected submit reply".into())),
         }
     }
-    pub async fn status(&self, task_id: TaskId) -> Result<String, Error> {
+    pub async fn status(&self, task_id: TaskId) -> Result<TaskView, Error> {
         match self.rpc(ClientRequest::Status(task_id)).await? {
             ClientReply::Status(status) => Ok(status),
-            ClientReply::Error(message) => Err(Error::Protocol(message)),
+            ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected status reply".into())),
+        }
+    }
+    pub async fn workers(&self) -> Result<Vec<WorkerView>, Error> {
+        match self.rpc(ClientRequest::Workers).await? {
+            ClientReply::Workers(workers) => Ok(workers),
+            ClientReply::Error(error) => Err(error),
+            _ => Err(Error::Protocol("unexpected workers reply".into())),
         }
     }
     pub async fn get_bytes(&self, id: ObjectId) -> Result<(Codec, Vec<u8>), Error> {
@@ -135,7 +142,7 @@ impl ClusterClient {
                     _ => Err(Error::ObjectConflict(id)),
                 }
             }
-            ClientReply::Error(message) => Err(Error::Protocol(message)),
+            ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected get reply".into())),
         }
     }
@@ -150,7 +157,7 @@ impl ClusterClient {
     pub async fn cancel(&self, task_id: TaskId) -> Result<(), Error> {
         match self.rpc(ClientRequest::Cancel(task_id)).await? {
             ClientReply::Cancelled => Ok(()),
-            ClientReply::Error(message) => Err(Error::Protocol(message)),
+            ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected cancel reply".into())),
         }
     }
@@ -194,7 +201,7 @@ impl<T: DeserializeOwned> TaskHandle<T> {
         loop {
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(Error::DeadlineExceeded("task result"));
+                return Err(Error::DeadlineExceeded("task result".into()));
             }
             let remaining = deadline - now;
             match tokio::time::timeout(remaining, self.client.get(&self.output)).await {
@@ -202,12 +209,12 @@ impl<T: DeserializeOwned> TaskHandle<T> {
                 Ok(Err(Error::Protocol(message))) if message.contains("unavailable") => {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
-                        return Err(Error::DeadlineExceeded("task result"));
+                        return Err(Error::DeadlineExceeded("task result".into()));
                     }
                     tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
                 }
                 Ok(Err(error)) => return Err(error),
-                Err(_) => return Err(Error::DeadlineExceeded("task result")),
+                Err(_) => return Err(Error::DeadlineExceeded("task result".into())),
             }
         }
     }

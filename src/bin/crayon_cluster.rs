@@ -1,11 +1,11 @@
-use std::{sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use crayon::{
     client::ClusterClient,
     cluster::{envelope, now_ms, read_frame, request, write_frame, CoordinatorServer},
     data_plane::LocalObjectStore,
     error::Error,
-    ids::{ClusterId, NodeId, WorkerEpoch},
+    ids::{ClusterId, NodeId, ObjectId, TaskId, WorkerEpoch},
     operation::{Codec, OperationDescriptor, OperationKey, TaskArg},
     protocol::{
         ClientReply, ClientRequest, Envelope, RegisterWorker, RpcReply, RpcRequest, TaskAssignment,
@@ -20,7 +20,7 @@ const CLUSTER_ID: ClusterId = ClusterId([0; 16]);
 const OBJECT_CONNECTIONS: usize = 128;
 
 fn usage() -> ! {
-    eprintln!("usage: crayon-cluster coordinator <addr> | worker <coordinator> <advertise> | submit <coordinator> <a> <b>");
+    eprintln!("usage: crayon-cluster coordinator <addr> [lease-ms] | worker <coordinator> <advertise> [node-id] [cpu] [operations] | submit <coordinator> <a> <b> | submit-detach <coordinator> <operation> <value> [object-id] [cpu] [max-attempts] | status <coordinator> <task-id> | workers <coordinator> | cancel <coordinator> <task-id> | get <coordinator> <object-id>");
     std::process::exit(2)
 }
 
@@ -29,7 +29,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("coordinator") => {
-            CoordinatorServer::new(CLUSTER_ID, 5_000)
+            let lease_ms = args
+                .get(3)
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(5_000);
+            CoordinatorServer::new(CLUSTER_ID, lease_ms)
                 .serve(args.get(2).unwrap_or_else(|| usage()))
                 .await?
         }
@@ -37,6 +42,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_worker(
                 args.get(2).unwrap_or_else(|| usage()),
                 args.get(3).unwrap_or_else(|| usage()),
+                args.get(4)
+                    .map(|value| NodeId::from_str(value))
+                    .transpose()?,
+                args.get(5)
+                    .map(|value| value.parse())
+                    .transpose()?
+                    .unwrap_or(1.0),
+                args.get(6).map(String::as_str).unwrap_or("all"),
             )
             .await?
         }
@@ -46,6 +59,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let b: i64 = args.get(4).unwrap_or_else(|| usage()).parse()?;
             run_client(coordinator, a, b).await?;
         }
+        Some("submit-detach") => {
+            run_submit_detach(&args).await?;
+        }
+        Some("status") => run_status(&args).await?,
+        Some("workers") => run_workers(&args).await?,
+        Some("cancel") => run_cancel(&args).await?,
+        Some("get") => run_get(&args).await?,
         _ => usage(),
     }
     Ok(())
@@ -60,24 +80,71 @@ fn add_descriptor() -> OperationDescriptor {
     }
 }
 
-async fn run_worker(coordinator: &str, advertise: &str) -> Result<(), Error> {
+fn copy_descriptor() -> OperationDescriptor {
+    OperationDescriptor {
+        key: OperationKey::new("builtin", "copy", 1),
+        input_codec: Codec::BincodeV1,
+        output_codec: Codec::BincodeV1,
+        max_inline_arg_bytes: 1024,
+    }
+}
+
+fn sleep_descriptor() -> OperationDescriptor {
+    OperationDescriptor {
+        key: OperationKey::new("builtin", "sleep", 1),
+        input_codec: Codec::BincodeV1,
+        output_codec: Codec::BincodeV1,
+        max_inline_arg_bytes: 1024,
+    }
+}
+
+async fn run_worker(
+    coordinator: &str,
+    advertise: &str,
+    node_id: Option<NodeId>,
+    cpu: f64,
+    operations: &str,
+) -> Result<(), Error> {
     let objects = LocalObjectStore::default();
     serve_objects(advertise, objects.clone()).await?;
     let mut registry = OperationRegistry::default();
-    registry.register(add_descriptor(), |args| async move {
-        if args.len() != 2 {
-            return Err(Error::Protocol("add expects two arguments".into()));
-        }
-        let a: i64 = bincode::deserialize(&args[0])?;
-        let b: i64 = bincode::deserialize(&args[1])?;
-        Ok(bincode::serialize(&(a + b))?)
-    })?;
+    if matches!(operations, "all" | "add") {
+        registry.register(add_descriptor(), |args| async move {
+            if args.len() != 2 {
+                return Err(Error::Protocol("add expects two arguments".into()));
+            }
+            let a: i64 = bincode::deserialize(&args[0])?;
+            let b: i64 = bincode::deserialize(&args[1])?;
+            Ok(bincode::serialize(&(a + b))?)
+        })?;
+    }
+    if matches!(operations, "all" | "copy") {
+        registry.register(copy_descriptor(), |args| async move {
+            if args.len() != 1 {
+                return Err(Error::Protocol("copy expects one argument".into()));
+            }
+            Ok(args[0].clone())
+        })?;
+    }
+    if matches!(operations, "all" | "sleep") {
+        registry.register(sleep_descriptor(), |args| async move {
+            if args.len() != 1 {
+                return Err(Error::Protocol("sleep expects one argument".into()));
+            }
+            let millis: u64 = bincode::deserialize(&args[0])?;
+            tokio::time::sleep(Duration::from_millis(millis)).await;
+            Ok(bincode::serialize(&millis)?)
+        })?;
+    }
+    if registry.descriptors().is_empty() {
+        return Err(Error::OperationUnavailable(operations.into()));
+    }
     let registry = Arc::new(registry);
     let registration = RegisterWorker {
-        node_id: NodeId::new(),
+        node_id: node_id.unwrap_or_default(),
         worker_epoch: WorkerEpoch::new(),
         advertise_addr: advertise.into(),
-        resources: ResourceSet::cpu_gpu(1.0, 0.0)?,
+        resources: ResourceSet::cpu_gpu(cpu, 0.0)?,
         slots: 1,
         operations: registry.descriptors(),
     };
@@ -139,7 +206,7 @@ async fn run_worker(coordinator: &str, advertise: &str) -> Result<(), Error> {
                 )
                 .await?;
             }
-            RpcReply::Worker(WorkerReply::Error(message)) => return Err(Error::Protocol(message)),
+            RpcReply::Worker(WorkerReply::Error(error)) => return Err(error),
             _ => return Err(Error::Protocol("unexpected poll reply".into())),
         }
     }
@@ -190,7 +257,7 @@ async fn execute_assignment(
                 match rpc(coordinator, RpcRequest::Worker(WorkerRequest::Poll(identity.clone()))).await? {
                     RpcReply::Worker(WorkerReply::Cancel(fence)) if fence == assignment.fence => break None,
                     RpcReply::Worker(WorkerReply::Assignment(None)) => {}
-                    RpcReply::Worker(WorkerReply::Error(message)) => return Err(Error::Protocol(message)),
+                    RpcReply::Worker(WorkerReply::Error(error)) => return Err(error),
                     _ => return Err(Error::Protocol("worker received assignment while busy".into())),
                 }
             }
@@ -291,17 +358,17 @@ async fn serve_objects(advertise: &str, objects: LocalObjectStore) -> Result<(),
                                         location: String::new(),
                                         bytes: Some(object.bytes),
                                     }),
-                                    Err(error) => {
-                                        RpcReply::Client(ClientReply::Error(error.to_string()))
-                                    }
+                                    Err(error) => RpcReply::Client(ClientReply::Error(error)),
                                 }
                             }
-                            _ => RpcReply::Client(ClientReply::Error(
+                            _ => RpcReply::Client(ClientReply::Error(Error::Protocol(
                                 "invalid object request".into(),
-                            )),
+                            ))),
                         }
                     }
-                    _ => RpcReply::Client(ClientReply::Error("invalid object request".into())),
+                    _ => RpcReply::Client(ClientReply::Error(Error::Protocol(
+                        "invalid object request".into(),
+                    ))),
                 };
                 let _ =
                     tokio::time::timeout(Duration::from_secs(5), write_frame(&mut stream, &reply))
@@ -318,11 +385,107 @@ async fn rpc(address: &str, body: RpcRequest) -> Result<RpcReply, Error> {
 async fn accept(coordinator: &str, request_body: WorkerRequest) -> Result<(), Error> {
     match rpc(coordinator, RpcRequest::Worker(request_body)).await? {
         RpcReply::Worker(WorkerReply::Accepted) => Ok(()),
-        RpcReply::Worker(WorkerReply::Error(message)) => Err(Error::Protocol(message)),
+        RpcReply::Worker(WorkerReply::Error(error)) => Err(error),
         _ => Err(Error::Protocol(
             "coordinator did not accept worker report".into(),
         )),
     }
+}
+
+async fn run_submit_detach(args: &[String]) -> Result<(), Error> {
+    let coordinator = args.get(2).unwrap_or_else(|| usage());
+    let operation_name = args.get(3).unwrap_or_else(|| usage());
+    let value: u64 = args
+        .get(4)
+        .unwrap_or_else(|| usage())
+        .parse()
+        .map_err(|error| Error::Protocol(format!("invalid value: {error}")))?;
+    let descriptor = match operation_name.as_str() {
+        "copy" => copy_descriptor(),
+        "sleep" => sleep_descriptor(),
+        _ => return Err(Error::OperationUnavailable(operation_name.clone())),
+    };
+    let operation = crayon::Operation::<u64, u64>::new(descriptor)?;
+    let arg = if let Some(id) = args.get(5).filter(|value| value.as_str() != "-") {
+        TaskArg::Object(ObjectId::from_str(id).map_err(Error::Protocol)?)
+    } else {
+        TaskArg::Inline {
+            codec: Codec::BincodeV1,
+            bytes: bincode::serialize(&value)?,
+        }
+    };
+    let cpu = args
+        .get(6)
+        .map(|value| value.parse())
+        .transpose()
+        .map_err(|error| Error::Protocol(format!("invalid cpu: {error}")))?
+        .unwrap_or(1.0);
+    let max_attempts = args
+        .get(7)
+        .map(|value| value.parse())
+        .transpose()
+        .map_err(|error| Error::Protocol(format!("invalid max attempts: {error}")))?
+        .unwrap_or(1);
+    let task = ClusterClient::connect(coordinator)
+        .submit(
+            &operation,
+            vec![arg],
+            ResourceSet::cpu_gpu(cpu, 0.0)?,
+            max_attempts,
+        )
+        .await?;
+    println!("{} {}", task.task_id, task.output.id);
+    Ok(())
+}
+
+async fn run_status(args: &[String]) -> Result<(), Error> {
+    let coordinator = args.get(2).unwrap_or_else(|| usage());
+    let id = TaskId::from_str(args.get(3).unwrap_or_else(|| usage()))
+        .map_err(|error| Error::Protocol(error.to_string()))?;
+    let view = ClusterClient::connect(coordinator).status(id).await?;
+    println!(
+        "{} {} {} {}",
+        view.task_id, view.output_id, view.state, view.attempt.0
+    );
+    Ok(())
+}
+
+async fn run_workers(args: &[String]) -> Result<(), Error> {
+    let coordinator = args.get(2).unwrap_or_else(|| usage());
+    for worker in ClusterClient::connect(coordinator).workers().await? {
+        println!(
+            "{} {} {} {} {}",
+            worker.identity.node_id,
+            worker.advertise_addr,
+            worker.alive,
+            worker.free_slots,
+            worker
+                .operations
+                .iter()
+                .map(|descriptor| descriptor.key.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    Ok(())
+}
+
+async fn run_cancel(args: &[String]) -> Result<(), Error> {
+    let coordinator = args.get(2).unwrap_or_else(|| usage());
+    let id = TaskId::from_str(args.get(3).unwrap_or_else(|| usage()))
+        .map_err(|error| Error::Protocol(error.to_string()))?;
+    ClusterClient::connect(coordinator).cancel(id).await?;
+    println!("cancelled");
+    Ok(())
+}
+
+async fn run_get(args: &[String]) -> Result<(), Error> {
+    let coordinator = args.get(2).unwrap_or_else(|| usage());
+    let id = ObjectId::from_str(args.get(3).unwrap_or_else(|| usage())).map_err(Error::Protocol)?;
+    let (_, bytes) = ClusterClient::connect(coordinator).get_bytes(id).await?;
+    let value: u64 = bincode::deserialize(&bytes)?;
+    println!("{value}");
+    Ok(())
 }
 
 async fn run_client(coordinator: &str, a: i64, b: i64) -> Result<(), Error> {

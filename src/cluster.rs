@@ -15,8 +15,9 @@ use crate::{
     error::Error,
     ids::{ClusterId, CoordinatorEpoch},
     protocol::{
-        ClientReply, ClientRequest, Envelope, RegisteredWorker, RpcReply, RpcRequest, WorkerReply,
-        WorkerRequest, DEFAULT_RPC_TIMEOUT_MS, MAX_FRAME_BYTES, MAX_OBJECT_BYTES,
+        ClientReply, ClientRequest, Envelope, RegisteredWorker, RpcReply, RpcRequest, TaskView,
+        WorkerReply, WorkerRequest, WorkerView, DEFAULT_RPC_TIMEOUT_MS, MAX_FRAME_BYTES,
+        MAX_OBJECT_BYTES,
     },
 };
 
@@ -87,7 +88,7 @@ impl CoordinatorServer {
                             revision,
                             lease_timeout_ms: self.lease_ms,
                         }),
-                        Err(error) => WorkerReply::Error(error.to_string()),
+                        Err(error) => WorkerReply::Error(error),
                     }
                 }
                 WorkerRequest::Heartbeat(identity) => {
@@ -97,7 +98,7 @@ impl CoordinatorServer {
                         .heartbeat(&identity, now_ms(), self.lease_ms)
                     {
                         Ok(()) => WorkerReply::Accepted,
-                        Err(error) => WorkerReply::Error(error.to_string()),
+                        Err(error) => WorkerReply::Error(error),
                     }
                 }
                 WorkerRequest::Poll(identity) => {
@@ -106,27 +107,27 @@ impl CoordinatorServer {
                         Ok(Some(fence)) => WorkerReply::Cancel(fence),
                         Ok(None) => match state.assign_next(identity.node_id) {
                             Ok(value) => WorkerReply::Assignment(value),
-                            Err(error) => WorkerReply::Error(error.to_string()),
+                            Err(error) => WorkerReply::Error(error),
                         },
-                        Err(error) => WorkerReply::Error(error.to_string()),
+                        Err(error) => WorkerReply::Error(error),
                     }
                 }
                 WorkerRequest::Cancelled { identity, fence } => {
                     match self.state.lock().acknowledge_cancel(&identity, fence) {
                         Ok(()) => WorkerReply::Accepted,
-                        Err(error) => WorkerReply::Error(error.to_string()),
+                        Err(error) => WorkerReply::Error(error),
                     }
                 }
                 WorkerRequest::Started { identity, fence } => {
                     match self.state.lock().started(&identity, fence) {
                         Ok(()) => WorkerReply::Accepted,
-                        Err(error) => WorkerReply::Error(error.to_string()),
+                        Err(error) => WorkerReply::Error(error),
                     }
                 }
                 WorkerRequest::Completed { identity, report } => {
                     match self.state.lock().complete(&identity, report) {
                         Ok(()) => WorkerReply::Accepted,
-                        Err(error) => WorkerReply::Error(error.to_string()),
+                        Err(error) => WorkerReply::Error(error),
                     }
                 }
                 WorkerRequest::Failed {
@@ -136,13 +137,13 @@ impl CoordinatorServer {
                     retryable,
                 } => match self.state.lock().fail(&identity, fence, message, retryable) {
                     Ok(()) => WorkerReply::Accepted,
-                    Err(error) => WorkerReply::Error(error.to_string()),
+                    Err(error) => WorkerReply::Error(error),
                 },
             }),
             RpcRequest::Client(request) => RpcReply::Client(match request {
                 ClientRequest::Put { codec, bytes } => {
                     if bytes.len() > MAX_OBJECT_BYTES {
-                        ClientReply::Error("object too large".into())
+                        ClientReply::Error(Error::Protocol("object too large".into()))
                     } else {
                         match self.state.lock().put(codec.clone(), bytes.clone()) {
                             Ok(id) => {
@@ -156,7 +157,7 @@ impl CoordinatorServer {
                                     bytes: Some(bytes),
                                 }
                             }
-                            Err(error) => ClientReply::Error(error.to_string()),
+                            Err(error) => ClientReply::Error(error),
                         }
                     }
                 }
@@ -171,11 +172,17 @@ impl CoordinatorServer {
                     .submit(operation, args, resources, max_attempts)
                 {
                     Ok((task_id, output_id)) => ClientReply::Submitted { task_id, output_id },
-                    Err(error) => ClientReply::Error(error.to_string()),
+                    Err(error) => ClientReply::Error(error),
                 },
                 ClientRequest::Status(id) => match self.state.lock().tasks.get(&id) {
-                    Some(task) => ClientReply::Status(format!("{:?}", task.state)),
-                    None => ClientReply::Error("task not found".into()),
+                    Some(task) => ClientReply::Status(TaskView {
+                        task_id: task.id,
+                        output_id: task.output,
+                        state: format!("{:?}", task.state),
+                        attempt: task.attempt,
+                        worker: task.assigned.map(|assigned| assigned.0),
+                    }),
+                    None => ClientReply::Error(Error::TaskNotFound(id)),
                 },
                 ClientRequest::Get(id) => match self.state.lock().objects.get(&id) {
                     Some(object) if object.state == crate::coordinator::ObjectState::Available => {
@@ -189,16 +196,35 @@ impl CoordinatorServer {
                         }
                     }
                     Some(object) if object.state == crate::coordinator::ObjectState::Lost => {
-                        ClientReply::Error(Error::ObjectLost(id).to_string())
+                        ClientReply::Error(Error::ObjectLost(id))
                     }
-                    _ => ClientReply::Error("object unavailable".into()),
+                    _ => ClientReply::Error(Error::Protocol("object unavailable".into())),
                 },
-                ClientRequest::GetLocal(_) => {
-                    ClientReply::Error("coordinator has no worker-local object endpoint".into())
+                ClientRequest::GetLocal(_) => ClientReply::Error(Error::Protocol(
+                    "coordinator has no worker-local object endpoint".into(),
+                )),
+                ClientRequest::Workers => {
+                    let state = self.state.lock();
+                    ClientReply::Workers(
+                        state
+                            .workers
+                            .values()
+                            .map(|worker| WorkerView {
+                                identity: worker.identity.clone(),
+                                advertise_addr: worker.advertise_addr.clone(),
+                                alive: worker.state == crate::coordinator::WorkerState::Alive,
+                                slots: worker.slots,
+                                free_slots: worker.free_slots,
+                                resources: worker.total.clone(),
+                                available: worker.available.clone(),
+                                operations: worker.operations.values().cloned().collect(),
+                            })
+                            .collect(),
+                    )
                 }
                 ClientRequest::Cancel(id) => match self.state.lock().cancel(id) {
                     Ok(()) => ClientReply::Cancelled,
-                    Err(error) => ClientReply::Error(error.to_string()),
+                    Err(error) => ClientReply::Error(error),
                 },
             }),
         }
@@ -208,7 +234,7 @@ impl CoordinatorServer {
 pub async fn request(address: &str, envelope: &Envelope) -> Result<RpcReply, Error> {
     let deadline = envelope.deadline_unix_ms.saturating_sub(now_ms());
     if deadline == 0 {
-        return Err(Error::DeadlineExceeded("rpc request"));
+        return Err(Error::DeadlineExceeded("rpc request".into()));
     }
     tokio::time::timeout(Duration::from_millis(deadline), async {
         let mut stream = TcpStream::connect(address).await?;
@@ -218,7 +244,7 @@ pub async fn request(address: &str, envelope: &Envelope) -> Result<RpcReply, Err
             .ok_or_else(|| Error::Protocol("connection closed before reply".into()))
     })
     .await
-    .map_err(|_| Error::DeadlineExceeded("rpc request"))?
+    .map_err(|_| Error::DeadlineExceeded("rpc request".into()))?
 }
 
 pub fn envelope(cluster_id: ClusterId, body: RpcRequest) -> Envelope {
@@ -261,7 +287,7 @@ async fn timeout_io<T>(
 ) -> Result<T, Error> {
     tokio::time::timeout(Duration::from_millis(DEFAULT_RPC_TIMEOUT_MS), future)
         .await
-        .map_err(|_| Error::DeadlineExceeded("rpc io"))?
+        .map_err(|_| Error::DeadlineExceeded("rpc io".into()))?
 }
 pub fn now_ms() -> u64 {
     SystemTime::now()

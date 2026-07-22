@@ -49,7 +49,7 @@ impl Envelope {
             return Err(Error::Protocol("cluster id mismatch".into()));
         }
         if self.deadline_unix_ms <= now_ms {
-            return Err(Error::DeadlineExceeded("rpc request"));
+            return Err(Error::DeadlineExceeded("rpc request".into()));
         }
         Ok(())
     }
@@ -127,7 +127,27 @@ pub enum ClientRequest {
     Status(TaskId),
     Get(ObjectId),
     GetLocal(ObjectId),
+    Workers,
     Cancel(TaskId),
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskView {
+    pub task_id: TaskId,
+    pub output_id: ObjectId,
+    pub state: String,
+    pub attempt: Attempt,
+    pub worker: Option<NodeId>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerView {
+    pub identity: WorkerIdentity,
+    pub advertise_addr: String,
+    pub alive: bool,
+    pub slots: u32,
+    pub free_slots: u32,
+    pub resources: ResourceSet,
+    pub available: ResourceSet,
+    pub operations: Vec<OperationDescriptor>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientReply {
@@ -143,9 +163,10 @@ pub enum ClientReply {
         task_id: TaskId,
         output_id: ObjectId,
     },
-    Status(String),
+    Status(TaskView),
+    Workers(Vec<WorkerView>),
     Cancelled,
-    Error(String),
+    Error(Error),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerRequest {
@@ -187,7 +208,7 @@ pub enum WorkerReply {
     Assignment(Option<TaskAssignment>),
     Cancel(TaskFence),
     Accepted,
-    Error(String),
+    Error(Error),
 }
 
 #[cfg(test)]
