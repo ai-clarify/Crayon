@@ -1,0 +1,21 @@
+examples/llm_gsm8k.rs
+  s_3ed83973de6379::t_e5985b0492ee9e 1,3-5,7,9-10,20-24,27,29-30,32-34,40-42,46,48,50,52-59,72,74-76,81-84,87-90,93-98,100-107,121-122,124,128-131,139-141,144-145,147-149,151,157-158,161,169-174,176-192,194-195,197-198,200-204,206-209,211-217,219-223,225,227-232,234-303,305,307,309-319,322-338,341
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "09cb791c7437fcc48206f12841db50cba7e9f9be",
+  "prompts": {},
+  "sessions": {
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
