@@ -13,10 +13,16 @@ fn free_port() -> u16 {
         .port()
 }
 
+struct WorkerProcess {
+    node_id: String,
+    child: Child,
+}
+
 struct Cluster {
     binary: &'static str,
     coordinator: String,
-    children: Vec<Child>,
+    coordinator_child: Child,
+    workers: Vec<WorkerProcess>,
 }
 
 impl Cluster {
@@ -32,7 +38,8 @@ impl Cluster {
         let cluster = Self {
             binary,
             coordinator,
-            children: vec![child],
+            coordinator_child: child,
+            workers: Vec::new(),
         };
         cluster.eventually(Duration::from_secs(3), || {
             cluster
@@ -45,12 +52,13 @@ impl Cluster {
 
     fn worker(&mut self, operation: &str, cpu: f64) -> String {
         let address = format!("127.0.0.1:{}", free_port());
+        let node_id = uuid::Uuid::new_v4().simple().to_string();
         let child = Command::new(self.binary)
             .args([
                 "worker",
                 &self.coordinator,
                 &address,
-                &uuid::Uuid::new_v4().simple().to_string(),
+                &node_id,
                 &cpu.to_string(),
                 operation,
             ])
@@ -58,7 +66,7 @@ impl Cluster {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        self.children.push(child);
+        self.workers.push(WorkerProcess { node_id, child });
         self.eventually(Duration::from_secs(3), || {
             stdout(self.run(["workers", &self.coordinator])).contains(&address)
         });
@@ -103,13 +111,32 @@ impl Cluster {
         stdout(self.run(["status", &self.coordinator, task]))
     }
 
-    fn eventually(&self, timeout: Duration, mut predicate: impl FnMut() -> bool) {
+    fn kill_worker(&mut self, node_id: &str) {
+        let worker = self
+            .workers
+            .iter_mut()
+            .find(|worker| worker.node_id == node_id)
+            .unwrap();
+        worker.child.kill().unwrap();
+        worker.child.wait().unwrap();
+    }
+
+    fn eventually(&self, timeout: Duration, predicate: impl FnMut() -> bool) {
+        self.eventually_every(timeout, Duration::from_millis(25), predicate)
+    }
+
+    fn eventually_every(
+        &self,
+        timeout: Duration,
+        interval: Duration,
+        mut predicate: impl FnMut() -> bool,
+    ) {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if predicate() {
                 return;
             }
-            thread::sleep(Duration::from_millis(25));
+            thread::sleep(interval);
         }
         panic!("condition not met within {timeout:?}");
     }
@@ -117,9 +144,11 @@ impl Cluster {
 
 impl Drop for Cluster {
     fn drop(&mut self) {
-        for child in &mut self.children {
-            let _ = child.kill();
-            let _ = child.wait();
+        let _ = self.coordinator_child.kill();
+        let _ = self.coordinator_child.wait();
+        for worker in &mut self.workers {
+            let _ = worker.child.kill();
+            let _ = worker.child.wait();
         }
     }
 }
@@ -209,22 +238,39 @@ fn worker_loss_retries_and_loses_owned_objects() {
     cluster.worker("sleep", 1.0);
     cluster.worker("sleep", 1.0);
     let (task, output) = cluster.submit("sleep", 800, None, 1.0, 2);
+    let mut owner = None;
     cluster.eventually(Duration::from_secs(3), || {
-        cluster.status(&task).contains("Running")
+        let status = cluster.status(&task);
+        let fields: Vec<_> = status.split_whitespace().collect();
+        if fields.get(2) == Some(&"Running") {
+            owner = fields.get(4).map(|value| (*value).to_owned());
+            true
+        } else {
+            false
+        }
     });
-    cluster.children[1].kill().unwrap();
-    cluster.children[1].wait().unwrap();
+    let first_owner = owner.unwrap();
+    cluster.kill_worker(&first_owner);
+    let mut second_owner = None;
     cluster.eventually(Duration::from_secs(5), || {
         let status = cluster.status(&task);
-        status.contains("Succeeded") && status.ends_with('2')
+        let fields: Vec<_> = status.split_whitespace().collect();
+        if fields.get(2) == Some(&"Running") && fields.get(3) == Some(&"2") {
+            second_owner = fields.get(4).map(|value| (*value).to_owned());
+            true
+        } else {
+            false
+        }
+    });
+    cluster.eventually(Duration::from_secs(3), || {
+        cluster.status(&task).contains("Succeeded")
     });
     assert_eq!(
         stdout(cluster.run(["get", &cluster.coordinator, &output])),
         "800"
     );
-    cluster.children[2].kill().unwrap();
-    cluster.children[2].wait().unwrap();
-    cluster.eventually(Duration::from_secs(3), || {
+    cluster.kill_worker(&second_owner.unwrap());
+    cluster.eventually_every(Duration::from_secs(3), Duration::from_millis(150), || {
         let lost = cluster.run(["get", &cluster.coordinator, &output]);
         !lost.status.success() && String::from_utf8_lossy(&lost.stderr).contains("ObjectLost")
     });

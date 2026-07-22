@@ -6,8 +6,7 @@ use crate::{
     },
     operation::{Codec, OperationDescriptor, OperationKey, TaskArg},
     protocol::{
-        RegisterWorker, TaskAssignment, TaskCompletion, TaskFence, TaskStatus as TaskState,
-        WorkerIdentity,
+        RegisterWorker, TaskAssignment, TaskCompletion, TaskFence, TaskStatus, WorkerIdentity,
     },
     resources::ResourceSet,
 };
@@ -17,6 +16,31 @@ use std::collections::HashMap;
 pub enum WorkerState {
     Alive,
     Dead,
+}
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TaskState {
+    Waiting,
+    Runnable,
+    Assigned,
+    Running,
+    CancelRequested,
+    Succeeded,
+    Failed(String),
+    Cancelled,
+}
+impl From<&TaskState> for TaskStatus {
+    fn from(state: &TaskState) -> Self {
+        match state {
+            TaskState::Waiting => Self::Waiting,
+            TaskState::Runnable => Self::Runnable,
+            TaskState::Assigned => Self::Assigned,
+            TaskState::Running => Self::Running,
+            TaskState::CancelRequested => Self::CancelRequested,
+            TaskState::Succeeded => Self::Succeeded,
+            TaskState::Failed(message) => Self::Failed(message.clone()),
+            TaskState::Cancelled => Self::Cancelled,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ObjectState {

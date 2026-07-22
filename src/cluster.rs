@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,8 +13,8 @@ use tokio::{
 
 use crate::{
     coordinator::CoordinatorState,
-    error::{DeadlineContext, Error},
-    ids::{ClusterId, CoordinatorEpoch},
+    error::Error,
+    ids::{ClusterId, CoordinatorEpoch, RequestId},
     protocol::{
         ClientReply, ClientRequest, Envelope, RegisteredWorker, RpcReply, RpcRequest, TaskView,
         WorkerReply, WorkerRequest, WorkerView, DEFAULT_RPC_TIMEOUT_MS, MAX_FRAME_BYTES,
@@ -176,8 +177,9 @@ impl CoordinatorServer {
                 },
                 ClientRequest::Status(id) => match self.state.lock().tasks.get(&id) {
                     Some(task) => ClientReply::Status(TaskView {
+                        task_id: task.id,
                         output_id: task.output,
-                        state: task.state.clone(),
+                        state: (&task.state).into(),
                         attempt: task.attempt,
                         worker: task.assigned.map(|assigned| assigned.0),
                     }),
@@ -233,7 +235,7 @@ impl CoordinatorServer {
 pub async fn request(address: &str, envelope: &Envelope) -> Result<RpcReply, Error> {
     let deadline = envelope.deadline_unix_ms.saturating_sub(now_ms());
     if deadline == 0 {
-        return Err(Error::DeadlineExceeded(DeadlineContext::RpcRequest));
+        return Err(Error::DeadlineExceeded);
     }
     tokio::time::timeout(Duration::from_millis(deadline), async {
         let mut stream = TcpStream::connect(address).await?;
@@ -243,7 +245,7 @@ pub async fn request(address: &str, envelope: &Envelope) -> Result<RpcReply, Err
             .ok_or_else(|| Error::Protocol("connection closed before reply".into()))
     })
     .await
-    .map_err(|_| Error::DeadlineExceeded(DeadlineContext::RpcRequest))?
+    .map_err(|_| Error::DeadlineExceeded)?
 }
 
 pub fn envelope(cluster_id: ClusterId, body: RpcRequest) -> Envelope {
@@ -286,7 +288,7 @@ async fn timeout_io<T>(
 ) -> Result<T, Error> {
     tokio::time::timeout(Duration::from_millis(DEFAULT_RPC_TIMEOUT_MS), future)
         .await
-        .map_err(|_| Error::DeadlineExceeded(DeadlineContext::RpcIo))?
+        .map_err(|_| Error::DeadlineExceeded)?
 }
 pub fn now_ms() -> u64 {
     SystemTime::now()

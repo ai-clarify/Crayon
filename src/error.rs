@@ -2,13 +2,6 @@ use crate::ids::{ObjectId, TaskId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-pub enum DeadlineContext {
-    RpcRequest,
-    RpcIo,
-    TaskResult,
-}
-
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Error {
     Protocol(String),
@@ -23,7 +16,7 @@ pub enum Error {
     ObjectLost(ObjectId),
     ObjectConflict(ObjectId),
     DependencyFailed(ObjectId),
-    DeadlineExceeded(DeadlineContext),
+    DeadlineExceeded,
     Serialization(String),
     Io(String),
 }

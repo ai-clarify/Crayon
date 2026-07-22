@@ -426,8 +426,14 @@ async fn run_status(args: &[String]) -> Result<(), Error> {
         .map_err(|error| Error::Protocol(error.to_string()))?;
     let view = ClusterClient::connect(coordinator).status(id).await?;
     println!(
-        "{} {} {} {}",
-        id, view.output_id, view.state, view.attempt.0
+        "{} {} {} {} {}",
+        view.task_id,
+        view.output_id,
+        view.state,
+        view.attempt.0,
+        view.worker
+            .map(|worker| worker.to_string())
+            .unwrap_or_else(|| "-".into())
     );
     Ok(())
 }

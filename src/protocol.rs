@@ -1,5 +1,5 @@
 use crate::{
-    error::{DeadlineContext, Error},
+    error::Error,
     ids::{
         Attempt, ClusterId, CoordinatorEpoch, LeaseId, NodeId, ObjectId, RequestId, Revision,
         TaskId, WorkerEpoch, WorkerSessionId,
@@ -20,7 +20,7 @@ impl fmt::Display for TaskStatus {
 }
 
 pub const MAGIC: [u8; 4] = *b"CRYN";
-pub const PROTOCOL_MAJOR: u16 = 1;
+pub const PROTOCOL_MAJOR: u16 = 2;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OBJECT_BYTES: usize = MAX_FRAME_BYTES - 64 * 1024;
@@ -58,7 +58,7 @@ impl Envelope {
             return Err(Error::Protocol("cluster id mismatch".into()));
         }
         if self.deadline_unix_ms <= now_ms {
-            return Err(Error::DeadlineExceeded(DeadlineContext::RpcRequest));
+            return Err(Error::DeadlineExceeded);
         }
         Ok(())
     }
@@ -152,6 +152,7 @@ pub enum TaskStatus {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskView {
+    pub task_id: TaskId,
     pub output_id: ObjectId,
     pub state: TaskStatus,
     pub attempt: Attempt,
@@ -246,7 +247,7 @@ mod tests {
         assert!(envelope.validate(ClusterId::new(), 9).is_err());
         assert!(matches!(
             envelope.validate(cluster, 10),
-            Err(Error::DeadlineExceeded(_))
+            Err(Error::DeadlineExceeded)
         ));
     }
 }
