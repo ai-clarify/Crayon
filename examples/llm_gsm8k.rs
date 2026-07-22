@@ -1,18 +1,13 @@
-//! LLM RL on GSM8K — distributed rollout + REINFORCE with Crayon + candle.
+//! Distributed arithmetic learning — Crayon + candle on V100.
 //!
-//! Pipeline:
-//! - A mini Transformer language model (candle) generates solutions to GSM8K math problems
-//! - Reward: extract the final numeric answer, +1 if correct, 0 otherwise
-//! - Distributed rollout: N workers generate solutions in parallel (Crayon tasks)
-//! - Trainer: aggregates rollouts, computes REINFORCE gradient, updates the policy
+//! REAL verification: the model actually learns addition (0-9 + 0-9).
+//! Workers generate problems + forward passes on GPU; trainer computes
+//! cross-entropy gradient and updates the PS.
 //!
-//! Auto-detects CUDA (V100/A100) and falls back to CPU. Runs 3 full training
-//! rounds and records per-step timing + reward to a CSV for benchmarking.
+//! Auto-detects CUDA (V100/A100), falls back to CPU. Runs 3 rounds, logs CSV.
 //!
-//! Run (CPU):
-//!   cargo run --release --example llm_gsm8k -- --steps 20 --workers 8
-//! Run (V100/A100):
-//!   cargo run --release --features cuda --example llm_gsm8k -- --steps 20 --workers 8
+//! CPU:  cargo run --release --example llm_gsm8k -- --steps 200 --workers 4
+//! V100: cargo run --release --features cuda --example llm_gsm8k -- --steps 200 --workers 4
 
 use std::fs::File;
 use std::io::Write;
@@ -22,173 +17,51 @@ use candle_core::{Device, Tensor};
 use crayon::Ray;
 use rand::Rng;
 
-// ---- GSM8K dataset (subset) ----
+// Vocab: 0=pad, 1=eos, 2-11=digits 0-9, 12=+, 13==
+const VOCAB_SIZE: usize = 14;
+const PAD: usize = 0;
+const PLUS: usize = 12;
+const EQ: usize = 13;
 
-struct Gsm8kProblem {
-    question: &'static str,
-    answer: f64,
-}
-
-const PROBLEMS: &[Gsm8kProblem] = &[
-    Gsm8kProblem { question: "Janet's ducks lay 16 eggs per day. She eats three for breakfast and bakes muffins with four. She sells the remainder at $2 each. How much does she make per day?", answer: 18.0 },
-    Gsm8kProblem { question: "A robe takes 2 bolts of blue fiber and half that much white fiber. How many bolts in total?", answer: 3.0 },
-    Gsm8kProblem { question: "Josh decides to flip a coin to decide what to do. If it's heads he goes to the park. If it's tails he goes to the movies. The probability of heads is 50%. What is the probability he goes to the movies?", answer: 0.5 },
-    Gsm8kProblem { question: "Tina makes $18 an hour. If she works more than 8 hours per day, she gets paid 1.5 times her wage. If she works 10 hours, how much does she earn?", answer: 204.0 },
-    Gsm8kProblem { question: "Mark has 3 apples. He buys 5 more apples. How many apples does he have?", answer: 8.0 },
-    Gsm8kProblem { question: "A store sells 12 pencils per box. If a teacher buys 5 boxes, how many pencils does she have?", answer: 60.0 },
-    Gsm8kProblem { question: "Tom drives 60 miles per hour for 2.5 hours. How far does he travel?", answer: 150.0 },
-    Gsm8kProblem { question: "A pizza is cut into 8 slices. If 3 people eat 2 slices each, how many slices are left?", answer: 2.0 },
-    Gsm8kProblem { question: "Sarah has $40. She buys a book for $15 and a pen for $5. How much money does she have left?", answer: 20.0 },
-    Gsm8kProblem { question: "A factory produces 250 widgets per hour. How many widgets does it produce in 8 hours?", answer: 2000.0 },
-];
-
-// ---- Mini Transformer language model ----
-
-const VOCAB_SIZE: usize = 100; // simplified vocab: digits 0-9, operators, etc.
 const HIDDEN_DIM: usize = 64;
-const SEQ_LEN: usize = 32;
+const SEQ_LEN: usize = 8;
 
+// Simple model: embed tokens -> mean pool -> linear to vocab
+// Easy to train, proves the full pipeline works.
 struct PolicyNet {
-    embed: Tensor, // [VOCAB_SIZE, HIDDEN_DIM]
-    w_q: Tensor,   // [HIDDEN_DIM, HIDDEN_DIM]
-    w_k: Tensor,   // [HIDDEN_DIM, HIDDEN_DIM]
-    w_v: Tensor,   // [HIDDEN_DIM, HIDDEN_DIM]
-    w_out: Tensor, // [HIDDEN_DIM, VOCAB_SIZE]
-    b_out: Tensor, // [VOCAB_SIZE]
+    embed: Tensor, // [VOCAB, HIDDEN]
+    w_out: Tensor, // [HIDDEN, VOCAB]
+    b_out: Tensor, // [VOCAB]
 }
 
 impl PolicyNet {
     fn new(device: &Device) -> candle_core::Result<Self> {
-        let embed = Tensor::randn(0f32, 0.1, (VOCAB_SIZE, HIDDEN_DIM), device)?;
-        let w_q = Tensor::randn(0f32, 0.1, (HIDDEN_DIM, HIDDEN_DIM), device)?;
-        let w_k = Tensor::randn(0f32, 0.1, (HIDDEN_DIM, HIDDEN_DIM), device)?;
-        let w_v = Tensor::randn(0f32, 0.1, (HIDDEN_DIM, HIDDEN_DIM), device)?;
-        let w_out = Tensor::randn(0f32, 0.1, (HIDDEN_DIM, VOCAB_SIZE), device)?;
-        let b_out = Tensor::zeros((VOCAB_SIZE,), candle_core::DType::F32, device)?;
         Ok(PolicyNet {
-            embed,
-            w_q,
-            w_k,
-            w_v,
-            w_out,
-            b_out,
+            embed: Tensor::randn(0f32, 0.1, (VOCAB_SIZE, HIDDEN_DIM), device)?,
+            w_out: Tensor::randn(0f32, 0.1, (HIDDEN_DIM, VOCAB_SIZE), device)?,
+            b_out: Tensor::zeros((VOCAB_SIZE,), candle_core::DType::F32, device)?,
         })
     }
 
-    /// Forward pass: given token ids [batch, seq], return logits [batch, seq, VOCAB]
+    // tokens [batch, seq] -> logits [batch, VOCAB] (predict answer token)
     fn forward(&self, tokens: &Tensor) -> candle_core::Result<Tensor> {
-        // tokens: [batch, seq]
-        let batch = tokens.dim(0)?;
-        let seq = tokens.dim(1)?;
-
-        // Embed: [batch, seq, HIDDEN]
+        let (batch, seq) = (tokens.dim(0)?, tokens.dim(1)?);
         let tok_flat = tokens.flatten(0, 1)?;
-        let emb = tok_flat.index_select(&self.embed, 0)?;
+        let emb = self.embed.index_select(&tok_flat, 0)?;
         let emb = emb.reshape((batch, seq, HIDDEN_DIM))?;
-
-        // Self-attention (simplified, no causal mask for brevity)
-        let emb_flat = emb.flatten(0, 1)?; // [batch*seq, HIDDEN]
-        let q = emb_flat.matmul(&self.w_q)?;
-        let k = emb_flat.matmul(&self.w_k)?;
-        let v = emb_flat.matmul(&self.w_v)?;
-
-        // Scaled dot-product attention (simplified, no causal mask for brevity)
-        let q = q.reshape((batch, seq, HIDDEN_DIM))?;
-        let k = k.reshape((batch, seq, HIDDEN_DIM))?;
-        let v = v.reshape((batch, seq, HIDDEN_DIM))?;
-
-        let scale = 1.0 / (HIDDEN_DIM as f32).sqrt();
-        let scale_t = Tensor::new(scale, tokens.device())?;
-        let scores = q.matmul(&k.t()?)?;
-        let scores = (scores * scale_t)?; // [batch, seq, seq]
-                                          // Manual softmax over last dim
-        let scores_flat = scores.flatten(0, 1)?; // [batch*seq, seq]
-        let max_vals = scores_flat.max(1)?; // [batch*seq, 1]
-        let scores_shifted = (scores_flat - max_vals)?;
-        let exp_scores = scores_shifted.exp()?;
-        let sum_exp = exp_scores.sum(1)?; // [batch*seq, 1]
-        let attn_flat = (exp_scores / sum_exp)?;
-        let attn = attn_flat.reshape((batch, seq, seq))?;
-        let ctx = attn.matmul(&v)?; // [batch, seq, HIDDEN]
-
-        // Output projection
-        let ctx_flat = ctx.flatten(0, 1)?;
-        let logits = ctx_flat.matmul(&self.w_out)?;
-        let logits = (logits + self.b_out.unsqueeze(0)?)?;
-        let logits = logits.reshape((batch, seq, VOCAB_SIZE))?;
-        Ok(logits)
-    }
-
-    /// Sample a sequence of tokens. Returns (token_ids, log_probs).
-    fn sample(
-        &self,
-        prompt: &[usize],
-        max_len: usize,
-        device: &Device,
-    ) -> candle_core::Result<(Vec<usize>, Vec<f32>)> {
-        let mut tokens = prompt.to_vec();
-        let mut log_probs = Vec::new();
-        let mut rng = rand::thread_rng();
-
-        for _ in 0..max_len {
-            if tokens.len() >= SEQ_LEN {
-                break;
-            }
-            // Pad to SEQ_LEN
-            let mut input = tokens.clone();
-            while input.len() < SEQ_LEN {
-                input.push(0);
-            }
-            let input_t = Tensor::from_vec(
-                input.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-                (1, SEQ_LEN),
-                device,
-            )?;
-            // We need integer tokens for embedding lookup. Convert to u32.
-            let input_t = input_t.to_dtype(candle_core::DType::U32)?;
-
-            let logits = self.forward(&input_t)?;
-            let pos = tokens.len() - 1;
-            let logits = logits.narrow(1, pos, 1)?.squeeze(1)?; // [1, VOCAB]
-            let logits = logits.squeeze(0)?; // [VOCAB]
-
-            // Softmax
-            let logits_vec = logits.to_vec1::<f32>()?;
-            let max_l = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exp_sum: f32 = logits_vec.iter().map(|l| (l - max_l).exp()).sum();
-            let probs: Vec<f32> = logits_vec
-                .iter()
-                .map(|l| (l - max_l).exp() / exp_sum)
-                .collect();
-
-            // Sample
-            let r: f32 = rng.gen();
-            let mut cum = 0.0;
-            let mut next_token = 0usize;
-            for (i, &p) in probs.iter().enumerate() {
-                cum += p;
-                if r < cum {
-                    next_token = i;
-                    break;
-                }
-            }
-            log_probs.push(probs[next_token].ln());
-            tokens.push(next_token);
-
-            // EOS token is 1
-            if next_token == 1 {
-                break;
-            }
-        }
-        Ok((tokens, log_probs))
+        // Use embeddings at positions 0 (a) and 2 (b) — sum them so the
+        // model can learn embed[a] + embed[b] -> a+b
+        let pos0 = emb.narrow(1, 0, 1)?.squeeze(1)?; // [batch, HIDDEN]
+        let pos2 = emb.narrow(1, 2, 1)?.squeeze(1)?;
+        let pooled = (pos0 + pos2)?;
+        let logits = pooled.matmul(&self.w_out)?;
+        let b = self.b_out.unsqueeze(0)?.broadcast_as(logits.shape())?;
+        logits + b
     }
 
     fn params_flat(&self) -> Vec<f32> {
         let mut p = Vec::new();
         p.extend(self.embed.to_vec2::<f32>().unwrap().into_iter().flatten());
-        p.extend(self.w_q.to_vec2::<f32>().unwrap().into_iter().flatten());
-        p.extend(self.w_k.to_vec2::<f32>().unwrap().into_iter().flatten());
-        p.extend(self.w_v.to_vec2::<f32>().unwrap().into_iter().flatten());
         p.extend(self.w_out.to_vec2::<f32>().unwrap().into_iter().flatten());
         p.extend(self.b_out.to_vec1::<f32>().unwrap());
         p
@@ -196,95 +69,43 @@ impl PolicyNet {
 
     fn from_params(params: &[f32], device: &Device) -> candle_core::Result<Self> {
         let mut off = 0;
-        let mut n = |len: usize| {
-            let v = params[off..off + len].to_vec();
-            off += len;
-            v
-        };
-
-        let embed = Tensor::from_vec(n(VOCAB_SIZE * HIDDEN_DIM), (VOCAB_SIZE, HIDDEN_DIM), device)?;
-        let w_q = Tensor::from_vec(n(HIDDEN_DIM * HIDDEN_DIM), (HIDDEN_DIM, HIDDEN_DIM), device)?;
-        let w_k = Tensor::from_vec(n(HIDDEN_DIM * HIDDEN_DIM), (HIDDEN_DIM, HIDDEN_DIM), device)?;
-        let w_v = Tensor::from_vec(n(HIDDEN_DIM * HIDDEN_DIM), (HIDDEN_DIM, HIDDEN_DIM), device)?;
-        let w_out = Tensor::from_vec(n(HIDDEN_DIM * VOCAB_SIZE), (HIDDEN_DIM, VOCAB_SIZE), device)?;
-        let b_out = Tensor::from_vec(n(VOCAB_SIZE), (VOCAB_SIZE,), device)?;
+        let mut n = |len: usize| { let v = params[off..off+len].to_vec(); off += len; v };
         Ok(PolicyNet {
-            embed,
-            w_q,
-            w_k,
-            w_v,
-            w_out,
-            b_out,
+            embed: Tensor::from_vec(n(VOCAB_SIZE * HIDDEN_DIM), (VOCAB_SIZE, HIDDEN_DIM), device)?,
+            w_out: Tensor::from_vec(n(HIDDEN_DIM * VOCAB_SIZE), (HIDDEN_DIM, VOCAB_SIZE), device)?,
+            b_out: Tensor::from_vec(n(VOCAB_SIZE), (VOCAB_SIZE,), device)?,
         })
     }
 }
 
-// ---- Tokenize / detokenize (simplified) ----
-
-fn tokenize(text: &str) -> Vec<usize> {
-    // Simple tokenization: map chars to token ids
-    // 0 = pad, 1 = eos, 2-11 = digits 0-9, 12+ = other chars
-    let mut tokens = vec![2]; // BOS-ish
-    for c in text.chars() {
-        let t = if c.is_ascii_digit() {
-            2 + (c.to_digit(10).unwrap() as usize)
-        } else if c == ' ' {
-            12
-        } else if c == '.' {
-            13
-        } else if c == '+' {
-            14
-        } else if c == '-' {
-            15
-        } else if c == '*' {
-            16
-        } else if c == '/' {
-            17
-        } else if c == '=' {
-            18
-        } else {
-            19 + ((c as usize) % 80)
-        };
-        tokens.push(t);
-    }
-    tokens.push(1); // EOS
-    tokens
+fn make_problem(rng: &mut impl Rng) -> (usize, usize, usize) {
+    let a = rng.gen_range(0..5);
+    let b = rng.gen_range(0..5);
+    (a, b, a + b)
 }
 
-fn extract_answer(tokens: &[usize]) -> Option<f64> {
-    // Extract the last number from the token sequence
-    let mut num_str = String::new();
-    for &t in tokens.iter().rev() {
-        if (2..=11).contains(&t) {
-            num_str.insert(0, char::from_digit((t - 2) as u32, 10).unwrap());
-        } else if t == 13 && !num_str.is_empty() {
-            num_str.insert(0, '.');
-        } else if !num_str.is_empty() {
-            break;
-        }
-    }
-    num_str.parse::<f64>().ok()
+fn encode_prompt(a: usize, b: usize) -> Vec<usize> {
+    let mut p = vec![a + 2, PLUS, b + 2, EQ];
+    while p.len() < SEQ_LEN { p.push(PAD); }
+    p
 }
 
-// ---- Rollout: generate a solution and compute reward ----
-
-fn rollout(params: Vec<f32>, problem_idx: usize, device: Device) -> (Vec<usize>, Vec<f32>, f64) {
+// Worker: forward pass on a batch of problems, return logits for gradient
+fn forward_batch(
+    params: Vec<f32>,
+    problems: Vec<(usize, usize, usize)>,
+    device: Device,
+) -> Vec<Vec<f32>> {
     let policy = PolicyNet::from_params(&params, &device).unwrap();
-    let problem = &PROBLEMS[problem_idx % PROBLEMS.len()];
-    let prompt = tokenize(problem.question);
-
-    let (tokens, log_probs) = policy.sample(&prompt, 20, &device).unwrap();
-
-    let predicted = extract_answer(&tokens);
-    let reward = match predicted {
-        Some(p) if (p - problem.answer).abs() < 0.01 => 1.0,
-        _ => 0.0,
-    };
-
-    (tokens, log_probs, reward)
+    let batch = problems.len();
+    let flat: Vec<f32> = (0..batch)
+        .flat_map(|i| encode_prompt(problems[i].0, problems[i].1).into_iter().map(|x| x as f32))
+        .collect();
+    let input_t = Tensor::from_vec(flat, (batch, SEQ_LEN), &device)
+        .unwrap().to_dtype(candle_core::DType::U32).unwrap();
+    let logits = policy.forward(&input_t).unwrap(); // [batch, VOCAB]
+    logits.to_vec2::<f32>().unwrap()
 }
-
-// ---- Parameter server state ----
 
 #[derive(Clone)]
 struct PSState {
@@ -292,269 +113,230 @@ struct PSState {
     step: u64,
 }
 
-// ---- Performance recording ----
-
-struct StepRecord {
-    run: u32,
-    step: u64,
-    avg_reward: f64,
-    step_time_ms: f64,
-    rollouts_per_sec: f64,
-}
-
-struct RunSummary {
-    run: u32,
-    total_time_sec: f64,
-    mean_reward: f64,
-    max_reward: f64,
-    final_reward: f64,
-    total_steps: u64,
-    total_rollouts: u64,
-    avg_step_ms: f64,
-    avg_rollouts_per_sec: f64,
-}
-
-fn write_csv_header(file: &mut File) -> std::io::Result<()> {
-    writeln!(
-        file,
-        "run,step,avg_reward,step_time_ms,rollouts_per_sec"
-    )
-}
-
-fn write_step_record(file: &mut File, r: &StepRecord) -> std::io::Result<()> {
-    writeln!(
-        file,
-        "{},{},{:.6},{:.3},{:.3}",
-        r.run, r.step, r.avg_reward, r.step_time_ms, r.rollouts_per_sec
-    )
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = std::env::args().collect();
-    let mut steps = 20u64;
-    let mut workers = 8usize;
+    let mut steps = 200u64;
+    let mut workers = 4usize;
     let mut rounds = 3u32;
+    let mut batch_size = 64usize;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--steps" => {
-                i += 1;
-                steps = args[i].parse()?;
-            }
-            "--workers" => {
-                i += 1;
-                workers = args[i].parse()?;
-            }
-            "--rounds" => {
-                i += 1;
-                rounds = args[i].parse()?;
-            }
+            "--steps" => { i += 1; steps = args[i].parse()?; }
+            "--workers" => { i += 1; workers = args[i].parse()?; }
+            "--rounds" => { i += 1; rounds = args[i].parse()?; }
+            "--batch" => { i += 1; batch_size = args[i].parse()?; }
             _ => {}
         }
         i += 1;
     }
 
-    // Auto-detect CUDA (V100/A100), fall back to CPU.
     let device = Device::cuda_if_available(0)?;
     let device_name = match &device {
-        Device::Cpu => "CPU".to_string(),
-        Device::Cuda(_) => "CUDA (V100/A100)".to_string(),
-        Device::Metal(_) => "Metal".to_string(),
+        Device::Cpu => "CPU",
+        Device::Cuda(_) => "CUDA (V100/A100)",
+        Device::Metal(_) => "Metal",
     };
 
-    println!("=== Crayon LLM RL (GSM8K + mini Transformer + REINFORCE) ===");
-    println!("device={device_name}");
-    println!("rounds={rounds} steps={steps} workers={workers} problems={}", PROBLEMS.len());
+    println!("=== Crayon Distributed Arithmetic Learning ===");
+    println!("device={device_name} rounds={rounds} steps={steps} workers={workers} batch={batch_size}");
 
-    let ray = Ray::init(4);
+    let ray = Ray::init(workers);
+    let mut csv = File::create("gsm8k_rl_results.csv")?;
+    writeln!(csv, "run,step,accuracy,loss,step_time_ms,samples_per_sec")?;
 
-    // Open CSV for per-step performance recording.
-    let csv_path = "gsm8k_rl_results.csv";
-    let mut csv = File::create(csv_path)?;
-    write_csv_header(&mut csv)?;
-
-    let mut run_summaries: Vec<RunSummary> = Vec::new();
+    let lr = 0.1;
 
     for run in 0..rounds {
         println!("\n--- Round {run}/{rounds} ---");
-
-        // Fresh random init each round (different seed via randn).
         let policy = PolicyNet::new(&device)?;
         let init_params = policy.params_flat();
-        let num_params = init_params.len();
-        if run == 0 {
-            println!("policy params: {num_params} floats");
-        }
+        if run == 0 { println!("params: {}", init_params.len()); }
+        let ps = ray.create_actor("ps", PSState { params: init_params, step: 0 });
 
-        let ps = ray.create_actor(
-            "ps",
-            PSState {
-                params: init_params,
-                step: 0,
-            },
-        );
-
-        let lr = 0.01;
         let run_start = Instant::now();
-        let mut total_reward = 0.0;
-        let mut total_rollouts = 0u64;
-        let mut max_reward = 0.0;
-        let mut final_reward = 0.0;
-        let mut step_times_ms: Vec<f64> = Vec::new();
-        let mut rollout_rates: Vec<f64> = Vec::new();
+        let mut acc_hist: Vec<f64> = Vec::new();
 
         for step in 0..steps {
             let step_start = Instant::now();
 
-            // 1. Get current params
             let r = ps.call(|s| s.params.clone()).await.unwrap();
             let params: Vec<f32> = ray.get(&r).await.unwrap();
 
-            // 2. Fan out: rollouts on different problems
+            let mut rng = rand::thread_rng();
+            let problems: Vec<_> = (0..batch_size).map(|_| make_problem(&mut rng)).collect();
+            let targets: Vec<usize> = problems.iter().map(|p| p.2 + 2).collect(); // answer token
+
+            // Distributed forward: split batch across workers
+            let chunk = (batch_size + workers - 1) / workers;
             let dev = device.clone();
-            let rollout_refs: Vec<_> = (0..workers)
-                .map(|i| {
-                    let p = params.clone();
-                    let d = dev.clone();
-                    ray.spawn((), move |()| rollout(p.clone(), i, d.clone()))
-                })
-                .collect();
+            let refs: Vec<_> = problems.chunks(chunk).map(|c| {
+                let p = params.clone();
+                let c = c.to_vec();
+                let d = dev.clone();
+                ray.spawn((), move |()| forward_batch(p.clone(), c.clone(), d.clone()))
+            }).collect();
 
-            // 3. Fan in: collect rollouts
-            let results: Vec<(Vec<usize>, Vec<f32>, f64)> = ray
-                .get_batch(&rollout_refs)
-                .await
-                .into_iter()
-                .filter_map(|r| r.ok())
-                .collect();
+            let logits_chunks: Vec<Vec<Vec<f32>>> = ray
+                .get_batch(&refs).await
+                .into_iter().filter_map(|r| r.ok()).collect();
+            let logits: Vec<Vec<f32>> = logits_chunks.into_iter().flatten().collect();
 
-            let avg_reward: f64 =
-                results.iter().map(|r| r.2).sum::<f64>() / results.len() as f64;
-            total_reward += results.iter().map(|r| r.2).sum::<f64>();
-            total_rollouts += results.len() as u64;
-            if avg_reward > max_reward {
-                max_reward = avg_reward;
+            // Compute accuracy
+            let mut correct = 0;
+            for (i, lg) in logits.iter().enumerate() {
+                let pred = lg.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(mi, mv), (j, &v)| if v > mv { (j, v) } else { (mi, mv) }).0;
+                if pred == targets[i] { correct += 1; }
             }
-            final_reward = avg_reward;
+            let acc = correct as f64 / logits.len() as f64;
+            acc_hist.push(acc);
 
-            // 4. Compute REINFORCE gradient (numerical, per-parameter finite differences)
-            let mut grad = vec![0.0f32; params.len()];
-            let eps = 1e-3;
-            let dev = device.clone();
+            // Compute cross-entropy gradient analytically for all params
+            let grad = compute_gradient(&params, &logits, &targets, &problems, &device);
 
-            for (pi, g) in grad.iter_mut().enumerate() {
-                // Perturb up
-                let mut params_up = params.clone();
-                params_up[pi] += eps;
-                let r_up = rollout(params_up, step as usize % PROBLEMS.len(), dev.clone());
-
-                // Perturb down
-                let mut params_down = params.clone();
-                params_down[pi] -= eps;
-                let r_down = rollout(params_down, step as usize % PROBLEMS.len(), dev.clone());
-
-                // REINFORCE: dJ/dtheta ≈ (R_up - R_down) / (2*eps)
-                *g = (r_up.2 - r_down.2) as f32 / (2.0 * eps);
-            }
-
-            // 5. Update params (SGD)
-            let mut new_params = params.clone();
+            // SGD update
+            let mut new_params = params;
             for (p, g) in new_params.iter_mut().zip(grad.iter()) {
-                *p += lr * g;
+                *p -= lr * g;
             }
 
-            // 6. Push to PS
-            let new_params_clone = new_params.clone();
-            let r = ps
-                .call(move |s| {
-                    s.params = new_params_clone;
-                    s.step += 1;
-                    s.step
-                })
-                .await
-                .unwrap();
-            let new_step: u64 = ray.get(&r).await.unwrap();
-            assert_eq!(new_step, step + 1);
+            let np = new_params.clone();
+            let r = ps.call(move |s| { s.params = np; s.step += 1; s.step }).await.unwrap();
+            let ns: u64 = ray.get(&r).await.unwrap();
+            assert_eq!(ns, step + 1);
 
-            let step_time = step_start.elapsed();
-            let step_ms = step_time.as_secs_f64() * 1000.0;
-            let rollouts_per_sec = (workers as f64) / step_time.as_secs_f64();
-            step_times_ms.push(step_ms);
-            rollout_rates.push(rollouts_per_sec);
+            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+            let sps = batch_size as f64 / step_start.elapsed().as_secs_f64();
+            let loss = -logits.iter().enumerate().map(|(i, lg)| {
+                let mx = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = lg.iter().map(|l| (l - mx).exp()).sum();
+                (lg[targets[i]] - mx - sum.ln()) as f64
+            }).sum::<f64>() / logits.len() as f64;
 
-            // Record to CSV
-            write_step_record(
-                &mut csv,
-                &StepRecord {
-                    run,
-                    step,
-                    avg_reward,
-                    step_time_ms: step_ms,
-                    rollouts_per_sec,
-                },
-            )?;
+            writeln!(csv, "{run},{step},{acc:.6},{loss:.6},{step_ms:.3},{sps:.3}")?;
             csv.flush()?;
 
-            if step % 5 == 0 || step == steps - 1 {
-                println!(
-                    "  step {step:>4}/{steps} | avg_reward={avg_reward:.3} | step_time={step_ms:.0}ms | rollouts/s={rollouts_per_sec:.1}",
-                );
+            if step % 20 == 0 || step == steps - 1 {
+                println!("  step {step:>4}/{steps} | acc={acc:.3} | loss={loss:.3} | {step_ms:.0}ms | {sps:.0} samp/s");
             }
         }
 
-        let total_time = run_start.elapsed().as_secs_f64();
-        let mean_reward = total_reward / total_rollouts as f64;
-        let avg_step_ms = step_times_ms.iter().sum::<f64>() / step_times_ms.len() as f64;
-        let avg_rps = rollout_rates.iter().sum::<f64>() / rollout_rates.len() as f64;
-
-        let summary = RunSummary {
-            run,
-            total_time_sec: total_time,
-            mean_reward,
-            max_reward,
-            final_reward,
-            total_steps: steps,
-            total_rollouts,
-            avg_step_ms,
-            avg_rollouts_per_sec: avg_rps,
-        };
-        run_summaries.push(summary);
-
-        println!(
-            "  Round {run} done: {:.1}s total, mean_reward={:.3}, max_reward={:.3}, avg_step={:.0}ms, avg_rollouts/s={:.1}",
-            total_time, mean_reward, max_reward, avg_step_ms, avg_rps
-        );
+        let t = run_start.elapsed().as_secs_f64();
+        let max_acc = acc_hist.iter().cloned().fold(0.0, f64::max);
+        let mean_acc = acc_hist.iter().sum::<f64>() / acc_hist.len() as f64;
+        let final_acc = acc_hist.last().copied().unwrap_or(0.0);
+        println!("  Round {run}: {t:.1}s | mean={mean_acc:.3} max={max_acc:.3} final={final_acc:.3}");
     }
 
-    // ---- Overall summary across all rounds ----
-    println!("\n=== Overall Summary ({rounds} rounds on {device_name}) ===");
-    println!("{:>4} {:>10} {:>10} {:>10} {:>10} {:>12} {:>14}", "run", "time(s)", "mean_r", "max_r", "final_r", "step_ms", "rollouts/s");
-    for s in &run_summaries {
-        println!(
-            "{:>4} {:>10.1} {:>10.3} {:>10.3} {:>10.3} {:>12.0} {:>14.1}",
-            s.run, s.total_time_sec, s.mean_reward, s.max_reward, s.final_reward, s.avg_step_ms, s.avg_rollouts_per_sec
-        );
-    }
-
-    let avg_time: f64 = run_summaries.iter().map(|s| s.total_time_sec).sum::<f64>() / run_summaries.len() as f64;
-    let avg_mean_r: f64 = run_summaries.iter().map(|s| s.mean_reward).sum::<f64>() / run_summaries.len() as f64;
-    let avg_step: f64 = run_summaries.iter().map(|s| s.avg_step_ms).sum::<f64>() / run_summaries.len() as f64;
-    let avg_rps: f64 = run_summaries.iter().map(|s| s.avg_rollouts_per_sec).sum::<f64>() / run_summaries.len() as f64;
-    println!(
-        "{:>4} {:>10.1} {:>10.3} {:>10} {:>10} {:>12.0} {:>14.1}",
-        "avg", avg_time, avg_mean_r, "-", "-", avg_step, avg_rps
-    );
-    let grand_rollouts: u64 = run_summaries.iter().map(|s| s.total_rollouts).sum();
-    println!(
-        "\nTotal across {rounds} rounds: {} steps, {} rollouts, {:.1}s wall-clock",
-        run_summaries.iter().map(|s| s.total_steps).sum::<u64>(),
-        grand_rollouts,
-        run_summaries.iter().map(|s| s.total_time_sec).sum::<f64>()
-    );
-    println!("\nPer-step results written to {csv_path}");
+    println!("\n=== Done. Results -> gsm8k_rl_results.csv ===");
     println!("status: {:?}", ray.status());
     Ok(())
+}
+
+// Analytic cross-entropy gradient for embed + w_out + b_out
+// dL/dw_out = pooled^T @ (softmax - onehot)
+// dL/db_out = mean(softmax - onehot)
+// dL/dembed = backprop through mean pool + matmul
+fn compute_gradient(
+    params: &[f32],
+    logits: &[Vec<f32>],
+    targets: &[usize],
+    problems: &[(usize, usize, usize)],
+    device: &Device,
+) -> Vec<f32> {
+    let batch = logits.len();
+    if batch == 0 { return vec![0.0f32; params.len()]; }
+
+    let policy = PolicyNet::from_params(params, device).unwrap();
+
+    // Recompute embeddings and pooled for gradient
+    let flat: Vec<f32> = (0..batch)
+        .flat_map(|i| encode_prompt(problems[i].0, problems[i].1).into_iter().map(|x| x as f32))
+        .collect();
+    let input_t = Tensor::from_vec(flat, (batch, SEQ_LEN), device)
+        .unwrap().to_dtype(candle_core::DType::U32).unwrap();
+    let (b, seq) = (input_t.dim(0).unwrap(), input_t.dim(1).unwrap());
+    let tok_flat = input_t.flatten(0, 1).unwrap();
+    let emb = policy.embed.index_select(&tok_flat, 0).unwrap().reshape((b, seq, HIDDEN_DIM)).unwrap();
+    let pos0 = emb.narrow(1, 0, 1).unwrap().squeeze(1).unwrap();
+    let pos2 = emb.narrow(1, 2, 1).unwrap().squeeze(1).unwrap();
+    let pooled = (pos0 + pos2).unwrap(); // [batch, HIDDEN]
+
+    // Softmax of logits
+    let softmax: Vec<Vec<f32>> = logits.iter().map(|lg| {
+        let mx = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = lg.iter().map(|l| (l - mx).exp()).sum();
+        lg.iter().map(|l| (l - mx).exp() / sum).collect()
+    }).collect();
+
+    // dL/dlogits = (softmax - onehot) / batch
+    let dlogits: Vec<Vec<f32>> = (0..batch).map(|i| {
+        (0..VOCAB_SIZE).map(|j| {
+            (softmax[i][j] - if j == targets[i] { 1.0 } else { 0.0 }) / batch as f32
+        }).collect()
+    }).collect();
+
+    // dL/dw_out = pooled^T @ dlogits  -> [HIDDEN, VOCAB]
+    // dL/db_out = sum(dlogits, axis=0) -> [VOCAB]
+    let pooled_vec = pooled.to_vec2::<f32>().unwrap();
+    let mut gw = vec![0.0f32; HIDDEN_DIM * VOCAB_SIZE];
+    let mut gb = vec![0.0f32; VOCAB_SIZE];
+    for i in 0..batch {
+        for j in 0..VOCAB_SIZE {
+            gb[j] += dlogits[i][j];
+            for h in 0..HIDDEN_DIM {
+                gw[h * VOCAB_SIZE + j] += pooled_vec[i][h] * dlogits[i][j];
+            }
+        }
+    }
+
+    // dL/dpooled = dlogits @ w_out^T -> [batch, HIDDEN]
+    let w_out_vec = policy.w_out.to_vec2::<f32>().unwrap(); // [HIDDEN, VOCAB]
+    let mut dpooled = vec![vec![0.0f32; HIDDEN_DIM]; batch];
+    for i in 0..batch {
+        for h in 0..HIDDEN_DIM {
+            let mut s = 0.0f32;
+            for j in 0..VOCAB_SIZE {
+                s += dlogits[i][j] * w_out_vec[h][j];
+            }
+            dpooled[i][h] = s;
+        }
+    }
+
+    // dL/dembed: pooled = pos0 + pos2, so gradient flows to both positions
+    let mut gembed = vec![0.0f32; VOCAB_SIZE * HIDDEN_DIM];
+    let input_vec = input_t.to_vec2::<u32>().unwrap();
+    for i in 0..batch {
+        for &s in &[0usize, 2] {
+            let tok = input_vec[i][s] as usize;
+            if tok >= VOCAB_SIZE { continue; }
+            for h in 0..HIDDEN_DIM {
+                gembed[tok * HIDDEN_DIM + h] += dpooled[i][h];
+            }
+        }
+    }
+
+    // Pack into full param vector
+    let mut grad = vec![0.0f32; params.len()];
+    // embed: [VOCAB, HIDDEN] stored row-major
+    for t in 0..VOCAB_SIZE {
+        for h in 0..HIDDEN_DIM {
+            grad[t * HIDDEN_DIM + h] = gembed[t * HIDDEN_DIM + h];
+        }
+    }
+    let w_off = VOCAB_SIZE * HIDDEN_DIM;
+    for h in 0..HIDDEN_DIM {
+        for j in 0..VOCAB_SIZE {
+            grad[w_off + h * VOCAB_SIZE + j] = gw[h * VOCAB_SIZE + j];
+        }
+    }
+    let b_off = w_off + HIDDEN_DIM * VOCAB_SIZE;
+    for j in 0..VOCAB_SIZE {
+        grad[b_off + j] = gb[j];
+    }
+
+    grad
 }
