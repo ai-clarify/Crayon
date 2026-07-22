@@ -102,24 +102,15 @@ class Transformer(nn.Module):
 
 # ---------------------------------------------------------------------------
 # Rollout task — runs INSIDE workers (forward only, no training)
+#
+# Two variants:
+#   rollout_task(model, prompts)        — Crayon: model passed by reference (in-process)
+#   rollout_task_serialized(bytes, pr)  — Ray: model must be pickled (separate processes)
 # ---------------------------------------------------------------------------
-def rollout_task(state_dict_bytes, prompts_np):
-    """Generate completions + log_probs for a batch of prompts.
-
-    Args:
-        state_dict_bytes: pickled model state_dict (auto-resolved from ObjectRef)
-        prompts_np: [batch, PROMPT_LEN] int32 numpy array
-    Returns:
-        (completions [batch, GEN_LEN] int64, log_probs [batch, GEN_LEN] float32)
-    """
-    state_dict = pickle.loads(state_dict_bytes)
-    model = Transformer()
-    model.load_state_dict(state_dict)
+def _rollout_forward(model, prompts_np):
+    """Shared forward+sampling logic. Model is already on the correct device."""
     model.eval()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
+    device = next(model.parameters()).device
     prompts = torch.from_numpy(np.array(prompts_np, copy=True)).long().to(device)
     cur = prompts.clone()
     log_probs_list = []
@@ -146,6 +137,21 @@ def rollout_task(state_dict_bytes, prompts_np):
     completions = cur[:, PROMPT_LEN:].cpu().numpy().astype(np.int64)
     log_probs = torch.stack(log_probs_list, dim=1).cpu().numpy().astype(np.float32)
     return completions, log_probs
+
+
+def rollout_task(model, prompts_np):
+    """Crayon path: model passed by reference — zero copy, already on GPU."""
+    return _rollout_forward(model, prompts_np)
+
+
+def rollout_task_serialized(state_dict_bytes, prompts_np):
+    """Ray path: workers are separate processes, model must be pickled."""
+    state_dict = pickle.loads(state_dict_bytes)
+    model = Transformer()
+    model.load_state_dict(state_dict)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    return _rollout_forward(model, prompts_np)
 
 
 # ---------------------------------------------------------------------------
@@ -217,13 +223,17 @@ def train_step(model, optimizer, all_prompts, all_completions, all_old_lps, grou
 # Backend wrappers — same rollout work, different distribution framework
 # ---------------------------------------------------------------------------
 class CrayonBackend:
+    """Crayon workers are in-process threads — pass the model by reference.
+
+    No serialization, no copy, model stays on GPU. This is Crayon's structural
+    advantage over Ray (which uses separate processes and must pickle).
+    """
     def __init__(self, workers):
         import crayon
         self.ray = crayon.Ray(workers)
 
-    def distribute(self, state_dict_bytes, prompt_chunks):
-        state_ref = self.ray.put(state_dict_bytes)
-        refs = [self.ray.spawn(rollout_task, state_ref, chunk) for chunk in prompt_chunks]
+    def distribute(self, model, prompt_chunks):
+        refs = [self.ray.spawn(rollout_task, model, chunk) for chunk in prompt_chunks]
         results = self.ray.get_batch(refs)
         out = []
         for r in results:
@@ -237,14 +247,16 @@ class CrayonBackend:
 
 
 class RayBackend:
+    """Ray workers are separate processes — model must be pickled each step."""
     def __init__(self, workers):
         import ray
         if not ray.is_initialized():
             ray.init(num_cpus=workers, ignore_reinit_error=True, include_dashboard=False)
-        self._rollout_remote = ray.remote(rollout_task)
+        self._rollout_remote = ray.remote(rollout_task_serialized)
 
-    def distribute(self, state_dict_bytes, prompt_chunks):
+    def distribute(self, model, prompt_chunks):
         import ray
+        state_dict_bytes = pickle.dumps(model.state_dict())
         state_ref = ray.put(state_dict_bytes)
         refs = [self._rollout_remote.remote(state_ref, chunk) for chunk in prompt_chunks]
         return ray.get(refs)
@@ -336,19 +348,18 @@ def main():
     for step in range(args.steps):
         step_start = time.time()
 
-        # 1. Serialize current model weights
-        state_dict_bytes = pickle.dumps(model.state_dict())
-
-        # 2. Generate prompts (each prompt repeated group_size times)
+        # 1. Generate prompts (each prompt repeated group_size times)
         base_prompts = rng.integers(0, VOCAB_SIZE, size=(num_prompts, PROMPT_LEN), dtype=np.int32)
         prompts = np.repeat(base_prompts, args.group_size, axis=0)
 
-        # 3. Split into chunks for workers
+        # 2. Split into chunks for workers
         chunk_size = (args.batch + args.workers - 1) // args.workers
         prompt_chunks = [prompts[i:i + chunk_size] for i in range(0, args.batch, chunk_size)]
 
-        # 4. Fan out rollouts via chosen backend
-        results = dist.distribute(state_dict_bytes, prompt_chunks)
+        # 3. Fan out rollouts via chosen backend
+        #    Crayon: model passed by reference (in-process, zero copy)
+        #    Ray: model pickled inside distribute() (separate processes)
+        results = dist.distribute(model, prompt_chunks)
 
         # 5. Unpack results
         all_prompts = []
