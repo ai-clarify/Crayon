@@ -23,12 +23,12 @@ use crate::object_store::ObjectStore;
 
 /// A type-erased actor method: takes the actor's state (as `&mut dyn Any`),
 /// returns the serialized result.
-pub(crate) type ActorMethod = Box<dyn FnOnce(&mut dyn Any) -> Vec<u8> + Send>;
+pub(crate) type ActorMethod = Box<dyn FnOnce(&mut dyn Any) -> Result<Vec<u8>, CrayonError> + Send>;
 
 /// A registered named method: takes state + serialized args, returns serialized
 /// result. Used for cross-node actor calls (closures can't be sent over the
 /// network, so remote callers address methods by name).
-type MethodFn = Arc<dyn Fn(&mut dyn Any, Vec<u8>) -> Vec<u8> + Send + Sync>;
+type MethodFn = Arc<dyn Fn(&mut dyn Any, Vec<u8>) -> Result<Vec<u8>, CrayonError> + Send + Sync>;
 
 pub(crate) struct Call {
     func: ActorMethod,
@@ -125,11 +125,7 @@ impl ActorHandleInner {
     /// with the given serialized args. Shared by the local `call_named` path
     /// (which sends via [`Self::send_and_store`]) and the remote `call_method`
     /// path (which awaits the reply directly).
-    pub(crate) fn build_method_call(
-        &self,
-        name: &str,
-        args: Vec<u8>,
-    ) -> Result<Call, CrayonError> {
+    pub(crate) fn build_method_call(&self, name: &str, args: Vec<u8>) -> Result<Call, CrayonError> {
         if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(CrayonError::ActorDead(self.id));
         }
@@ -163,7 +159,7 @@ impl ActorHandleInner {
         T: Send + 'static,
     {
         let output_id = ObjectID::new();
-        let r = self.store.reserve_ref(output_id);
+        let (r, lease) = self.store.reserve_output(output_id, None);
         self.gcs.record_actor_task(self.id, false);
 
         // Extract the reply receiver before sending — the Call owns the
@@ -171,23 +167,20 @@ impl ActorHandleInner {
         let rx = call.reply_rx();
         self.send_call(call).await?;
 
-        let store = self.store.clone();
         let gcs = self.gcs.clone();
         let id = self.id;
         tokio::spawn(async move {
             match rx.await {
                 Ok(Ok(bytes)) => {
-                    store.put_bytes(output_id, bytes, None);
+                    lease.publish(bytes, None);
                     gcs.record_actor_task(id, true);
                 }
                 Ok(Err(e)) => {
-                    store.put_error(output_id, e);
+                    lease.fail(e);
                     gcs.record_actor_task(id, true);
                 }
                 Err(_) => {
-                    // Actor died (mailbox closed). Surface the error to the
-                    // caller instead of leaving them hanging on `get()`.
-                    store.put_error(output_id, CrayonError::ActorDead(id));
+                    lease.fail(CrayonError::ActorDead(id));
                 }
             }
         });
@@ -247,11 +240,21 @@ impl<S: Send + 'static> ActorHandle<S> {
         T: serde::Serialize + Send + 'static,
         F: FnOnce(&mut S) -> T + Send + 'static,
     {
+        self.call_result(move |state| Ok(func(state))).await
+    }
+
+    pub async fn call_result<T, F>(
+        &self,
+        func: F,
+    ) -> Result<crate::common::ObjectRef<T>, CrayonError>
+    where
+        T: serde::Serialize + Send + 'static,
+        F: FnOnce(&mut S) -> Result<T, CrayonError> + Send + 'static,
+    {
         let erased: ActorMethod = Box::new(move |state: &mut dyn Any| {
-            let s = state
-                .downcast_mut::<S>()
-                .expect("actor state type mismatch");
-            bincode::serialize(&func(s)).expect("serialize actor result")
+            let state = state.downcast_mut::<S>().ok_or(CrayonError::TypeMismatch)?;
+            let value = func(state)?;
+            bincode::serialize(&value).map_err(|error| CrayonError::Serialize(error.to_string()))
         });
 
         let (reply, rx) = oneshot::channel();
@@ -288,7 +291,7 @@ impl<S: Send + 'static> ActorHandle<S> {
             let s = state
                 .downcast_mut::<S>()
                 .expect("actor state type mismatch");
-            func(s, args)
+            Ok(func(s, args))
         });
         self.inner.register_method(name, erased);
     }
@@ -309,10 +312,10 @@ impl<S: Send + 'static> ActorHandle<S> {
             let s = state
                 .downcast_mut::<S>()
                 .expect("actor state type mismatch");
-            let args: Args = bincode::deserialize(&args_bytes)
-                .expect("actor method args deserialize failed");
+            let args: Args =
+                bincode::deserialize(&args_bytes).expect("actor method args deserialize failed");
             let ret = func(s, args);
-            bincode::serialize(&ret).expect("actor method result serialize failed")
+            bincode::serialize(&ret).map_err(|e| CrayonError::Serialize(e.to_string()))
         });
         self.inner.register_method(name, erased);
     }
@@ -363,10 +366,12 @@ impl<S: Send + 'static> ActorHandle<S> {
             // The owner stores the result in its object store; we get the
             // ObjectID back and fetch it through the store's remote-fetch path.
             (Some(owner), Some(node)) => {
-                let id = node
+                let bytes = node
                     .remote_actor_call(self.inner.id, owner, method, args)
                     .await
                     .map_err(|e| CrayonError::TaskFailed(e.to_string()))?;
+                let id = ObjectID::new();
+                self.inner.store().put_bytes(id, bytes, None);
                 Ok(self.inner.store().reserve_ref(id))
             }
             // Local actor (or no node attached): build the Call and route it
@@ -422,28 +427,39 @@ pub fn spawn_actor<S: Send + Clone + 'static>(
                     return;
                 }
                 gcs_clone.set_actor_state(id, ActorState::Running);
-                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    (call.func)(state.as_mut())
-                })) {
-                    Ok(v) => Ok(v),
-                    Err(p) => {
-                        let _ = call.reply.send(Err(crate::common::panic_to_error(
-                            p,
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut state = state;
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (call.func)(state.as_mut())
+                    }));
+                    (state, outcome, call.reply)
+                })
+                .await;
+                match result {
+                    Ok((next_state, Ok(value), reply)) => {
+                        state = next_state;
+                        let _ = reply.send(value);
+                    }
+                    Ok((_next_state, Err(panic), reply)) => {
+                        let _ = reply.send(Err(crate::common::panic_to_error(
+                            panic,
                             "actor method panicked",
                         )));
                         if restarts < max_restarts {
-                            // Reset to initial state and keep going.
                             restarts += 1;
                             state = Box::new(initial_state.clone());
                             gcs_clone.set_actor_state(id, ActorState::Running);
                             continue 'restart;
-                        } else {
-                            gcs_clone.set_actor_state(id, ActorState::Dead);
-                            return;
                         }
+                        gcs_clone.set_actor_state(id, ActorState::Dead);
+                        return;
                     }
-                };
-                let _ = call.reply.send(result);
+                    Err(error) => {
+                        gcs_clone.set_actor_state(id, ActorState::Dead);
+                        tracing::error!("actor blocking task failed: {error}");
+                        return;
+                    }
+                }
             }
             // Mailbox closed — actor is done.
             gcs_clone.set_actor_state(id, ActorState::Dead);

@@ -36,6 +36,18 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> ResolveArg for ObjectRef<T
     }
 }
 
+/// Internal raw-byte task argument that bypasses bincode decoding.
+#[derive(Clone)]
+pub struct RawBytesArg(pub ObjectRef<Vec<u8>>);
+
+#[async_trait]
+impl ResolveArg for RawBytesArg {
+    type Output = Vec<u8>;
+    async fn resolve(self, store: &ObjectStore) -> Result<Vec<u8>, CrayonError> {
+        store.get_bytes(self.0.id).await.map(|bytes| bytes.to_vec())
+    }
+}
+
 /// A tuple of [`ResolveArg`]s that resolves to a tuple of outputs.
 #[async_trait]
 pub trait ResolveArgs: Send {

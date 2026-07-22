@@ -2,3 +2,8 @@ target
 Cargo.lock
 *.whl
 .venv
+__pycache__/
+*.py[cod]
+artifacts/
+benchmark_artifacts/
+benchmark_rl_*.csv

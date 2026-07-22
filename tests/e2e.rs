@@ -68,6 +68,7 @@ async fn distributed_metadata_sync() {
         size_bytes: size,
         created_at: std::time::Instant::now(),
         owner: None,
+        owner_node: None,
     });
 
     // Wait for periodic sync (every 2s) + registration
@@ -75,7 +76,10 @@ async fn distributed_metadata_sync() {
 
     // Worker's GCS should now know about the object from head
     let obj = gcs2.get_object(r.id);
-    assert!(obj.is_some(), "worker GCS should have synced object metadata from head");
+    assert!(
+        obj.is_some(),
+        "worker GCS should have synced object metadata from head"
+    );
     assert_eq!(obj.unwrap().size_bytes, 4); // i32 = 4 bytes in bincode
 }
 
@@ -107,7 +111,11 @@ async fn distributed_actor_discovery() {
     #[derive(Clone, Default)]
     #[allow(dead_code)]
     struct Counter(u64);
-    let ray = crayon::Ray::init_with_memory(1, 1024 * 1024, std::env::temp_dir().join("crayon_actor_test"));
+    let ray = crayon::Ray::init_with_memory(
+        1,
+        1024 * 1024,
+        std::env::temp_dir().join("crayon_actor_test"),
+    );
     let actor = ray.create_actor("counter", Counter(0));
     let actor_id = actor.id();
 

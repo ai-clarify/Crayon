@@ -1,14 +1,11 @@
-//! Multi-node networking — Crayon's analog of Ray's raylet + GCS client.
-//!
-//! Each [`Node`] runs a TCP server. A head node tracks peers; worker nodes
-//! register and receive the peer list. Objects are fetched from remote peers
-//! via a pooled connection (see [`ConnectionPool`]).
-//!
-//! Wire format: 4-byte BE length + bincode [`Message`].
+//! Multi-node networking for object transfer, membership, and actor calls.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,51 +14,56 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::common::ObjectID;
 use crate::object_store::ObjectStore;
 
-/// Maximum allowed message size (256 MiB).
-const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024 * 1024;
+const CHUNK_SIZE: usize = 1024 * 1024;
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONNS_PER_ADDR: usize = 16;
 
-/// Unique identifier for a node.
+type NodeError = Box<dyn std::error::Error + Send + Sync>;
+
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeID(pub [u8; 16]);
 
 impl NodeID {
     pub fn new() -> Self {
-        NodeID(*uuid::Uuid::new_v4().as_bytes())
+        Self(*uuid::Uuid::new_v4().as_bytes())
     }
 }
-
 impl Default for NodeID {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl std::fmt::Display for NodeID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in &self.0 {
-            write!(f, "{:02x}", b)?;
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
         }
         Ok(())
     }
 }
 
-/// Messages exchanged between nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Message {
-    RegisterNode { addr: String },
-    NodeList(Vec<(NodeID, String)>),
-    Ping { addr: String },
-    Pong,
+enum Message {
+    RegisterNode {
+        id: NodeID,
+        addr: String,
+    },
+    NodeList {
+        epoch: u64,
+        nodes: Vec<(NodeID, String)>,
+    },
+    Ping {
+        id: NodeID,
+        addr: String,
+    },
     GetObject(ObjectID),
     ObjectData(ObjectID, Vec<u8>),
     ObjectNotFound(ObjectID),
-    /// Periodic GCS sync: object locations, task states, and actor metadata
-    /// from the sender. Only carries serializable fields (no Instant timestamps).
     GcsSync {
-        objects: Vec<(ObjectID, usize)>, // (id, size_bytes)
+        source: NodeID,
+        objects: Vec<(ObjectID, usize)>,
         tasks: Vec<(crate::common::TaskID, crate::common::TaskState)>,
-        /// (id, name, state, owner_node) — lets peers discover named actors
-        /// across nodes and route calls to the right node.
         actors: Vec<(
             crate::common::ActorID,
             String,
@@ -69,123 +71,137 @@ pub enum Message {
             Option<NodeID>,
         )>,
     },
-    /// Invoke a registered method on a remote actor. The pooled connection
-    /// guarantees one request/response per checkout, so no correlation ID
-    /// is needed — the reply is always the next message.
     ActorCall {
         actor_id: crate::common::ActorID,
         method: String,
         args: Vec<u8>,
     },
-    /// Reply to an [`Message::ActorCall`]. On success, carries the
-    /// [`ObjectID`] of the method's result, stored in the owner node's object
-    /// store — the caller fetches it via the existing remote-fetch path.
-    ActorCallReply {
-        result: Result<ObjectID, String>,
-    },
+    ActorCallReply(Result<Vec<u8>, String>),
+    Ack,
 }
 
-type NodeError = Box<dyn std::error::Error + Send + Sync>;
-
-/// A pooled TCP connection that can send/receive [`Message`]s.
 struct Connection {
     stream: TcpStream,
 }
 
 impl Connection {
-    async fn connect(addr: &str) -> Result<Self, NodeError> {
-        Ok(Connection {
-            stream: TcpStream::connect(addr).await?,
-        })
+    async fn connect(addr: &str, deadline: tokio::time::Instant) -> Result<Self, NodeError> {
+        let stream = tokio::time::timeout_at(deadline, TcpStream::connect(addr))
+            .await
+            .map_err(|_| "connect timeout")??;
+        Ok(Self { stream })
     }
 
-    async fn send(&mut self, msg: &Message) -> Result<(), NodeError> {
-        let bytes = bincode::serialize(msg)?;
-        let len = (bytes.len() as u32).to_be_bytes();
-        self.stream.write_all(&len).await?;
-        self.stream.write_all(&bytes).await?;
+    async fn send(
+        &mut self,
+        message: &Message,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), NodeError> {
+        let bytes = bincode::serialize(message)?;
+        if bytes.len() > MAX_MESSAGE_SIZE {
+            return Err(format!("message too large: {} bytes", bytes.len()).into());
+        }
+        let write = async {
+            self.stream
+                .write_all(&(bytes.len() as u64).to_be_bytes())
+                .await?;
+            for chunk in bytes.chunks(CHUNK_SIZE) {
+                self.stream.write_all(chunk).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        tokio::time::timeout_at(deadline, write)
+            .await
+            .map_err(|_| "write timeout")??;
         Ok(())
     }
 
-    async fn recv(&mut self) -> Result<Option<Message>, NodeError> {
-        let mut len_buf = [0u8; 4];
-        if self.stream.read_exact(&mut len_buf).await.is_err() {
+    async fn recv(&mut self, deadline: tokio::time::Instant) -> Result<Option<Message>, NodeError> {
+        let read = async {
+            let mut len = [0u8; 8];
+            match self.stream.read_exact(&mut len).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let len = usize::try_from(u64::from_be_bytes(len)).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "length overflow")
+            })?;
+            if len > MAX_MESSAGE_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "message too large",
+                ));
+            }
+            let mut bytes = vec![0; len];
+            for chunk in bytes.chunks_mut(CHUNK_SIZE) {
+                self.stream.read_exact(chunk).await?;
+            }
+            Ok(Some(bytes))
+        };
+        let Some(bytes) = tokio::time::timeout_at(deadline, read)
+            .await
+            .map_err(|_| "read timeout")??
+        else {
             return Ok(None);
-        }
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > MAX_MESSAGE_SIZE {
-            return Err(format!("message too large: {len} bytes (max {MAX_MESSAGE_SIZE})").into());
-        }
-        let mut buf = vec![0u8; len];
-        self.stream.read_exact(&mut buf).await?;
-        Ok(Some(bincode::deserialize(&buf)?))
+        };
+        Ok(Some(bincode::deserialize(&bytes)?))
     }
 }
 
-/// A simple LIFO connection pool keyed by address. Reusing connections avoids
-/// the TCP handshake cost on every remote object fetch — critical for RL
-/// workloads that pull many small samples.
-///
-/// Bounded per address to prevent file-descriptor leaks under high concurrency:
-/// excess connections are dropped (closed) on return instead of cached forever.
 #[derive(Default)]
 struct ConnectionPool {
     inner: Mutex<HashMap<String, Vec<Connection>>>,
 }
 
-/// Max idle connections cached per peer address. Beyond this, returned
-/// connections are closed to bound resource usage.
-const MAX_CONNS_PER_ADDR: usize = 16;
-
 impl ConnectionPool {
     fn new() -> Arc<Self> {
-        Arc::new(ConnectionPool::default())
+        Arc::new(Self::default())
     }
 
-    /// Get a connection from the pool, or open a new one.
-    async fn get(self: &Arc<Self>, addr: &str) -> Result<Connection, NodeError> {
-        if let Some(c) = self.inner.lock().get_mut(addr).and_then(|v| v.pop()) {
-            return Ok(c);
+    async fn get(
+        &self,
+        addr: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<Connection, NodeError> {
+        if let Some(connection) = self.inner.lock().get_mut(addr).and_then(Vec::pop) {
+            return Ok(connection);
         }
-        Connection::connect(addr).await
+        Connection::connect(addr, deadline).await
     }
 
-    /// Return a connection to the pool for reuse. If the pool for this address
-    /// is full, the connection is dropped (closed) instead of cached.
-    fn put(&self, addr: &str, conn: Connection) {
+    fn put(&self, addr: &str, connection: Connection) {
         let mut inner = self.inner.lock();
-        let v = inner.entry(addr.to_string()).or_default();
-        if v.len() < MAX_CONNS_PER_ADDR {
-            v.push(conn);
+        let connections = inner.entry(addr.to_string()).or_default();
+        if connections.len() < MAX_CONNS_PER_ADDR {
+            connections.push(connection);
         }
-        // else: conn drops here, closing the socket
+    }
+
+    fn invalidate(&self, addr: &str) {
+        self.inner.lock().remove(addr);
     }
 }
 
-/// A remote node's address + last-seen timestamp (for heartbeat eviction).
 struct RemoteNode {
     addr: String,
     last_seen: std::time::Instant,
 }
 
-/// The local node's networking state.
 #[derive(Clone)]
 pub struct Node {
     pub id: NodeID,
     pub addr: String,
     store: ObjectStore,
     peers: Arc<Mutex<HashMap<NodeID, RemoteNode>>>,
+    membership_epoch: Arc<AtomicU64>,
+    is_head: bool,
     pool: Arc<ConnectionPool>,
-    /// Optional GCS for metadata sync. When attached, the node periodically
-    /// broadcasts object/task metadata to peers and merges incoming metadata.
     gcs: Arc<Mutex<Option<crate::gcs::Gcs>>>,
-    /// Locally-hosted actors, keyed by ID. Used to route incoming
-    /// [`Message::ActorCall`] messages to the right actor task.
     local_actors: Arc<Mutex<HashMap<crate::common::ActorID, Arc<crate::actor::ActorHandleInner>>>>,
 }
 
 impl Node {
-    /// Start a node. If `head_addr` is `None`, this is the head node.
     pub async fn start(
         addr: &str,
         head_addr: Option<&str>,
@@ -193,306 +209,334 @@ impl Node {
     ) -> Result<Arc<Self>, NodeError> {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?.to_string();
-
-        let node = Arc::new(Node {
+        let node = Arc::new(Self {
             id: NodeID::new(),
             addr: local_addr.clone(),
             store,
             peers: Arc::new(Mutex::new(HashMap::new())),
+            membership_epoch: Arc::new(AtomicU64::new(1)),
+            is_head: head_addr.is_none(),
             pool: ConnectionPool::new(),
             gcs: Arc::new(Mutex::new(None)),
             local_actors: Arc::new(Mutex::new(HashMap::new())),
         });
 
-        // Accept loop
-        let node_clone = node.clone();
+        let server = node.clone();
         tokio::spawn(async move {
-            loop {
-                if let Ok((stream, _)) = listener.accept().await {
-                    let n = node_clone.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, n).await {
-                            tracing::warn!("connection error: {e}");
-                        }
-                    });
-                }
+            while let Ok((stream, _)) = listener.accept().await {
+                let server = server.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_connection(stream, server).await {
+                        tracing::warn!("connection error: {error}");
+                    }
+                });
             }
         });
 
-        // Worker: register with head + send heartbeats
         if let Some(head) = head_addr {
-            let mut conn = Connection::connect(head).await?;
-            conn.send(&Message::RegisterNode {
-                addr: local_addr.clone(),
-            })
-            .await?;
-            if let Some(Message::NodeList(peers)) = conn.recv().await? {
-                let mut p = node.peers.lock();
-                for (pid, paddr) in peers {
-                    // Filter out ourselves by address (head assigns us a new
-                    // NodeID we don't know about, so we can't filter by ID).
-                    if paddr != node.addr {
-                        p.insert(
-                            pid,
-                            RemoteNode {
-                                addr: paddr,
-                                last_seen: std::time::Instant::now(),
-                            },
-                        );
-                    }
-                }
-            }
-            // Don't pool the registration connection — the head's
-            // handle_connection owns it and will close it on disconnect.
-            drop(conn);
-
+            node.refresh_membership(head, true).await?;
+            let node_for_heartbeat = node.clone();
             let head = head.to_string();
-            let my_addr = local_addr;
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                let mut ticker = tokio::time::interval(Duration::from_secs(5));
                 loop {
                     ticker.tick().await;
-                    // Use a fresh connection for heartbeats — don't pollute the
-                    // fetch pool with Ping/Pong traffic.
-                    if let Ok(mut conn) = Connection::connect(&head).await {
-                        let _ = conn
-                            .send(&Message::Ping {
-                                addr: my_addr.clone(),
-                            })
-                            .await;
+                    if let Err(error) = node_for_heartbeat.refresh_membership(&head, false).await {
+                        tracing::warn!("heartbeat failed: {error}");
+                    }
+                }
+            });
+        } else {
+            let head = node.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(10));
+                loop {
+                    ticker.tick().await;
+                    let cutoff = std::time::Instant::now() - Duration::from_secs(15);
+                    let removed: Vec<_> = {
+                        let mut peers = head.peers.lock();
+                        let removed = peers
+                            .iter()
+                            .filter(|(_, peer)| peer.last_seen <= cutoff)
+                            .map(|(id, peer)| (*id, peer.addr.clone()))
+                            .collect::<Vec<_>>();
+                        peers.retain(|_, peer| peer.last_seen > cutoff);
+                        removed
+                    };
+                    if !removed.is_empty() {
+                        head.membership_epoch.fetch_add(1, Ordering::AcqRel);
+                        for (_, addr) in removed {
+                            head.pool.invalidate(&addr);
+                        }
                     }
                 }
             });
         }
-
-        // Evict dead peers
-        let node_clone = node.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
-            loop {
-                ticker.tick().await;
-                let deadline = std::time::Instant::now() - std::time::Duration::from_secs(15);
-                node_clone
-                    .peers
-                    .lock()
-                    .retain(|_, p| p.last_seen > deadline);
-            }
-        });
-
         Ok(node)
     }
 
-    /// Attach a GCS for metadata sync. The node will periodically broadcast
-    /// object/task metadata to peers and merge incoming metadata.
-    pub fn with_gcs(self: &Arc<Self>, gcs: crate::gcs::Gcs) -> Arc<Self> {
-        *self.gcs.lock() = Some(gcs.clone());
+    async fn refresh_membership(&self, head: &str, register: bool) -> Result<(), NodeError> {
+        let deadline = tokio::time::Instant::now() + RPC_TIMEOUT;
+        let mut connection = Connection::connect(head, deadline).await?;
+        let message = if register {
+            Message::RegisterNode {
+                id: self.id,
+                addr: self.addr.clone(),
+            }
+        } else {
+            Message::Ping {
+                id: self.id,
+                addr: self.addr.clone(),
+            }
+        };
+        connection.send(&message, deadline).await?;
+        let Some(Message::NodeList { epoch, nodes }) = connection.recv(deadline).await? else {
+            return Err("invalid membership reply".into());
+        };
+        if epoch < self.membership_epoch.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.membership_epoch.store(epoch, Ordering::Release);
+        let now = std::time::Instant::now();
+        let next: HashMap<_, _> = nodes
+            .into_iter()
+            .filter(|(id, _)| *id != self.id)
+            .map(|(id, addr)| {
+                (
+                    id,
+                    RemoteNode {
+                        addr,
+                        last_seen: now,
+                    },
+                )
+            })
+            .collect();
+        let removed: Vec<_> = {
+            let peers = self.peers.lock();
+            peers
+                .iter()
+                .filter(|(id, _)| !next.contains_key(id))
+                .map(|(_, peer)| peer.addr.clone())
+                .collect()
+        };
+        *self.peers.lock() = next;
+        for addr in removed {
+            self.pool.invalidate(&addr);
+        }
+        Ok(())
+    }
 
-        // Periodically broadcast GCS state to all peers.
+    pub fn with_gcs(self: &Arc<Self>, gcs: crate::gcs::Gcs) -> Arc<Self> {
+        *self.gcs.lock() = Some(gcs);
         let node = self.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+            let mut ticker = tokio::time::interval(Duration::from_secs(2));
             loop {
                 ticker.tick().await;
                 node.broadcast_gcs().await;
             }
         });
-
         self.clone()
     }
 
-    /// Register a locally-hosted actor so incoming [`Message::ActorCall`]
-    /// messages can be routed to it. Triggers an immediate GCS broadcast so
-    /// peers discover the new actor without waiting for the next periodic sync.
     pub fn register_actor(&self, inner: Arc<crate::actor::ActorHandleInner>) {
         self.local_actors.lock().insert(inner.id, inner);
-        // Kick off a broadcast right away so peers learn about this actor
-        // without waiting up to 2s for the next periodic tick.
         let node = self.clone();
-        tokio::spawn(async move {
-            node.broadcast_gcs().await;
-        });
+        tokio::spawn(async move { node.broadcast_gcs().await });
     }
 
-    /// Invoke a registered method on a remote actor. Sends an
-    /// [`Message::ActorCall`] to the actor's owner node and waits for the reply,
-    /// which carries the [`ObjectID`] of the result stored on the owner node.
     pub async fn remote_actor_call(
         &self,
         actor_id: crate::common::ActorID,
         owner: NodeID,
         method: &str,
         args: Vec<u8>,
-    ) -> Result<ObjectID, NodeError> {
-        let addr = self
-            .peers
-            .lock()
-            .get(&owner)
-            .map(|p| p.addr.clone())
-            .ok_or_else(|| format!("no peer with node id {owner}"))?;
-
-        let mut conn = self.pool.get(&addr).await?;
-        conn.send(&Message::ActorCall {
+    ) -> Result<Vec<u8>, NodeError> {
+        let addr = self.peer_addr(owner)?;
+        let message = Message::ActorCall {
             actor_id,
             method: method.to_string(),
             args,
-        })
-        .await?;
-        // Pool guarantees one request/response per checkout — the next message
-        // is always our reply.
-        let reply = conn.recv().await?;
-        match reply {
-            Some(Message::ActorCallReply { result }) => {
-                // Only return the connection to the pool on success — if we got
-                // an unexpected message, the connection may be in a bad state.
-                self.pool.put(&addr, conn);
-                result.map_err(|e| e.into())
-            }
-            _ => Err("unexpected reply to actor call".into()),
+        };
+        match self.request(&addr, message).await? {
+            Message::ActorCallReply(result) => result.map_err(Into::into),
+            _ => Err("unexpected actor reply".into()),
         }
     }
-    async fn broadcast_gcs(&self) {
-        let gcs = match self.gcs.lock().clone() {
-            Some(g) => g,
-            None => return,
-        };
-        let objects: Vec<_> = gcs
-            .objects()
-            .into_iter()
-            .map(|o| (o.id, o.size_bytes))
-            .collect();
-        let tasks: Vec<_> = gcs
-            .tasks()
-            .into_iter()
-            .map(|t| (t.id, t.state))
-            .collect();
-        let actors: Vec<_> = gcs
-            .actors()
-            .into_iter()
-            .map(|a| (a.id, a.name, a.state, a.owner_node))
-            .collect();
-        let msg = Message::GcsSync {
-            objects,
-            tasks,
-            actors,
-        };
-        let peers: Vec<_> = self.peers.lock().values().map(|p| p.addr.clone()).collect();
-        for addr in peers {
-            let pool = self.pool.clone();
-            let msg = msg.clone();
-            tokio::spawn(async move {
-                if let Ok(mut conn) = pool.get(&addr).await {
-                    if conn.send(&msg).await.is_ok() {
-                        pool.put(&addr, conn);
-                    }
-                    // else: send failed, drop the (possibly broken) connection
+
+    async fn request(&self, addr: &str, message: Message) -> Result<Message, NodeError> {
+        let deadline = tokio::time::Instant::now() + RPC_TIMEOUT;
+        for attempt in 0..2 {
+            let mut connection = self.pool.get(addr, deadline).await?;
+            let result = async {
+                connection.send(&message, deadline).await?;
+                connection
+                    .recv(deadline)
+                    .await?
+                    .ok_or_else(|| "peer closed connection".into())
+            }
+            .await;
+            match result {
+                Ok(reply) => {
+                    self.pool.put(addr, connection);
+                    return Ok(reply);
                 }
+                Err(error) if attempt == 0 && tokio::time::Instant::now() < deadline => {
+                    self.pool.invalidate(addr);
+                    tracing::debug!("retrying RPC after pooled connection failure: {error}");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!()
+    }
+
+    fn peer_addr(&self, id: NodeID) -> Result<String, NodeError> {
+        self.peers
+            .lock()
+            .get(&id)
+            .map(|peer| peer.addr.clone())
+            .ok_or_else(|| format!("no peer with node id {id}").into())
+    }
+
+    async fn broadcast_gcs(&self) {
+        let Some(gcs) = self.gcs.lock().clone() else {
+            return;
+        };
+        let message = Message::GcsSync {
+            source: self.id,
+            objects: gcs
+                .objects()
+                .into_iter()
+                .filter(|o| o.owner_node.is_none() || o.owner_node == Some(self.id))
+                .map(|o| (o.id, o.size_bytes))
+                .collect(),
+            tasks: gcs
+                .tasks()
+                .into_iter()
+                .map(|task| (task.id, task.state))
+                .collect(),
+            actors: gcs
+                .actors()
+                .into_iter()
+                .filter(|actor| actor.owner_node.is_none() || actor.owner_node == Some(self.id))
+                .map(|actor| (actor.id, actor.name, actor.state, actor.owner_node))
+                .collect(),
+        };
+        let peers: Vec<_> = self
+            .peers
+            .lock()
+            .values()
+            .map(|peer| peer.addr.clone())
+            .collect();
+        for addr in peers {
+            let node = self.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                let _ = node.request(&addr, message).await;
             });
         }
     }
 
-    /// Fetch an object from a remote node by ID. Queries all peers concurrently
-    /// and returns the first successful result. This avoids the latency of
-    /// trying peers one-by-one when some are slow or unreachable.
     pub async fn fetch_remote_object(&self, id: ObjectID) -> Result<Vec<u8>, NodeError> {
-        let peers: Vec<_> = self.peers.lock().values().map(|p| p.addr.clone()).collect();
-        let pool = self.pool.clone();
-
-        let futs: Vec<_> = peers
-            .into_iter()
-            .map(|addr| {
-                let pool = pool.clone();
-                async move {
-                    let mut conn = pool.get(&addr).await?;
-                    conn.send(&Message::GetObject(id)).await?;
-                    match conn.recv().await? {
-                        Some(Message::ObjectData(_, bytes)) => {
-                            pool.put(&addr, conn);
-                            Ok::<_, NodeError>(bytes)
-                        }
-                        _ => Err("object not found on peer".into()),
-                    }
-                }
-            })
+        let peers: Vec<_> = self
+            .peers
+            .lock()
+            .values()
+            .map(|peer| peer.addr.clone())
             .collect();
-
-        // Run all fetches concurrently; return the first success.
-        let results = futures::future::join_all(futs).await;
-        results
-            .into_iter()
-            .find_map(|r| r.ok())
-            .ok_or_else(|| "object not found on any peer".into())
+        let mut requests = FuturesUnordered::new();
+        for addr in peers {
+            let node = self.clone();
+            requests.push(async move {
+                match node.request(&addr, Message::GetObject(id)).await? {
+                    Message::ObjectData(returned, bytes) if returned == id => Ok(bytes),
+                    _ => Err::<Vec<u8>, NodeError>("object not found on peer".into()),
+                }
+            });
+        }
+        while let Some(result) = requests.next().await {
+            if let Ok(bytes) = result {
+                return Ok(bytes);
+            }
+        }
+        Err("object not found on any peer".into())
     }
 
     pub fn peers(&self) -> Vec<(NodeID, String)> {
         self.peers
             .lock()
             .iter()
-            .map(|(id, p)| (*id, p.addr.clone()))
+            .map(|(id, peer)| (*id, peer.addr.clone()))
             .collect()
     }
 }
 
 impl crate::object_store::RemoteFetcher for Node {
-    fn fetch_remote(
-        &self,
-        id: ObjectID,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>,
-                > + Send,
-        >,
-    > {
-        let this = self.clone();
-        Box::pin(async move { this.fetch_remote_object(id).await })
+    fn fetch_remote(&self, id: ObjectID) -> crate::object_store::RemoteFetchFuture {
+        let node = self.clone();
+        Box::pin(async move { node.fetch_remote_object(id).await })
     }
 }
 
 async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), NodeError> {
-    let mut conn = Connection { stream };
-    while let Some(msg) = conn.recv().await? {
-        match msg {
-            Message::RegisterNode { addr } => {
+    let mut connection = Connection { stream };
+    loop {
+        let deadline = tokio::time::Instant::now() + RPC_TIMEOUT;
+        let Some(message) = connection.recv(deadline).await? else {
+            return Ok(());
+        };
+        match message {
+            Message::RegisterNode { id, addr } | Message::Ping { id, addr } => {
+                if !node.is_head {
+                    return Err("membership request sent to worker".into());
+                }
+                let changed = node
+                    .peers
+                    .lock()
+                    .get(&id)
+                    .is_none_or(|peer| peer.addr != addr);
                 node.peers.lock().insert(
-                    NodeID::new(),
+                    id,
                     RemoteNode {
-                        addr: addr.clone(),
+                        addr,
                         last_seen: std::time::Instant::now(),
                     },
                 );
-                let mut peers: Vec<_> = node
+                if changed {
+                    node.membership_epoch.fetch_add(1, Ordering::AcqRel);
+                }
+                let mut nodes: Vec<_> = node
                     .peers
                     .lock()
                     .iter()
-                    .map(|(id, p)| (*id, p.addr.clone()))
+                    .map(|(id, peer)| (*id, peer.addr.clone()))
                     .collect();
-                peers.push((node.id, node.addr.clone()));
-                conn.send(&Message::NodeList(peers)).await?;
-            }
-            Message::Ping { addr } => {
-                let now = std::time::Instant::now();
-                for p in node.peers.lock().values_mut() {
-                    if p.addr == addr {
-                        p.last_seen = now;
-                    }
-                }
-                conn.send(&Message::Pong).await?;
+                nodes.push((node.id, node.addr.clone()));
+                connection
+                    .send(
+                        &Message::NodeList {
+                            epoch: node.membership_epoch.load(Ordering::Acquire),
+                            nodes,
+                        },
+                        deadline,
+                    )
+                    .await?;
             }
             Message::GetObject(id) => {
-                if node.store.contains(id) {
-                    let bytes = node.store.get_bytes(id).await?;
-                    conn.send(&Message::ObjectData(id, bytes.to_vec())).await?;
+                let reply = if node.store.contains(id) {
+                    Message::ObjectData(id, node.store.get_bytes(id).await?.to_vec())
                 } else {
-                    conn.send(&Message::ObjectNotFound(id)).await?;
-                }
+                    Message::ObjectNotFound(id)
+                };
+                connection.send(&reply, deadline).await?;
             }
             Message::GcsSync {
+                source,
                 objects,
                 tasks,
                 actors,
             } => {
-                // Merge peer's metadata into our GCS so we know object
-                // locations, task states, and actor locations across the cluster.
                 if let Some(gcs) = node.gcs.lock().clone() {
                     for (id, size_bytes) in objects {
                         gcs.add_object(crate::gcs::ObjectMeta {
@@ -500,6 +544,7 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                             size_bytes,
                             created_at: std::time::Instant::now(),
                             owner: None,
+                            owner_node: Some(source),
                         });
                     }
                     for (id, state) in tasks {
@@ -512,9 +557,6 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                         });
                     }
                     for (id, name, state, owner_node) in actors {
-                        // Upsert: insert if new (with owner_node for routing),
-                        // otherwise just update state so we don't clobber local
-                        // task counters.
                         if gcs.get_actor(id).is_some() {
                             gcs.set_actor_state(id, state);
                         } else {
@@ -522,7 +564,7 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                                 id,
                                 name,
                                 state,
-                                owner_node,
+                                owner_node: owner_node.or(Some(source)),
                                 created_at: std::time::Instant::now(),
                                 pending_tasks: 0,
                                 completed_tasks: 0,
@@ -530,32 +572,26 @@ async fn handle_connection(stream: TcpStream, node: Arc<Node>) -> Result<(), Nod
                         }
                     }
                 }
+                connection.send(&Message::Ack, deadline).await?;
             }
             Message::ActorCall {
                 actor_id,
                 method,
                 args,
             } => {
-                // Route the incoming call to the local actor task. Store the
-                // result in the object store so the caller can fetch it via the
-                // existing remote-fetch path (same as task outputs).
                 let actor = node.local_actors.lock().get(&actor_id).cloned();
-                let reply = match actor {
-                    Some(actor) => match actor.call_method(&method, args).await {
-                        Ok(bytes) => {
-                            let id = crate::common::ObjectID::new();
-                            node.store.put_bytes(id, bytes, None);
-                            Ok(id)
-                        }
-                        Err(e) => Err(e.to_string()),
-                    },
+                let result = match actor {
+                    Some(actor) => actor
+                        .call_method(&method, args)
+                        .await
+                        .map_err(|error| error.to_string()),
                     None => Err(format!("actor {actor_id} not found on this node")),
                 };
-                conn.send(&Message::ActorCallReply { result: reply })
+                connection
+                    .send(&Message::ActorCallReply(result), deadline)
                     .await?;
             }
-            _ => {}
+            _ => return Err("unexpected request message".into()),
         }
     }
-    Ok(())
 }

@@ -105,8 +105,8 @@ impl Ray {
         per_worker: Resources,
     ) -> Self {
         let mem = crate::memory::MemoryManager::new(max_memory_bytes, spill_dir);
-        let store = ObjectStore::new().with_memory(mem);
         let gcs = Gcs::new();
+        let store = ObjectStore::new().with_memory(mem).with_gcs(gcs.clone());
         let pool = WorkerPool::new(num_workers, per_worker, gcs.clone(), store.clone());
         let scheduler = Scheduler::new(pool);
         Ray {
@@ -137,14 +137,91 @@ impl Ray {
     /// Store an object in the object store. Returns a typed, refcounted
     /// reference. When the last clone is dropped, the object is evicted.
     pub fn put<T: serde::Serialize + Send + 'static>(&self, value: T) -> ObjectRef<T> {
-        let (r, size) = self.inner.store.put(value);
-        self.inner.gcs.add_object(crate::gcs::ObjectMeta {
-            id: r.id,
-            size_bytes: size,
-            created_at: std::time::Instant::now(),
-            owner: None,
-        });
-        r
+        self.inner.store.put(value).0
+    }
+
+    pub fn put_bytes(&self, bytes: Vec<u8>) -> ObjectRef<Vec<u8>> {
+        self.inner.store.put_bytes_ref(bytes)
+    }
+
+    pub async fn get_bytes(
+        &self,
+        reference: &ObjectRef<Vec<u8>>,
+    ) -> Result<bytes::Bytes, CrayonError> {
+        self.inner.store.get_bytes(reference.id).await
+    }
+
+    pub fn spawn_bytes_with_args<F, Args>(
+        &self,
+        args: Args,
+        resources: Resources,
+        func: F,
+    ) -> ObjectRef<Vec<u8>>
+    where
+        Args: crate::args::ResolveArgs + Send + Sync + Clone + 'static,
+        F: Fn(Args::Output) -> Result<Vec<u8>, CrayonError> + Send + Sync + 'static,
+    {
+        let id = crate::common::TaskID::new();
+        let output_id = ObjectID::new();
+        let (reference, lease) = self.inner.store.reserve_output(output_id, Some(id));
+        let args = Arc::new(args);
+        let func = Arc::new(func);
+        let control = WorkerPool::new_control(output_id, lease.clone());
+        let task = Task {
+            id,
+            output_id,
+            resources,
+            max_retries: 0,
+            retries: 0,
+            priority: 0,
+            control,
+            func: Arc::new(move |store| {
+                let args = args.clone();
+                let func = func.clone();
+                Box::pin(async move {
+                    let resolved = (*args).clone().resolve(&store).await?;
+                    tokio::task::spawn_blocking(move || func(resolved))
+                        .await
+                        .map_err(|e| CrayonError::TaskFailed(e.to_string()))?
+                })
+            }),
+        };
+        if let Err(error) = self.inner.scheduler.schedule(task) {
+            lease.fail(error);
+        }
+        reference
+    }
+
+    pub fn spawn_bytes<F>(&self, func: F) -> ObjectRef<Vec<u8>>
+    where
+        F: Fn() -> Result<Vec<u8>, CrayonError> + Send + Sync + 'static,
+    {
+        let id = crate::common::TaskID::new();
+        let output_id = ObjectID::new();
+        let (reference, lease) = self.inner.store.reserve_output(output_id, Some(id));
+        let func = Arc::new(func);
+        let control = WorkerPool::new_control(output_id, lease.clone());
+        let task = Task {
+            id,
+            output_id,
+            resources: Resources::default_task(),
+            max_retries: 0,
+            retries: 0,
+            priority: 0,
+            control,
+            func: Arc::new(move |_store| {
+                let func = func.clone();
+                Box::pin(async move {
+                    tokio::task::spawn_blocking(move || func())
+                        .await
+                        .map_err(|e| CrayonError::TaskFailed(e.to_string()))?
+                })
+            }),
+        };
+        if let Err(error) = self.inner.scheduler.schedule(task) {
+            lease.fail(error);
+        }
+        reference
     }
 
     /// Fetch an object by reference. Waits if the object is in-flight.
@@ -229,9 +306,10 @@ impl Ray {
     {
         let id = crate::common::TaskID::new();
         let output_id = ObjectID::new();
+        let (r, lease) = self.inner.store.reserve_output(output_id, Some(id));
         let args = Arc::new(args);
         let func = Arc::new(func);
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let control = WorkerPool::new_control(output_id, lease.clone());
         let task = Task {
             id,
             output_id,
@@ -239,26 +317,31 @@ impl Ray {
             max_retries,
             retries: 0,
             priority: 0,
-            cancelled,
+            control,
             func: Arc::new(move |store: ObjectStore| {
                 let args = args.clone();
                 let func = func.clone();
                 Box::pin(async move {
                     let resolved = (*args).clone().resolve(&store).await?;
-                    let result = func(resolved);
-                    bincode::serialize(&result).map_err(|e| CrayonError::Serialize(e.to_string()))
+                    tokio::task::spawn_blocking(move || {
+                        let result = func(resolved);
+                        bincode::serialize(&result)
+                            .map_err(|e| CrayonError::Serialize(e.to_string()))
+                    })
+                    .await
+                    .map_err(|e| CrayonError::TaskFailed(e.to_string()))?
                 })
             }),
         };
-        let r = self.inner.store.reserve_ref(output_id);
         if let Err(e) = self.inner.scheduler.schedule(task) {
-            // Scheduling failed (e.g. task resources exceed any worker's total).
-            // Store the error so the caller gets it on `get` instead of a
-            // timeout.
-            self.inner.store.put_error(output_id, e);
-            self.inner
-                .gcs
-                .set_task_state(id, crate::common::TaskState::Failed, Some(output_id));
+            lease.fail(e.clone());
+            self.inner.gcs.add_task(crate::gcs::TaskMeta {
+                id,
+                state: crate::common::TaskState::Failed,
+                created_at: std::time::Instant::now(),
+                finished_at: Some(std::time::Instant::now()),
+                output: Some(output_id),
+            });
         }
         r
     }

@@ -17,11 +17,9 @@
 | | Ray (Python) | Crayon (Rust + Python) |
 |---|---|---|
 | 语言 | Python + C++ | Rust 核心 + PyO3 绑定 |
-| GIL | 有，吞吐瓶颈 | 无 |
-| 内存安全 | 依赖 GC | 编译期保证 |
-| 代码量 | ~1,000,000 行 | ~3,000 行 |
-| 核心能力 | 完整 | 完整 |
-| Python API | ✅ | ✅ (兼容 Ray 心智) |
+| Python execution | Separate processes | In-process blocking threads; Python still uses the GIL |
+| Isolation | Process isolation | No process isolation |
+| Core scope | Production distributed platform | Experimental single-process runtime plus object/actor networking |
 
 **同样的 API 心智，零 Python 开销。**
 
@@ -82,11 +80,11 @@ r = counter.call(lambda c: c.__setitem__("n", c["n"] + 1) or c["n"])
 ## 核心能力
 
 - **Object Store** — Plasma 风格，bincode 序列化，引用计数 GC，LRU 磁盘溢出，批量 put/get
-- **Tasks** — 依赖自动解析，资源声明，失败自动重试 + 指数退避，任务取消，优先级调度
-- **Actors** — 串行邮箱，命名查找，参数服务器模式，故障自动重启，显式 kill
-- **Resources** — CPU/GPU 记账，分数资源，GPU-aware 调度（CPU 任务优先用 CPU 节点）
-- **Multi-Node** — TCP 点对点，心跳检测，透明远程拉取，消息大小上限
-- **Robustness** — 超时保护，死锁检测，背压（bounded mailbox），spill 文件自动清理
+- **Tasks** — 依赖解析、资源声明、失败重试、可观测取消；运行中代码不会被强制终止
+- **Actors** — 串行邮箱、命名查找、故障重启；同步方法在线程池执行
+- **Resources** — CPU/GPU 记账和分数资源
+- **Multi-Node** — 对象与 Actor RPC、权威 membership、端到端 deadline、分块传输
+- **Boundaries** — 无进程隔离、无通用跨节点任务调度、无 durable GCS、无 TLS/auth
 
 ## 运行
 
@@ -103,19 +101,19 @@ pip install crayon                   # 安装 Python 包
 docker compose up --build            # head + worker
 ```
 
-## Benchmark: Crayon vs Ray
+## Benchmark
 
-0.6B Transformer · GRPO · PyTorch · V100 · 2 workers · batch=8
+仓库提供可复现的 RL benchmark harness，但不内置跨机器通用的性能结论。
+主比较是 `crayon-shared` 与持久化 `ray-actor`；`crayon-serialized` 和
+`ray-stateless` 仅用于诊断不同数据路径。
 
-| Mode | Crayon | Ray | 倍数 |
-|------|--------|-----|------|
-| **A 各自最优** | **1.67s** | 21.2s | **Crayon 12.7x** |
-| B 都序列化 | 50.0s | 21.2s | Ray 2.4x |
+```bash
+python benchmark_rl.py --backend crayon-shared --small-model \
+  --warmup-steps 1 --measure-steps 2 --repetitions 1 \
+  --artifact-dir artifacts/smoke-crayon
+```
 
-**Mode A**：Crayon 传模型引用（进程内线程，零拷贝）；Ray 每步 pickle 2.4GB 权重。
-**Mode B**：Crayon 也走序列化，隔离框架开销。差距来自 bincode < plasma + 无模型缓存。
-
-详细数据和对抗式审核见 [docs/benchmark_rl.md](docs/benchmark_rl.md)。
+方法、限制和制品格式见 [docs/benchmark_rl.md](docs/benchmark_rl.md)。
 
 ## 文档
 

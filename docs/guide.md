@@ -141,7 +141,7 @@ assert!(!ray.store().contains(id));
 
 ### 超时
 
-`get` 默认 30s 超时，避免死等永不产生的对象：
+`get` 默认 300s 对象等待上限；网络 RPC 使用独立的端到端 deadline：
 
 ```rust
 use std::time::Duration;
@@ -203,7 +203,8 @@ assert!(result.is_err()); // 立即失败，不重试
 
 ```rust
 let r = ray.spawn((), |()| { std::thread::sleep(Duration::from_secs(10)); 42 });
-let cancelled = ray.cancel(r.id); // 取消任务
+let cancelled = ray.cancel(r.task_id().unwrap());
+// 调用方立即看到 TaskCancelled；已运行的闭包不会被强制终止，迟到结果会被丢弃。
 ```
 
 ### 优先级调度
@@ -212,7 +213,8 @@ let cancelled = ray.cancel(r.id); // 取消任务
 
 ## 6. Actors
 
-Actor 是有状态的 tokio task，通过 mpsc 邮箱串行处理方法调用。
+Actor 是有状态的邮箱，通过 mpsc 串行处理方法调用。同步方法在 blocking
+线程池执行，因此不会阻塞 Tokio I/O；同一 Actor 仍严格串行。
 
 ### 创建与调用
 
@@ -334,7 +336,9 @@ assert_eq!(v, 42);
 
 ### 心跳与故障检测
 
-Worker 每 5s 向 head 发 Ping，head 15s 无响应则驱逐 peer。
+Worker 每 5s 向 head 发送自己的真实 NodeID。head 返回带 epoch 的完整
+membership snapshot；RPC 连接、请求和响应共享一个绝对 deadline。对象和 Actor
+payload 分块传输，但接收端仍会在发布前完整组装到内存。
 
 ## 9. 磁盘溢出
 

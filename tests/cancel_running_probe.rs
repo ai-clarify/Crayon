@@ -1,29 +1,37 @@
-use crayon::common::TaskState;
+use crayon::common::{CrayonError, TaskState};
 use crayon::Ray;
 use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancel_running_probe() {
+async fn cancel_running_is_immediate_and_suppresses_late_result() {
     let ray = Ray::init(1);
     let result = ray.spawn((), |()| {
         std::thread::sleep(Duration::from_millis(300));
         42u64
     });
+    let task_id = result.task_id().unwrap();
 
-    let task_id = loop {
-        if let Some(task) = ray
+    loop {
+        if ray
             .gcs()
             .tasks()
             .into_iter()
-            .find(|task| task.state == TaskState::Running)
+            .any(|task| task.id == task_id && task.state == TaskState::Running)
         {
-            break task.id;
+            break;
         }
         tokio::task::yield_now().await;
-    };
+    }
 
     assert!(ray.cancel(task_id));
-    assert_eq!(ray.get(&result).await.unwrap(), 42);
-    let task = ray.gcs().tasks().into_iter().find(|task| task.id == task_id).unwrap();
-    assert_eq!(task.state, TaskState::Finished);
+    assert!(matches!(ray.get(&result).await, Err(CrayonError::TaskCancelled(id)) if id == task_id));
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let task = ray
+        .gcs()
+        .tasks()
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .unwrap();
+    assert_eq!(task.state, TaskState::Cancelled);
+    assert!(!ray.cancel(task_id));
 }

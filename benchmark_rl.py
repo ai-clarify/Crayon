@@ -1,444 +1,325 @@
-"""GRPO RL benchmark: Crayon vs Ray distribution backends.
+"""Reproducible RL distribution benchmark for Crayon and Ray.
 
-Same PyTorch 0.6B transformer, same GRPO training logic, same hyperparameters.
-The ONLY difference is the distribution framework (--backend crayon|ray).
-
-Two modes:
-  Mode A (default): each backend uses its optimal transport.
-    Crayon: model passed by reference (in-process threads, zero copy).
-    Ray:   model pickled each step (separate processes, must serialize).
-    -> Measures real-world throughput, including architecture advantages.
-
-  Mode B (--crayon-serialize): force Crayon to pickle the model, same as Ray.
-    -> Isolates pure framework overhead (object store, scheduling) from
-       the zero-copy architecture advantage.
-
-NOTE on parallelism:
-  Crayon workers are in-process threads, so Python rollout code is serialized
-  by the GIL. GPU forward passes still run concurrently (torch releases GIL),
-  but adding workers beyond 1 gives diminishing returns for small batches.
-  Ray workers are separate processes (true parallelism) but each must load
-  its own model copy, so 4 workers need 4x GPU memory.
-
-Run:
-    # Mode A — each backend's optimal path
-    python benchmark_rl.py --backend crayon --steps 10 --workers 2 --batch 8
-    python benchmark_rl.py --backend ray    --steps 10 --workers 2 --batch 8
-
-    # Mode B — both serialize (fair framework-overhead comparison)
-    python benchmark_rl.py --backend crayon --crayon-serialize --steps 10 --workers 2 --batch 8
+Backends:
+  crayon-shared       In-process Crayon tasks sharing the live model object.
+  crayon-serialized   Crayon raw-byte object/task path with one pickle layer.
+  ray-actor           Persistent Ray actor holding one model (primary baseline).
+  ray-stateless       Rebuild model per task (diagnostic only).
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
-import pickle
+import hashlib
+import json
+import os
+import platform
+import statistics
+import subprocess
+import sys
 import time
-
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# ---------------------------------------------------------------------------
-# Model config — 0.6B transformer (matches examples/llm_0_6b.rs)
-# ---------------------------------------------------------------------------
-VOCAB_SIZE = 1000
-HIDDEN_DIM = 2048
-NUM_LAYERS = 12
-NUM_HEADS = 16
-INTER_DIM = 8192
-
-# Sequence config (configurable via CLI)
-PROMPT_LEN = 16
-GEN_LEN = 16
-SEQ_LEN = PROMPT_LEN + GEN_LEN
-
-# GRPO / slime defaults
-LR = 1e-6
-CLIP = 0.2          # PPO ratio clip
-TEMPERATURE = 1.0
-TOP_P = 1.0
-CLIP_GRAD = 1.0
-GROUP_SIZE = 4      # completions per prompt
-EPS = 1e-8
+from pathlib import Path
 
 
-# ---------------------------------------------------------------------------
-# Transformer model (manual attention, matches Rust example architecture)
-# ---------------------------------------------------------------------------
-class TransformerLayer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.w_q = nn.Linear(HIDDEN_DIM, HIDDEN_DIM, bias=False)
-        self.w_k = nn.Linear(HIDDEN_DIM, HIDDEN_DIM, bias=False)
-        self.w_v = nn.Linear(HIDDEN_DIM, HIDDEN_DIM, bias=False)
-        self.w_o = nn.Linear(HIDDEN_DIM, HIDDEN_DIM, bias=False)
-        self.w_ff1 = nn.Linear(HIDDEN_DIM, INTER_DIM, bias=False)
-        self.w_ff2 = nn.Linear(INTER_DIM, HIDDEN_DIM, bias=False)
-
-    def forward(self, x):
-        # x: [batch, seq, hidden]
-        b, s, h = x.shape
-        head_dim = h // NUM_HEADS
-        q = self.w_q(x).view(b, s, NUM_HEADS, head_dim).transpose(1, 2)
-        k = self.w_k(x).view(b, s, NUM_HEADS, head_dim).transpose(1, 2)
-        v = self.w_v(x).view(b, s, NUM_HEADS, head_dim).transpose(1, 2)
-        scale = head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        ctx = torch.matmul(attn, v)
-        ctx = ctx.transpose(1, 2).contiguous().view(b, s, h)
-        x = x + self.w_o(ctx)
-        x = x + self.w_ff2(F.relu(self.w_ff1(x)))
-        return x
+def derive_seed(base: int, repetition: int, step: int, chunk: int) -> int:
+    payload = f"{base}:{repetition}:{step}:{chunk}".encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**31)
 
 
-class Transformer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.embed = nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
-        self.layers = nn.ModuleList([TransformerLayer() for _ in range(NUM_LAYERS)])
-        self.w_out = nn.Linear(HIDDEN_DIM, VOCAB_SIZE, bias=True)
-        self.apply(self._init)
+def summarize(values: list[float]) -> dict[str, float]:
+    if not values:
+        raise ValueError("cannot summarize an empty sample")
+    ordered = sorted(values)
 
-    @staticmethod
-    def _init(m):
-        if isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, mean=0.0, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Embedding):
-            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+    def percentile(p: float) -> float:
+        index = (len(ordered) - 1) * p
+        low = int(index)
+        high = min(low + 1, len(ordered) - 1)
+        return ordered[low] + (ordered[high] - ordered[low]) * (index - low)
 
-    def forward(self, tokens):
-        # tokens: [batch, seq] -> logits: [batch, vocab] (predicts next token)
-        x = self.embed(tokens)
-        for layer in self.layers:
-            x = layer(x)
-        return self.w_out(x[:, -1, :])
-
-    def num_params(self):
-        return sum(p.numel() for p in self.parameters())
+    return {
+        "count": len(values),
+        "median": statistics.median(values),
+        "mean": statistics.fmean(values),
+        "stdev": statistics.stdev(values) if len(values) > 1 else 0.0,
+        "p25": percentile(0.25),
+        "p75": percentile(0.75),
+        "p90": percentile(0.90),
+        "p95": percentile(0.95),
+        "min": min(values),
+        "max": max(values),
+    }
 
 
-# ---------------------------------------------------------------------------
-# Rollout task — runs INSIDE workers (forward only, no training)
-#
-# Two variants:
-#   rollout_task(model, prompts)        — Crayon: model passed by reference (in-process)
-#   rollout_task_serialized(bytes, pr)  — Ray: model must be pickled (separate processes)
-# ---------------------------------------------------------------------------
-def rollout_task(model, prompts_np):
-    """Forward+sampling logic. Model is already on the correct device."""
+def process_tree_pids(root: int) -> set[int]:
+    try:
+        output = subprocess.check_output(["ps", "-axo", "pid=,ppid="], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return {root}
+    children: dict[int, list[int]] = {}
+    for line in output.splitlines():
+        try:
+            pid, parent = map(int, line.split())
+        except ValueError:
+            continue
+        children.setdefault(parent, []).append(pid)
+    found, stack = {root}, [root]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in found:
+                found.add(child)
+                stack.append(child)
+    return found
+
+
+def parse_nvidia_smi(text: str, pids: set[int]) -> dict[str, object]:
+    rows = []
+    for line in text.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 3:
+            continue
+        try:
+            pid, used = int(parts[0]), float(parts[2].split()[0])
+        except ValueError:
+            continue
+        if pid in pids:
+            rows.append({"pid": pid, "gpu": parts[1], "memory_mib": used})
+    return {"supported": True, "total_mib": sum(row["memory_mib"] for row in rows), "rows": rows}
+
+
+def gpu_memory_tree() -> dict[str, object]:
+    command = [
+        "nvidia-smi",
+        "--query-compute-apps=pid,gpu_uuid,used_memory",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        output = subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return {"supported": False, "total_mib": None, "rows": []}
+    return parse_nvidia_smi(output, process_tree_pids(os.getpid()))
+
+
+def git_metadata() -> dict[str, object]:
+    def run(*args: str) -> str | None:
+        try:
+            return subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    return {
+        "commit": run("git", "rev-parse", "HEAD"),
+        "dirty": bool(run("git", "status", "--porcelain")),
+    }
+
+
+def load_torch():
+    try:
+        import numpy as np
+        import torch
+        import torch.nn as nn
+    except ImportError as error:
+        raise SystemExit("benchmark requires numpy and torch") from error
+    return np, torch, nn
+
+
+def build_components(small_model: bool):
+    np, torch, nn = load_torch()
+    hidden, layers, heads, intermediate = ((64, 2, 4, 128) if small_model else (2048, 12, 16, 8192))
+    vocab = 1000
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = nn.MultiheadAttention(hidden, heads, batch_first=True)
+            self.ff1 = nn.Linear(hidden, intermediate, bias=False)
+            self.ff2 = nn.Linear(intermediate, hidden, bias=False)
+
+        def forward(self, value):
+            attended, _ = self.attn(value, value, value, need_weights=False)
+            return value + attended + self.ff2(torch.relu(self.ff1(value)))
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(vocab, hidden)
+            self.layers = nn.ModuleList([Layer() for _ in range(layers)])
+            self.output = nn.Linear(hidden, vocab)
+
+        def forward(self, tokens):
+            value = self.embed(tokens)
+            for layer in self.layers:
+                value = layer(value)
+            return self.output(value[:, -1])
+
+    return np, torch, Model, vocab
+
+
+def rollout(model, prompts, seed: int, generation_length: int):
+    np, torch, _ = load_torch()
+    device = next(model.parameters()).device
+    tokens = torch.as_tensor(prompts, dtype=torch.long, device=device)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    completions, log_probs = [], []
     model.eval()
-    device = next(model.parameters()).device
-    prompts = torch.from_numpy(np.asarray(prompts_np)).long().to(device)
-    cur = prompts.clone()
-    log_probs_list = []
-
     with torch.no_grad():
-        for _ in range(GEN_LEN):
-            logits = model(cur) / TEMPERATURE
-            lp = F.log_softmax(logits, dim=-1)
-            if TOP_P >= 1.0:
-                probs = lp.exp()
-            else:
-                sorted_lp, sorted_idx = lp.sort(dim=-1, descending=True)
-                cumprobs = sorted_lp.exp().cumsum(dim=-1)
-                mask = cumprobs <= TOP_P
-                mask[:, 0] = True
-                sorted_lp = sorted_lp.masked_fill(~mask, float("-inf"))
-                probs = torch.zeros_like(lp).scatter_(-1, sorted_idx, sorted_lp.exp())
-                probs = probs / probs.sum(dim=-1, keepdim=True)
-            next_tok = torch.multinomial(probs, num_samples=1).squeeze(-1)
-            tok_lp = lp.gather(1, next_tok.unsqueeze(-1)).squeeze(-1)
-            log_probs_list.append(tok_lp)
-            cur = torch.cat([cur, next_tok.unsqueeze(-1)], dim=1)
-
-    completions = cur[:, PROMPT_LEN:].cpu().numpy().astype(np.int64)
-    log_probs = torch.stack(log_probs_list, dim=1).cpu().numpy().astype(np.float32)
-    return completions, log_probs
+        for _ in range(generation_length):
+            log_prob = torch.log_softmax(model(tokens), dim=-1)
+            next_token = torch.multinomial(log_prob.exp(), 1, generator=generator).squeeze(1)
+            completions.append(next_token)
+            log_probs.append(log_prob.gather(1, next_token[:, None]).squeeze(1))
+            tokens = torch.cat([tokens, next_token[:, None]], dim=1)
+    return (
+        torch.stack(completions, 1).cpu().numpy().astype(np.int64),
+        torch.stack(log_probs, 1).cpu().numpy().astype(np.float32),
+    )
 
 
-def rollout_task_serialized(state_dict_bytes, prompts_np):
-    """Ray path: workers are separate processes, model must be pickled."""
-    state_dict = pickle.loads(state_dict_bytes)
-    model = Transformer()
-    model.load_state_dict(state_dict)
-    model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    return rollout_task(model, prompts_np)
+def make_backend(name, workers, Model, device, generation_length):
+    import pickle
 
+    if name.startswith("crayon"):
+        try:
+            import crayon
+        except ImportError as error:
+            raise SystemExit("Crayon backend requires the built Python extension") from error
+        runtime = crayon.Ray(workers)
 
-# ---------------------------------------------------------------------------
-# Reward + GRPO advantage
-# ---------------------------------------------------------------------------
-def compute_reward(completions):
-    """completions: [batch, GEN_LEN] -> rewards: [batch] float32.
+        class CrayonBackend:
+            def run(self, model, chunks, seeds):
+                if name == "crayon-shared":
+                    refs = [runtime.spawn(rollout, model, chunk, seed, generation_length) for chunk, seed in zip(chunks, seeds)]
+                else:
+                    payload = pickle.dumps(model.state_dict(), protocol=pickle.HIGHEST_PROTOCOL)
+                    state = runtime.put(payload)
 
-    Token-sum reward normalized by vocab size (gives within-group variation).
-    """
-    return completions.sum(axis=1).astype(np.float32) / float(VOCAB_SIZE)
+                    def serialized(data, prompts, seed, length):
+                        instance = Model().to(device)
+                        instance.load_state_dict(pickle.loads(data))
+                        return rollout(instance, prompts, seed, length)
 
+                    refs = [runtime.spawn(serialized, state, chunk, seed, generation_length) for chunk, seed in zip(chunks, seeds)]
+                return runtime.get_batch(refs)
 
-def compute_grpo_advantages(rewards, group_size):
-    """Group-relative normalization: (r - mean_group) / (std_group + eps)."""
-    n = len(rewards)
-    adv = np.zeros_like(rewards)
-    for i in range(0, n, group_size):
-        g = rewards[i:i + group_size]
-        adv[i:i + group_size] = (g - g.mean()) / (g.std() + EPS)
-    return adv
+            def close(self):
+                return None
 
+        return CrayonBackend()
 
-# ---------------------------------------------------------------------------
-# Trainer — aggregates rollouts, computes GRPO loss, updates model
-# ---------------------------------------------------------------------------
-def train_step(model, optimizer, all_prompts, all_completions, all_old_lps, group_size):
-    """all_*: lists of numpy arrays from workers. Returns loss value."""
-    prompts = np.concatenate(all_prompts, axis=0)
-    completions = np.concatenate(all_completions, axis=0)
-    old_lps = np.concatenate(all_old_lps, axis=0)
-
-    rewards = compute_reward(completions)
-    advantages = compute_grpo_advantages(rewards, group_size)
-
-    device = next(model.parameters()).device
-    prompts_t = torch.from_numpy(prompts).long().to(device)
-    comp_t = torch.from_numpy(completions).long().to(device)
-    old_lps_t = torch.from_numpy(old_lps).float().to(device)
-    adv_t = torch.from_numpy(advantages).float().to(device).unsqueeze(-1)
-
-    full = torch.cat([prompts_t, comp_t], dim=1)
-
-    model.train()
-    new_lps_list = []
-    for step in range(comp_t.shape[1]):
-        seq = full[:, : prompts_t.shape[1] + step + 1]
-        logits = model(seq) / TEMPERATURE
-        lp = F.log_softmax(logits, dim=-1)
-        tok = comp_t[:, step]
-        new_lps_list.append(lp.gather(1, tok.unsqueeze(-1)).squeeze(-1))
-    new_lps = torch.stack(new_lps_list, dim=1)
-
-    # PPO/GRPO clipped surrogate loss
-    ratio = torch.exp(new_lps - old_lps_t)
-    clipped = torch.clamp(ratio, 1.0 - CLIP, 1.0 + CLIP)
-    surr1 = ratio * adv_t
-    surr2 = clipped * adv_t
-    loss = -torch.min(surr1, surr2).mean()
-
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD)
-    optimizer.step()
-    return loss.item()
-
-
-# ---------------------------------------------------------------------------
-# Backend wrappers — same rollout work, different distribution framework
-# ---------------------------------------------------------------------------
-class CrayonBackend:
-    """Crayon workers are in-process threads.
-
-    Two modes:
-    - serialize=False (default, Mode A): model passed by reference, zero copy.
-      This is Crayon's structural advantage over Ray.
-    - serialize=True (Mode B): model pickled through the object store, identical
-      data flow to Ray. Isolates framework overhead from architecture advantage.
-    """
-    def __init__(self, workers, serialize=False):
-        import crayon
-        self.ray = crayon.Ray(workers)
-        self.serialize = serialize
-
-    def distribute(self, model, prompt_chunks):
-        if self.serialize:
-            # Mode B: same data flow as Ray — pickle state_dict, put, spawn.
-            state_dict_bytes = pickle.dumps(model.state_dict())
-            state_ref = self.ray.put(state_dict_bytes)
-            refs = [self.ray.spawn(rollout_task_serialized, state_ref, chunk)
-                    for chunk in prompt_chunks]
-        else:
-            # Mode A: pass model by reference (in-process, zero copy).
-            refs = [self.ray.spawn(rollout_task, model, chunk) for chunk in prompt_chunks]
-        results = self.ray.get_batch(refs)
-        for r in results:
-            if isinstance(r, Exception):
-                raise r
-        return results
-
-    def shutdown(self):
-        pass  # crayon cleans up on GC
-
-
-class RayBackend:
-    """Ray workers are separate processes — model must be pickled each step."""
-    def __init__(self, workers):
+    try:
         import ray
-        if not ray.is_initialized():
-            ray.init(num_cpus=workers, ignore_reinit_error=True, include_dashboard=False)
-        self._rollout_remote = ray.remote(rollout_task_serialized)
+    except ImportError as error:
+        raise SystemExit("Ray backend requires `pip install ray`") from error
+    ray.init(num_cpus=workers, include_dashboard=False, ignore_reinit_error=True)
 
-    def distribute(self, model, prompt_chunks):
-        import ray
-        state_dict_bytes = pickle.dumps(model.state_dict())
-        state_ref = ray.put(state_dict_bytes)
-        refs = [self._rollout_remote.remote(state_ref, chunk) for chunk in prompt_chunks]
-        return ray.get(refs)
+    if name == "ray-actor":
+        @ray.remote
+        class RolloutActor:
+            def __init__(self):
+                self.model = Model().to(device)
 
-    def shutdown(self):
-        import ray
-        if ray.is_initialized():
+            def set_state(self, state):
+                self.model.load_state_dict(state)
+
+            def run(self, prompts, seed, length):
+                return rollout(self.model, prompts, seed, length)
+
+        actors = [RolloutActor.remote() for _ in range(workers)]
+
+        class RayActorBackend:
+            def run(self, model, chunks, seeds):
+                ray.get([actor.set_state.remote(model.state_dict()) for actor in actors])
+                return ray.get([actors[i % len(actors)].run.remote(chunk, seed, generation_length) for i, (chunk, seed) in enumerate(zip(chunks, seeds))])
+
+            def close(self):
+                ray.shutdown()
+
+        return RayActorBackend()
+
+    @ray.remote
+    def stateless(state, prompts, seed, length):
+        model = Model().to(device)
+        model.load_state_dict(state)
+        return rollout(model, prompts, seed, length)
+
+    class RayStatelessBackend:
+        def run(self, model, chunks, seeds):
+            state = ray.put(model.state_dict())
+            return ray.get([stateless.remote(state, chunk, seed, generation_length) for chunk, seed in zip(chunks, seeds)])
+
+        def close(self):
             ray.shutdown()
 
-
-# ---------------------------------------------------------------------------
-# GPU memory helper
-# ---------------------------------------------------------------------------
-def gpu_memory_mb():
-    if torch.cuda.is_available():
-        return torch.cuda.max_memory_allocated() / (1024 * 1024)
-    return 0.0
+    return RayStatelessBackend()
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="GRPO RL benchmark: crayon vs ray")
-    parser.add_argument("--backend", choices=["crayon", "ray"], required=True)
-    parser.add_argument("--steps", type=int, default=10)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--batch", type=int, default=16, help="total samples per step")
-    parser.add_argument("--prompt-len", type=int, default=PROMPT_LEN)
-    parser.add_argument("--gen-len", type=int, default=GEN_LEN)
-    parser.add_argument("--group-size", type=int, default=GROUP_SIZE)
-    parser.add_argument("--lr", type=float, default=LR)
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=["crayon-shared", "crayon-serialized", "ray-actor", "ray-stateless"], required=True)
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--prompt-len", type=int, default=16)
+    parser.add_argument("--gen-len", type=int, default=16)
+    parser.add_argument("--warmup-steps", type=int, default=1)
+    parser.add_argument("--measure-steps", type=int, default=5)
+    parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", type=str, default=None, help="CSV output path")
-    parser.add_argument("--crayon-serialize", action="store_true",
-                        help="Mode B: force Crayon to pickle the model (same as Ray). "
-                             "Default (Mode A): pass model by reference, zero copy.")
+    parser.add_argument("--artifact-dir", type=Path, required=True)
+    parser.add_argument("--small-model", action="store_true")
     args = parser.parse_args()
+    if min(args.workers, args.batch, args.measure_steps, args.repetitions) <= 0:
+        parser.error("workers, batch, measure-steps, and repetitions must be positive")
 
-    # Apply sequence config overrides at module level so workers see them
-    import sys
-    _mod = sys.modules[__name__]
-    _mod.PROMPT_LEN = args.prompt_len
-    _mod.GEN_LEN = args.gen_len
-    _mod.SEQ_LEN = args.prompt_len + args.gen_len
-
-    backend = args.backend
-
-    print(f"=== GRPO RL Benchmark — backend={backend} ===")
-    print(f"steps={args.steps} workers={args.workers} batch={args.batch} "
-          f"group_size={args.group_size}")
-    print(f"prompt_len={PROMPT_LEN} gen_len={GEN_LEN} seq_len={SEQ_LEN}")
-    print(f"lr={args.lr} clip={CLIP} temperature={TEMPERATURE} "
-          f"top_p={TOP_P} clip_grad={CLIP_GRAD}")
-
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
+    np, torch, Model, vocab = build_components(args.small_model)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device}")
+    torch.manual_seed(args.seed)
+    canonical = Model().state_dict()
+    backend = make_backend(args.backend, args.workers, Model, device, args.gen_len)
+    rows, checks, gpu_rows = [], [], []
+    artifact = args.artifact_dir
+    artifact.mkdir(parents=True, exist_ok=True)
 
-    # Build model + optimizer
-    model = Transformer().to(device)
-    n_params = model.num_params()
-    print(f"model params: {n_params:,} ({n_params / 1e9:.3f}B)")
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    try:
+        for repetition in range(args.repetitions):
+            model = Model().to(device)
+            model.load_state_dict(canonical)
+            total = args.warmup_steps + args.measure_steps
+            for step in range(total):
+                rng = np.random.default_rng(derive_seed(args.seed, repetition, step, 0))
+                prompts = rng.integers(0, vocab, size=(args.batch, args.prompt_len), dtype=np.int64)
+                chunks = [chunk for chunk in np.array_split(prompts, min(args.workers, args.batch)) if len(chunk)]
+                seeds = [derive_seed(args.seed, repetition, step, index) for index in range(len(chunks))]
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                started = time.perf_counter_ns()
+                results = backend.run(model, chunks, seeds)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                duration = (time.perf_counter_ns() - started) / 1e9
+                expected = [rollout(model, chunk, seed, args.gen_len) for chunk, seed in zip(chunks, seeds)]
+                valid = all(np.array_equal(a[0], b[0]) and np.allclose(a[1], b[1], rtol=1e-5, atol=1e-6) for a, b in zip(results, expected))
+                checks.append({"repetition": repetition, "step": step, "valid": valid})
+                if not valid:
+                    raise RuntimeError("semantic check failed")
+                phase = "warmup" if step < args.warmup_steps else "measure"
+                rows.append({"backend": args.backend, "repetition": repetition, "step": step, "phase": phase, "seconds": duration, "samples_per_second": args.batch / duration, "tokens_per_second": args.batch * args.gen_len / duration})
+                gpu_rows.append({"repetition": repetition, "step": step, **gpu_memory_tree()})
+    finally:
+        backend.close()
 
-    # Sanity: batch must be divisible by group_size
-    assert args.batch % args.group_size == 0, \
-        f"batch ({args.batch}) must be divisible by group_size ({args.group_size})"
-    num_prompts = args.batch // args.group_size
-
-    # Initialize distribution backend once (reused across all steps)
-    if backend == "crayon":
-        dist = CrayonBackend(args.workers, serialize=args.crayon_serialize)
-        mode = "serialized" if args.crayon_serialize else "local"
-    else:
-        dist = RayBackend(args.workers)
-        mode = "serialized"  # Ray always serializes (separate processes)
-    print(f"mode: {mode}")
-
-    # Output file includes mode so A/B results don't overwrite each other
-    if args.output is None:
-        args.output = f"benchmark_rl_{backend}_{mode}.csv"
-
-    # CSV setup
-    csv_file = open(args.output, "w", newline="")
-    writer = csv.writer(csv_file)
-    writer.writerow([
-        "backend", "mode", "step", "step_time_ms", "samples_per_sec",
-        "tokens_per_sec", "gpu_memory_mb", "loss", "num_samples",
-    ])
-
-    total_start = time.time()
-    rng = np.random.default_rng(args.seed)
-
-    for step in range(args.steps):
-        step_start = time.time()
-
-        # 1. Generate prompts (each prompt repeated group_size times)
-        base_prompts = rng.integers(0, VOCAB_SIZE, size=(num_prompts, PROMPT_LEN), dtype=np.int32)
-        prompts = np.repeat(base_prompts, args.group_size, axis=0)
-
-        # 2. Split into chunks for workers
-        chunk_size = (args.batch + args.workers - 1) // args.workers
-        prompt_chunks = [prompts[i:i + chunk_size] for i in range(0, args.batch, chunk_size)]
-
-        # 3. Fan out rollouts via chosen backend
-        #    Crayon: model passed by reference (in-process, zero copy)
-        #    Ray: model pickled inside distribute() (separate processes)
-        results = dist.distribute(model, prompt_chunks)
-
-        # 5. Unpack results
-        all_prompts = []
-        all_completions = []
-        all_old_lps = []
-        for i, chunk in enumerate(prompt_chunks):
-            completions, log_probs = results[i]
-            all_prompts.append(chunk)
-            all_completions.append(completions)
-            all_old_lps.append(log_probs)
-
-        # 6. Train step (aggregate + GRPO + update)
-        loss = train_step(
-            model, optimizer, all_prompts, all_completions, all_old_lps,
-            args.group_size,
-        )
-
-        # 7. Metrics
-        step_time = time.time() - step_start
-        step_ms = step_time * 1000.0
-        samples_per_sec = args.batch / step_time
-        tokens_per_sec = args.batch * GEN_LEN / step_time
-        gpu_mem = gpu_memory_mb()
-
-        writer.writerow([
-            backend, mode, step, f"{step_ms:.3f}", f"{samples_per_sec:.3f}",
-            f"{tokens_per_sec:.3f}", f"{gpu_mem:.3f}", f"{loss:.6f}",
-            args.batch,
-        ])
-        csv_file.flush()
-
-        print(
-            f"  step {step:>4}/{args.steps} | {step_ms:>8.1f}ms | "
-            f"{samples_per_sec:>7.1f} samp/s | {tokens_per_sec:>8.1f} tok/s | "
-            f"gpu={gpu_mem:>7.1f}MB | loss={loss:.4f}"
-        )
-
-    total_time = time.time() - total_start
-    csv_file.close()
-
-    print(f"\n=== Done: {args.steps} steps in {total_time:.1f}s ===")
-    print(f"avg step: {total_time / args.steps * 1000:.0f}ms")
-    print(f"avg throughput: {args.steps * args.batch / total_time:.1f} samp/s")
-    print(f"results -> {args.output}")
-
-    dist.shutdown()
+    measured = [row for row in rows if row["phase"] == "measure"]
+    seconds = summarize([row["seconds"] for row in measured])
+    summary = {"backend": args.backend, "seconds": seconds, "samples_per_second": summarize([row["samples_per_second"] for row in measured]), "tokens_per_second": summarize([row["tokens_per_second"] for row in measured])}
+    with (artifact / "samples.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+        writer.writeheader(); writer.writerows(rows)
+    (artifact / "summary.json").write_text(json.dumps(summary, indent=2))
+    (artifact / "semantic_checks.json").write_text(json.dumps(checks, indent=2))
+    (artifact / "gpu_memory.json").write_text(json.dumps(gpu_rows, indent=2))
+    manifest = {"command": sys.argv, "python": sys.version, "platform": platform.platform(), "torch": torch.__version__, "cuda": torch.version.cuda, "device": str(device), "git": git_metadata(), "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "arguments": vars(args) | {"artifact_dir": str(args.artifact_dir)}}
+    (artifact / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

@@ -38,6 +38,8 @@ pub struct VersionMeta {
     pub version: u64,
     pub created_at: u64, // unix seconds
     pub object_id: ObjectID,
+    #[serde(skip)]
+    pub generation: u64,
     pub size_bytes: usize,
 }
 
@@ -71,11 +73,7 @@ impl VersionedStore {
 
     /// Store a new version of `name`. The version number is auto-incremented
     /// per name. Returns the metadata for the stored version.
-    pub fn put<T: serde::Serialize + Send + 'static>(
-        &self,
-        name: &str,
-        value: T,
-    ) -> VersionMeta {
+    pub fn put<T: serde::Serialize + Send + 'static>(&self, name: &str, value: T) -> VersionMeta {
         let v = self.next_version(name);
         self.put_with_version(name, value, v)
     }
@@ -87,18 +85,42 @@ impl VersionedStore {
         value: T,
         version: u64,
     ) -> VersionMeta {
-        // Use put_bytes directly (not put) so the object is NOT refcounted.
-        // Versioned artifacts live until explicitly evicted by the versioning
-        // store — a refcounted ObjectRef would drop them at end of scope.
-        let id = crate::common::ObjectID::new();
         let bytes = bincode::serialize(&value).expect("bincode serialize should not fail");
+        self.put_serialized(name, bytes, version)
+    }
+
+    pub fn put_bytes_with_version(&self, name: &str, bytes: Vec<u8>, version: u64) -> VersionMeta {
+        self.put_serialized(name, bytes, version)
+    }
+
+    pub async fn get_bytes(&self, name: &str) -> Option<bytes::Bytes> {
+        let meta = self.inner.lock().versions.get(name)?.last()?.clone();
+        self.store.get_bytes(meta.object_id).await.ok()
+    }
+
+    pub async fn get_bytes_at(&self, name: &str, version: u64) -> Option<bytes::Bytes> {
+        let meta = self
+            .inner
+            .lock()
+            .versions
+            .get(name)?
+            .iter()
+            .find(|meta| meta.version == version)?
+            .clone();
+        self.store.get_bytes(meta.object_id).await.ok()
+    }
+
+    fn put_serialized(&self, name: &str, bytes: Vec<u8>, version: u64) -> VersionMeta {
+        let id = crate::common::ObjectID::new();
         let size = bytes.len();
         self.store.put_bytes(id, bytes, None);
+        let generation = self.store.pin(id);
         let meta = VersionMeta {
             name: name.to_string(),
             version,
             created_at: now_secs(),
             object_id: id,
+            generation,
             size_bytes: size,
         };
 
@@ -108,7 +130,7 @@ impl VersionedStore {
         // If this version already exists, replace it (remove old object).
         if let Some(pos) = entry.iter().position(|m| m.version == version) {
             let old = entry.remove(pos);
-            self.store.delete(old.object_id);
+            self.store.unpin(old.object_id, old.generation);
         }
         entry.push(meta.clone());
 
@@ -117,7 +139,7 @@ impl VersionedStore {
             let overflow = entry.len() - keep_last;
             for _ in 0..overflow {
                 let old = entry.remove(0);
-                self.store.delete(old.object_id);
+                self.store.unpin(old.object_id, old.generation);
             }
         }
         meta
@@ -179,7 +201,7 @@ impl VersionedStore {
         let mut inner = self.inner.lock();
         if let Some(versions) = inner.versions.remove(name) {
             for m in versions {
-                self.store.delete(m.object_id);
+                self.store.unpin(m.object_id, m.generation);
             }
         }
     }

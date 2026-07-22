@@ -20,6 +20,7 @@ pub struct ObjectMeta {
     pub size_bytes: usize,
     pub created_at: Instant,
     pub owner: Option<TaskID>,
+    pub owner_node: Option<crate::node::NodeID>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +148,10 @@ impl Gcs {
     pub fn set_task_state(&self, id: TaskID, state: TaskState, output: Option<ObjectID>) {
         if let Some(t) = self.inner.lock().tasks.get_mut(&id) {
             t.state = state;
-            if state == TaskState::Finished || state == TaskState::Failed {
+            if matches!(
+                state,
+                TaskState::Finished | TaskState::Failed | TaskState::Cancelled
+            ) {
                 t.finished_at = Some(Instant::now());
             }
             if let Some(o) = output {

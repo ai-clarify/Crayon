@@ -33,6 +33,11 @@ impl ObjectRef {
         format!("{}", self.inner.id)
     }
 
+    #[getter]
+    fn task_id(&self) -> Option<String> {
+        self.inner.task_id().map(|id| id.to_string())
+    }
+
     fn __repr__(&self) -> String {
         format!("ObjectRef({})", self.id())
     }
@@ -96,25 +101,30 @@ impl ActorHandle {
         let inner = self.inner.clone();
         let fut = async move {
             inner
-                .call(move |state: &mut Vec<u8>| -> Vec<u8> {
-                    Python::with_gil(|py| {
-                        // Unpickle state
-                        let state_obj = pickle_loads(py, state).expect("failed to unpickle state");
-                        let state_bound = state_obj.bind(py);
-                        let method_obj = state_bound
-                            .getattr(method.as_str())
-                            .unwrap_or_else(|e| panic!("failed to get method '{method}': {e}"));
-                        let args_tuple =
-                            PyTuple::new_bound(py, &args_vec);
-                        let result = method_obj
-                            .call1(&args_tuple)
-                            .unwrap_or_else(|e| panic!("method '{method}' failed: {e}"));
-                        // Re-pickle state back (state may have mutated)
-                        let new_state = pickle_dumps(py, state_bound).expect("failed to pickle state");
-                        *state = new_state;
-                        pickle_dumps(py, &result).expect("failed to pickle result")
-                    })
-                })
+                .call_result(
+                    move |state: &mut Vec<u8>| -> Result<Vec<u8>, crayon_rs::common::CrayonError> {
+                        Python::with_gil(|py| {
+                            let state_obj = pickle_loads(py, state).map_err(|error| {
+                                crayon_rs::common::CrayonError::TaskFailed(error.to_string())
+                            })?;
+                            let state_bound = state_obj.bind(py);
+                            let method_obj =
+                                state_bound.getattr(method.as_str()).map_err(|error| {
+                                    crayon_rs::common::CrayonError::TaskFailed(error.to_string())
+                                })?;
+                            let args_tuple = PyTuple::new_bound(py, &args_vec);
+                            let result = method_obj.call1(&args_tuple).map_err(|error| {
+                                crayon_rs::common::CrayonError::TaskFailed(error.to_string())
+                            })?;
+                            *state = pickle_dumps(py, state_bound).map_err(|error| {
+                                crayon_rs::common::CrayonError::Serialize(error.to_string())
+                            })?;
+                            pickle_dumps(py, &result).map_err(|error| {
+                                crayon_rs::common::CrayonError::Serialize(error.to_string())
+                            })
+                        })
+                    },
+                )
                 .await
         };
 
@@ -178,15 +188,10 @@ impl Ray {
                     // Reuse Rust's default detection when only spill_dir is given.
                     2 * 1024 * 1024 * 1024
                 });
-                let spill = dir
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| {
-                        std::env::temp_dir()
-                            .join(format!("crayon-spill-{}", std::process::id()))
-                    });
-                runtime.block_on(async {
-                    RustRay::init_with_memory(num_workers, max_mem, spill)
-                })
+                let spill = dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
+                    std::env::temp_dir().join(format!("crayon-spill-{}", std::process::id()))
+                });
+                runtime.block_on(async { RustRay::init_with_memory(num_workers, max_mem, spill) })
             }
         };
 
@@ -197,7 +202,7 @@ impl Ray {
     fn put(&self, value: &Bound<'_, PyAny>) -> PyResult<ObjectRef> {
         let py = value.py();
         let bytes = pickle_dumps(py, value)?;
-        let obj_ref = self.inner.put(bytes);
+        let obj_ref = self.inner.put_bytes(bytes);
         Ok(ObjectRef { inner: obj_ref })
     }
 
@@ -227,14 +232,14 @@ impl Ray {
         let bytes = Python::with_gil(|py| {
             py.allow_threads(|| {
                 self.runtime
-                    .block_on(async move { inner.get::<Vec<u8>>(&obj_ref).await })
+                    .block_on(async move { inner.get_bytes(&obj_ref).await })
+                    .map(|bytes| bytes.to_vec())
             })
         })
         .map_err(|e| PyRuntimeError::new_err(format!("get failed: {:?}", e)))?;
         Python::with_gil(|py| pickle_loads(py, &bytes))
     }
 
-    /// Fetch many objects concurrently. Returns a list of results.
     /// Fetch many objects concurrently. Returns a list of results.
     fn get_batch(&self, obj_refs: &Bound<'_, PyList>) -> PyResult<PyObject> {
         let store = self.inner.store();
@@ -261,15 +266,20 @@ impl Ray {
             let inner = self.inner.clone();
             let remote_results = py.allow_threads(|| {
                 self.runtime.block_on(async move {
-                    let ids: Vec<_> = remote_refs.iter().map(|r| r.id).collect();
-                    inner.store().get_batch::<Vec<u8>>(&ids).await
+                    futures::future::join_all(
+                        remote_refs
+                            .iter()
+                            .map(|reference| inner.get_bytes(reference)),
+                    )
+                    .await
                 })
             });
             for (pos, res) in remote_positions.into_iter().zip(remote_results) {
                 match res {
                     Ok(bytes) => results[pos] = Some(pickle_loads(py, &bytes)?),
                     Err(e) => {
-                        results[pos] = Some(PyRuntimeError::new_err(format!("{:?}", e)).to_object(py));
+                        results[pos] =
+                            Some(PyRuntimeError::new_err(format!("{:?}", e)).to_object(py));
                     }
                 }
             }
@@ -314,21 +324,16 @@ impl Ray {
     ) -> PyResult<ObjectRef> {
         let func_obj = Arc::new(func.clone().unbind());
         let store = self.inner.store();
-
-        // Collect ObjectRef args into a Vec for Rust-side resolution.
-        // Non-ObjectRef args are captured directly as Python objects.
-        // Local ObjectRefs (from put_local) are resolved in-process: the
-        // cached Python object is passed by reference, no pickle needed.
-        let mut ref_args: Vec<crayon_rs::common::ObjectRef<Vec<u8>>> = Vec::new();
-        let mut plain_args: Vec<PyObject> = Vec::new();
-        let mut is_ref: Vec<bool> = Vec::new();
+        let mut ref_args = Vec::new();
+        let mut plain_args = Vec::new();
+        let mut is_ref = Vec::new();
         for arg in args.iter() {
-            if let Ok(obj_ref) = arg.extract::<ObjectRef>() {
-                if let Ok(local) = store.get_local::<PyObject>(obj_ref.inner.id) {
+            if let Ok(reference) = arg.extract::<ObjectRef>() {
+                if let Ok(local) = store.get_local::<PyObject>(reference.inner.id) {
                     plain_args.push(local.as_ref().clone_ref(args.py()));
                     is_ref.push(false);
                 } else {
-                    ref_args.push(obj_ref.inner);
+                    ref_args.push(crayon_rs::args::RawBytesArg(reference.inner));
                     is_ref.push(true);
                 }
             } else {
@@ -337,24 +342,20 @@ impl Ray {
             }
         }
         let plain_args = Arc::new(plain_args);
-
-        let inner = self.inner.clone();
-        let res = resources.map(RustResources::from);
-        // Single closure, branch only on the method call.
-        let run = move |resolved: Vec<Vec<u8>>| -> Vec<u8> {
-            run_task(
-                func_obj.clone(),
-                resolved,
-                plain_args.clone(),
-                is_ref.clone(),
-            )
-        };
-        let obj_ref = if let Some(res) = res {
-            inner.spawn_with_resources(ref_args, res, run)
-        } else {
-            inner.spawn(ref_args, run)
-        };
-
+        let resources = resources
+            .map(RustResources::from)
+            .unwrap_or_else(RustResources::default_task);
+        let obj_ref = self
+            .inner
+            .spawn_bytes_with_args(ref_args, resources, move |resolved| {
+                run_task(
+                    func_obj.clone(),
+                    resolved,
+                    plain_args.clone(),
+                    is_ref.clone(),
+                )
+                .map_err(|error| crayon_rs::common::CrayonError::TaskFailed(error))
+            });
         Ok(ObjectRef { inner: obj_ref })
     }
 
@@ -380,15 +381,23 @@ impl Ray {
             dict.set_item("tasks_total", status.tasks_total)?;
             dict.set_item("tasks_finished", status.tasks_finished)?;
             dict.set_item("tasks_failed", status.tasks_failed)?;
+            dict.set_item("tasks_cancelled", status.tasks_cancelled)?;
             dict.set_item("tasks_pending", status.tasks_pending)?;
             dict.set_item("tasks_running", status.tasks_running)?;
             dict.set_item("worker_utilization", status.worker_utilization)?;
             dict.set_item("memory_used_bytes", status.memory_used_bytes)?;
             dict.set_item("memory_limit_bytes", status.memory_limit_bytes)?;
+            dict.set_item("spill_failures", status.spill_failures)?;
 
             let actors_list = PyList::empty_bound(py);
             for a in &status.actors {
-                let entry = (a.id.clone(), a.name.clone(), a.state.clone(), a.pending, a.completed);
+                let entry = (
+                    a.id.clone(),
+                    a.name.clone(),
+                    a.state.clone(),
+                    a.pending,
+                    a.completed,
+                );
                 actors_list.append(entry)?;
             }
             dict.set_item("actors", actors_list)?;
@@ -448,27 +457,28 @@ fn run_task(
     resolved: Vec<Vec<u8>>,
     plain_args: Arc<Vec<PyObject>>,
     is_ref: Vec<bool>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, String> {
     Python::with_gil(|py| {
         let func = func_obj.bind(py);
         let mut resolved_iter = resolved.into_iter();
         let mut plain_iter = plain_args.iter();
-        let call_args: Vec<PyObject> = is_ref
-            .iter()
-            .map(|&is_r| {
-                if is_r {
-                    let bytes = resolved_iter.next().expect("resolved arg missing");
-                    pickle_loads(py, &bytes).expect("failed to unpickle task arg")
-                } else {
-                    plain_iter.next().expect("plain arg missing").clone_ref(py)
-                }
-            })
-            .collect();
+        let mut call_args = Vec::with_capacity(is_ref.len());
+        for is_reference in is_ref {
+            if is_reference {
+                let bytes = resolved_iter
+                    .next()
+                    .ok_or_else(|| "resolved argument missing".to_string())?;
+                call_args.push(pickle_loads(py, &bytes).map_err(|error| error.to_string())?);
+            } else {
+                let value = plain_iter
+                    .next()
+                    .ok_or_else(|| "plain argument missing".to_string())?;
+                call_args.push(value.clone_ref(py));
+            }
+        }
         let args_tuple = PyTuple::new_bound(py, &call_args);
-        let result = func
-            .call1(&args_tuple)
-            .unwrap_or_else(|e| panic!("task function raised: {e}"));
-        pickle_dumps(py, &result).expect("failed to pickle task result")
+        let result = func.call1(&args_tuple).map_err(|error| error.to_string())?;
+        pickle_dumps(py, &result).map_err(|error| error.to_string())
     })
 }
 
@@ -522,7 +532,7 @@ impl VersionedStore {
         let py = value.py();
         let bytes = pickle_dumps(py, value)?;
         let v = version.unwrap_or_else(|| self.inner.latest_version(name) + 1);
-        let meta = self.inner.put_with_version(name, bytes, v);
+        let meta = self.inner.put_bytes_with_version(name, bytes, v);
         Ok(meta.version)
     }
 
@@ -533,7 +543,10 @@ impl VersionedStore {
         let bytes = Python::with_gil(|py| {
             py.allow_threads(|| {
                 self.runtime.block_on(async move {
-                    inner.get::<Vec<u8>>(&name_owned).await
+                    inner
+                        .get_bytes(&name_owned)
+                        .await
+                        .map(|bytes| bytes.to_vec())
                 })
             })
         })
@@ -548,11 +561,16 @@ impl VersionedStore {
         let bytes = Python::with_gil(|py| {
             py.allow_threads(|| {
                 self.runtime.block_on(async move {
-                    inner.get_at::<Vec<u8>>(&name_owned, version).await
+                    inner
+                        .get_bytes_at(&name_owned, version)
+                        .await
+                        .map(|bytes| bytes.to_vec())
                 })
             })
         })
-        .ok_or_else(|| PyRuntimeError::new_err(format!("version {version} of '{name}' not found")))?;
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(format!("version {version} of '{name}' not found"))
+        })?;
         Python::with_gil(|py| pickle_loads(py, &bytes))
     }
 

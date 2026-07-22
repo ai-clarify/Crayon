@@ -1,6 +1,0 @@
-backend,mode,step,step_time_ms,samples_per_sec,tokens_per_sec,gpu_memory_mb,loss,num_samples
-ray,serialized,0,26243.436,0.305,4.877,11615.034,0.113217,8
-ray,serialized,1,21212.519,0.377,6.034,12413.536,0.031232,8
-ray,serialized,2,21199.855,0.377,6.038,12413.536,-0.000000,8
-ray,serialized,3,21440.490,0.373,5.970,12413.536,-0.000000,8
-ray,serialized,4,21360.722,0.375,5.992,12413.973,-0.000000,8

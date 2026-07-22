@@ -15,6 +15,7 @@ pub struct SystemStatus {
     pub tasks_total: usize,
     pub tasks_finished: usize,
     pub tasks_failed: usize,
+    pub tasks_cancelled: usize,
     pub tasks_pending: usize,
     pub tasks_running: usize,
     pub workers: Vec<WorkerStatus>,
@@ -23,6 +24,7 @@ pub struct SystemStatus {
     pub memory_used_bytes: usize,
     /// Memory budget; objects are spilled to disk beyond this. 0 = unlimited.
     pub memory_limit_bytes: usize,
+    pub spill_failures: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,8 +45,9 @@ pub struct WorkerStatus {
 
 impl SystemStatus {
     pub fn snapshot(gcs: &Gcs, store: &ObjectStore) -> Self {
-        let objects = gcs.objects().len();
+        let objects = store.len();
         let (memory_used_bytes, memory_limit_bytes) = store.memory_stats();
+        let spill_failures = store.spill_failures();
         let actors = gcs
             .actors()
             .into_iter()
@@ -61,12 +64,14 @@ impl SystemStatus {
         let tasks_total = tasks.len();
         let mut tasks_finished = 0;
         let mut tasks_failed = 0;
+        let mut tasks_cancelled = 0;
         let mut tasks_pending = 0;
         let mut tasks_running = 0;
         for t in &tasks {
             match t.state {
                 crate::common::TaskState::Finished => tasks_finished += 1,
                 crate::common::TaskState::Failed => tasks_failed += 1,
+                crate::common::TaskState::Cancelled => tasks_cancelled += 1,
                 crate::common::TaskState::Pending => tasks_pending += 1,
                 crate::common::TaskState::Running => tasks_running += 1,
             }
@@ -95,12 +100,14 @@ impl SystemStatus {
             tasks_total,
             tasks_finished,
             tasks_failed,
+            tasks_cancelled,
             tasks_pending,
             tasks_running,
             workers,
             worker_utilization,
             memory_used_bytes,
             memory_limit_bytes,
+            spill_failures,
         }
     }
 
@@ -110,10 +117,11 @@ impl SystemStatus {
         s.push_str("=== Crayon Status ===\n");
         s.push_str(&format!("Objects: {}\n", self.objects));
         s.push_str(&format!(
-            "Tasks: {} total, {} finished, {} failed, {} running, {} pending\n",
+            "Tasks: {} total, {} finished, {} failed, {} cancelled, {} running, {} pending\n",
             self.tasks_total,
             self.tasks_finished,
             self.tasks_failed,
+            self.tasks_cancelled,
             self.tasks_running,
             self.tasks_pending
         ));
