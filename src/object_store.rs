@@ -201,7 +201,7 @@ impl ObjectStore {
     }
 
     pub async fn get_bytes(&self, id: ObjectID) -> Result<bytes::Bytes, CrayonError> {
-        self.get_bytes_timeout(id, std::time::Duration::from_secs(30))
+        self.get_bytes_timeout(id, std::time::Duration::from_secs(300))
             .await
     }
 
