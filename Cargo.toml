@@ -14,11 +14,6 @@ categories = ["concurrency", "science", "algorithms"]
 [lib]
 name = "crayon"
 
-[features]
-# Enable CUDA backend for candle (used by llm_gsm8k example on V100/A100).
-# Build with: cargo run --release --features cuda --example llm_gsm8k
-cuda = ["candle-core/cuda"]
-
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -33,7 +28,6 @@ futures = "0.3"
 core_affinity = "0.8"
 
 [dev-dependencies]
-candle-core = "0.10"
 rand = "0.8"
 
 [[bin]]

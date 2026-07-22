@@ -8,7 +8,7 @@
 //! Tasks read the device id and pass it to their ML framework:
 //! ```ignore
 //! let device = crayon::device::current_device().unwrap_or(0);
-//! let model = Model::load(&candle_core::Device::Cuda(device))?;
+//! let model = load_model(device); // e.g. torch.cuda.set_device(device)
 //! ```
 
 use std::cell::Cell;
