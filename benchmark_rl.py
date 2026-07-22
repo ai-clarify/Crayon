@@ -3,9 +3,30 @@
 Same PyTorch 0.6B transformer, same GRPO training logic, same hyperparameters.
 The ONLY difference is the distribution framework (--backend crayon|ray).
 
+Two modes:
+  Mode A (default): each backend uses its optimal transport.
+    Crayon: model passed by reference (in-process threads, zero copy).
+    Ray:   model pickled each step (separate processes, must serialize).
+    -> Measures real-world throughput, including architecture advantages.
+
+  Mode B (--crayon-serialize): force Crayon to pickle the model, same as Ray.
+    -> Isolates pure framework overhead (object store, scheduling) from
+       the zero-copy architecture advantage.
+
+NOTE on parallelism:
+  Crayon workers are in-process threads, so Python rollout code is serialized
+  by the GIL. GPU forward passes still run concurrently (torch releases GIL),
+  but adding workers beyond 1 gives diminishing returns for small batches.
+  Ray workers are separate processes (true parallelism) but each must load
+  its own model copy, so 4 workers need 4x GPU memory.
+
 Run:
-    python benchmark_rl.py --backend crayon --steps 10 --workers 4 --batch 16
-    python benchmark_rl.py --backend ray    --steps 10 --workers 4 --batch 16
+    # Mode A — each backend's optimal path
+    python benchmark_rl.py --backend crayon --steps 10 --workers 2 --batch 8
+    python benchmark_rl.py --backend ray    --steps 10 --workers 2 --batch 8
+
+    # Mode B — both serialize (fair framework-overhead comparison)
+    python benchmark_rl.py --backend crayon --crayon-serialize --steps 10 --workers 2 --batch 8
 """
 
 import argparse
