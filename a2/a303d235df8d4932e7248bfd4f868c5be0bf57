@@ -1,0 +1,31 @@
+benchmark_rl.py
+  s_396cb81162fd23::t_f8c06d7eda442c 1-401
+src/object_store.rs
+  s_3ed83973de6379::t_07698259a133c9 204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a2a303d235df8d4932e7248bfd4f868c5be0bf57",
+  "prompts": {},
+  "sessions": {
+    "s_396cb81162fd23": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a41d9c44529db3427",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3ed83973de6379": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a5ffaeb-7d2a-4b8b-a14c-090d296b18a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
