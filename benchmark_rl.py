@@ -107,11 +107,11 @@ class Transformer(nn.Module):
 #   rollout_task(model, prompts)        — Crayon: model passed by reference (in-process)
 #   rollout_task_serialized(bytes, pr)  — Ray: model must be pickled (separate processes)
 # ---------------------------------------------------------------------------
-def _rollout_forward(model, prompts_np):
-    """Shared forward+sampling logic. Model is already on the correct device."""
+def rollout_task(model, prompts_np):
+    """Forward+sampling logic. Model is already on the correct device."""
     model.eval()
     device = next(model.parameters()).device
-    prompts = torch.from_numpy(np.array(prompts_np, copy=True)).long().to(device)
+    prompts = torch.from_numpy(np.asarray(prompts_np)).long().to(device)
     cur = prompts.clone()
     log_probs_list = []
 
@@ -139,19 +139,13 @@ def _rollout_forward(model, prompts_np):
     return completions, log_probs
 
 
-def rollout_task(model, prompts_np):
-    """Crayon path: model passed by reference — zero copy, already on GPU."""
-    return _rollout_forward(model, prompts_np)
-
-
 def rollout_task_serialized(state_dict_bytes, prompts_np):
     """Ray path: workers are separate processes, model must be pickled."""
     state_dict = pickle.loads(state_dict_bytes)
     model = Transformer()
     model.load_state_dict(state_dict)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    return _rollout_forward(model, prompts_np)
+    model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    return rollout_task(model, prompts_np)
 
 
 # ---------------------------------------------------------------------------
@@ -235,12 +229,10 @@ class CrayonBackend:
     def distribute(self, model, prompt_chunks):
         refs = [self.ray.spawn(rollout_task, model, chunk) for chunk in prompt_chunks]
         results = self.ray.get_batch(refs)
-        out = []
         for r in results:
             if isinstance(r, Exception):
                 raise r
-            out.append(r)
-        return out
+        return results
 
     def shutdown(self):
         pass  # crayon cleans up on GC

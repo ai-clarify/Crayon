@@ -4,10 +4,8 @@
 //! and actor handles. Python objects are serialized via `pickle` and stored in
 //! Crayon's object store as raw bytes.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
@@ -150,10 +148,6 @@ impl ActorHandle {
 struct Ray {
     inner: RustRay,
     runtime: Arc<tokio::runtime::Runtime>,
-    /// In-process object cache: ObjectID -> Python object.
-    /// Objects stored here are passed to workers by reference (zero copy),
-    /// bypassing pickle serialization. Only valid within this process.
-    local_objs: Arc<Mutex<HashMap<ObjectID, PyObject>>>,
 }
 
 #[pymethods]
@@ -196,11 +190,7 @@ impl Ray {
             }
         };
 
-        Ok(Ray {
-            inner,
-            runtime,
-            local_objs: Arc::new(Mutex::new(HashMap::new())),
-        })
+        Ok(Ray { inner, runtime })
     }
 
     /// Store a Python object in the object store. Returns an `ObjectRef`.
@@ -211,19 +201,17 @@ impl Ray {
         Ok(ObjectRef { inner: obj_ref })
     }
 
-    /// Store a Python object in the in-process local cache (no serialization).
+    /// Store a Python object in-process by reference (no serialization).
     ///
-    /// Unlike `put`, the object is NOT pickled or copied. Workers receive a
-    /// reference to the same Python object. This is dramatically faster for
-    /// large objects (model weights, big tensors) but only works within a
-    /// single process — Crayon's workers are in-process threads, so this is
-    /// the fast path for single-node RL. Ray cannot do this because its
-    /// workers are separate processes.
+    /// The object is stored in the object store's local slot — shared with
+    /// workers via `Arc`, zero copy. Only valid within a single process
+    /// (Crayon's workers are in-process threads). This is the fast path for
+    /// single-node RL: pass model weights, large tensors, etc. without
+    /// pickling. Ray cannot do this because its workers are separate processes.
     fn put_local(&self, value: &Bound<'_, PyAny>) -> PyResult<ObjectRef> {
         let id = ObjectID::new();
         let obj = value.clone().unbind();
-        self.local_objs.lock().insert(id, obj);
-        // Reserve a ref in the store for lifecycle tracking (no data stored).
+        self.inner.store().put_local(id, obj);
         let obj_ref = self.inner.store().reserve_ref::<Vec<u8>>(id);
         Ok(ObjectRef { inner: obj_ref })
     }
@@ -231,12 +219,11 @@ impl Ray {
     /// Fetch an object by reference. Blocks until the object is available.
     fn get(&self, obj_ref: &ObjectRef) -> PyResult<PyObject> {
         // Fast path: in-process local object — zero copy, no pickle.
-        if let Some(obj) = self.local_objs.lock().get(&obj_ref.inner.id) {
-            return Python::with_gil(|py| Ok(obj.clone_ref(py)));
+        if let Ok(local) = self.inner.store().get_local::<PyObject>(obj_ref.inner.id) {
+            return Python::with_gil(|py| Ok(local.as_ref().clone_ref(py)));
         }
         let inner = self.inner.clone();
         let obj_ref = obj_ref.inner.clone();
-        // Release the GIL while blocking so worker threads can run Python code.
         let bytes = Python::with_gil(|py| {
             py.allow_threads(|| {
                 self.runtime
@@ -248,63 +235,51 @@ impl Ray {
     }
 
     /// Fetch many objects concurrently. Returns a list of results.
+    /// Fetch many objects concurrently. Returns a list of results.
     fn get_batch(&self, obj_refs: &Bound<'_, PyList>) -> PyResult<PyObject> {
-        let local_objs = self.local_objs.clone();
-        let inner = self.inner.clone();
+        let store = self.inner.store();
+        let py = obj_refs.py();
 
-        // Split into local (zero-copy) and remote (store) refs.
-        let mut local_results: Vec<Option<PyObject>> = Vec::new();
+        // Pre-allocate results; local refs fill in-place, remote refs fetched later.
+        let mut results: Vec<Option<PyObject>> = Vec::with_capacity(obj_refs.len());
         let mut remote_refs: Vec<crayon_rs::common::ObjectRef<Vec<u8>>> = Vec::new();
-        let mut remote_indices: Vec<usize> = Vec::new();
+        let mut remote_positions: Vec<usize> = Vec::new();
 
         for (i, r) in obj_refs.iter().enumerate() {
             let r: ObjectRef = r.extract().unwrap();
-            if let Some(obj) = local_objs.lock().get(&r.inner.id) {
-                local_results.push(Some(obj.clone_ref(obj_refs.py())));
+            if let Ok(local) = store.get_local::<PyObject>(r.inner.id) {
+                results.push(Some(local.as_ref().clone_ref(py)));
             } else {
-                local_results.push(None);
+                results.push(None);
                 remote_refs.push(r.inner);
-                remote_indices.push(i);
+                remote_positions.push(i);
             }
         }
 
         // Fetch remote refs concurrently through the object store.
-        let remote_results = if remote_refs.is_empty() {
-            Vec::new()
-        } else {
-            Python::with_gil(|py| {
-                py.allow_threads(|| {
-                    self.runtime.block_on(async move {
-                        let ids: Vec<_> = remote_refs.iter().map(|r| r.id).collect();
-                        inner.store().get_batch::<Vec<u8>>(&ids).await
-                    })
+        if !remote_refs.is_empty() {
+            let inner = self.inner.clone();
+            let remote_results = py.allow_threads(|| {
+                self.runtime.block_on(async move {
+                    let ids: Vec<_> = remote_refs.iter().map(|r| r.id).collect();
+                    inner.store().get_batch::<Vec<u8>>(&ids).await
                 })
-            })
-        };
-
-        // Merge local + remote results back into order.
-        Python::with_gil(|py| {
-            let list = PyList::empty_bound(py);
-            let mut remote_idx = 0;
-            for local in local_results.iter() {
-                if let Some(obj) = local {
-                    list.append(obj.clone_ref(py))?;
-                } else {
-                    match &remote_results[remote_idx] {
-                        Ok(bytes) => {
-                            let obj = pickle_loads(py, bytes)?;
-                            list.append(obj)?;
-                        }
-                        Err(e) => {
-                            let err = PyRuntimeError::new_err(format!("{:?}", e));
-                            list.append(err)?;
-                        }
+            });
+            for (pos, res) in remote_positions.into_iter().zip(remote_results) {
+                match res {
+                    Ok(bytes) => results[pos] = Some(pickle_loads(py, &bytes)?),
+                    Err(e) => {
+                        results[pos] = Some(PyRuntimeError::new_err(format!("{:?}", e)).to_object(py));
                     }
-                    remote_idx += 1;
                 }
             }
-            Ok(list.unbind().into_any())
-        })
+        }
+
+        let list = PyList::empty_bound(py);
+        for obj in results.into_iter().flatten() {
+            list.append(obj)?;
+        }
+        Ok(list.unbind().into_any())
     }
 
     /// Run a Python callable as a remote task.
@@ -338,6 +313,7 @@ impl Ray {
         resources: Option<Resources>,
     ) -> PyResult<ObjectRef> {
         let func_obj = Arc::new(func.clone().unbind());
+        let store = self.inner.store();
 
         // Collect ObjectRef args into a Vec for Rust-side resolution.
         // Non-ObjectRef args are captured directly as Python objects.
@@ -346,11 +322,10 @@ impl Ray {
         let mut ref_args: Vec<crayon_rs::common::ObjectRef<Vec<u8>>> = Vec::new();
         let mut plain_args: Vec<PyObject> = Vec::new();
         let mut is_ref: Vec<bool> = Vec::new();
-        let local_objs = self.local_objs.lock();
         for arg in args.iter() {
             if let Ok(obj_ref) = arg.extract::<ObjectRef>() {
-                if let Some(local_obj) = local_objs.get(&obj_ref.inner.id) {
-                    plain_args.push(local_obj.clone_ref(args.py()));
+                if let Ok(local) = store.get_local::<PyObject>(obj_ref.inner.id) {
+                    plain_args.push(local.as_ref().clone_ref(args.py()));
                     is_ref.push(false);
                 } else {
                     ref_args.push(obj_ref.inner);
@@ -361,32 +336,23 @@ impl Ray {
                 is_ref.push(false);
             }
         }
-        drop(local_objs);
         let plain_args = Arc::new(plain_args);
 
         let inner = self.inner.clone();
         let res = resources.map(RustResources::from);
-        let obj_ref = match res {
-            None => inner.spawn(ref_args, move |resolved: Vec<Vec<u8>>| -> Vec<u8> {
-                run_task(
-                    func_obj.clone(),
-                    resolved,
-                    plain_args.clone(),
-                    is_ref.clone(),
-                )
-            }),
-            Some(res) => inner.spawn_with_resources(
-                ref_args,
-                res,
-                move |resolved: Vec<Vec<u8>>| -> Vec<u8> {
-                    run_task(
-                        func_obj.clone(),
-                        resolved,
-                        plain_args.clone(),
-                        is_ref.clone(),
-                    )
-                },
-            ),
+        // Single closure, branch only on the method call.
+        let run = move |resolved: Vec<Vec<u8>>| -> Vec<u8> {
+            run_task(
+                func_obj.clone(),
+                resolved,
+                plain_args.clone(),
+                is_ref.clone(),
+            )
+        };
+        let obj_ref = if let Some(res) = res {
+            inner.spawn_with_resources(ref_args, res, run)
+        } else {
+            inner.spawn(ref_args, run)
         };
 
         Ok(ObjectRef { inner: obj_ref })
@@ -485,20 +451,19 @@ fn run_task(
 ) -> Vec<u8> {
     Python::with_gil(|py| {
         let func = func_obj.bind(py);
-        let mut call_args: Vec<PyObject> = Vec::with_capacity(is_ref.len());
-        let mut ref_idx = 0;
-        let mut plain_idx = 0;
-        for &is_r in &is_ref {
-            if is_r {
-                let bytes = &resolved[ref_idx];
-                ref_idx += 1;
-                let obj = pickle_loads(py, bytes).expect("failed to unpickle task arg");
-                call_args.push(obj);
-            } else {
-                call_args.push(plain_args[plain_idx].clone_ref(py));
-                plain_idx += 1;
-            }
-        }
+        let mut resolved_iter = resolved.into_iter();
+        let mut plain_iter = plain_args.iter();
+        let call_args: Vec<PyObject> = is_ref
+            .iter()
+            .map(|&is_r| {
+                if is_r {
+                    let bytes = resolved_iter.next().expect("resolved arg missing");
+                    pickle_loads(py, &bytes).expect("failed to unpickle task arg")
+                } else {
+                    plain_iter.next().expect("plain arg missing").clone_ref(py)
+                }
+            })
+            .collect();
         let args_tuple = PyTuple::new_bound(py, &call_args);
         let result = func
             .call1(&args_tuple)

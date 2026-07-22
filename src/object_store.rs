@@ -36,6 +36,11 @@ struct Entry {
     /// Critical for `get_batch` and spill paths that would otherwise copy
     /// large RL objects (model weights, trajectories) multiple times.
     value: Option<bytes::Bytes>,
+    /// In-process local object: stored by reference (no serialization).
+    /// Used for single-node RL where workers are in-process threads and
+    /// can share large objects (model weights) without pickling.
+    /// Mutually exclusive with `value` — an entry is either local or serialized.
+    local: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// If set, the task that produces this object failed. `get` returns this
     /// error instead of waiting forever or returning garbage bytes.
     error: Option<CrayonError>,
@@ -134,6 +139,7 @@ impl ObjectStore {
         {
             let mut e = entry.lock();
             e.value = Some(bytes);
+            e.local = None; // bytes and local are mutually exclusive
             e.size_bytes = size;
             e.spilled = false;
             e.notify.notify_waiters();
@@ -441,6 +447,7 @@ impl ObjectStore {
             .or_insert_with(|| {
                 Arc::new(Mutex::new(Entry {
                     value: None,
+                    local: None,
                     error: None,
                     notify: Arc::new(Notify::new()),
                     refcount: Arc::new(AtomicUsize::new(0)),
@@ -451,6 +458,58 @@ impl ObjectStore {
                 }))
             })
             .clone()
+    }
+
+    /// Store an object in-process by reference (no serialization).
+    ///
+    /// The object is shared with workers via `Arc` — zero copy. Only valid
+    /// within a single process (Crayon's workers are in-process threads).
+    /// This is the fast path for single-node RL: pass model weights, large
+    /// tensors, etc. without pickling. Ray cannot do this because its workers
+    /// are separate processes.
+    ///
+    /// Use [`ObjectStore::get_local`] to retrieve. Falls back to serialized
+    /// bytes on cross-node access (not yet implemented).
+    pub fn put_local<T: Send + Sync + 'static>(&self, id: ObjectID, value: T) {
+        let entry = self.entry(id, None);
+        let mut e = entry.lock();
+        e.local = Some(Arc::new(value));
+        e.value = None;
+        e.size_bytes = 0;
+        e.notify.notify_waiters();
+    }
+
+    /// Retrieve an in-process local object by reference.
+    ///
+    /// Returns `Ok(Arc<T>)` if the object was stored via [`ObjectStore::put_local`],
+    /// `Err(ObjectNotFound)` if no entry exists, or `Err(NotLocal)` if the entry
+    /// exists but holds serialized bytes instead.
+    pub fn get_local<T: Send + Sync + 'static>(
+        &self,
+        id: ObjectID,
+    ) -> Result<Arc<T>, CrayonError> {
+        let map = self.inner.map.lock();
+        let entry = map
+            .get(&id)
+            .ok_or(CrayonError::ObjectNotFound(id))?;
+        let e = entry.lock();
+        match &e.local {
+            Some(local) => local
+                .clone()
+                .downcast::<T>()
+                .map_err(|_| CrayonError::Serialize("type mismatch in get_local".to_string())),
+            None => Err(CrayonError::ObjectNotFound(id)),
+        }
+    }
+
+    /// Returns true if the entry holds an in-process local object (no bytes).
+    pub fn is_local(&self, id: ObjectID) -> bool {
+        self.inner
+            .map
+            .lock()
+            .get(&id)
+            .map(|e| e.lock().local.is_some())
+            .unwrap_or(false)
     }
 }
 
