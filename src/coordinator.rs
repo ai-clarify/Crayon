@@ -1042,4 +1042,122 @@ mod tests {
         assert!(!state.waiting.contains(&blocked));
         assert_eq!(state.tasks[&blocked].state, TaskState::Cancelled);
     }
+
+    fn completion(fence: TaskFence, output: ObjectId) -> TaskCompletion {
+        TaskCompletion {
+            fence,
+            output_id: output,
+            codec: Codec::RawBytes,
+            size_bytes: 1,
+            checksum: crate::cluster::checksum(&[7]),
+            location: "127.0.0.1:9001".into(),
+            bytes: Some(vec![7].into()),
+        }
+    }
+
+    #[test]
+    fn release_reserved_output_is_rejected_then_task_completes() {
+        // Releasing a live task's still-Reserved output must be refused; otherwise
+        // the object is deleted and the task's completion panics on a missing key.
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        let (_, output) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+            .unwrap();
+        let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
+        assert_eq!(
+            state.release_object(output),
+            Err(Error::ObjectInUse(output))
+        );
+        state.started(&identity, assignment.fence).unwrap();
+        state
+            .complete(&identity, completion(assignment.fence, output))
+            .unwrap();
+        assert_eq!(state.tasks[&assignment.fence.task_id].state, TaskState::Succeeded);
+    }
+
+    #[test]
+    fn release_reclaims_terminal_task_and_object() {
+        // A released output must drop both the object and its now-terminal producer
+        // task, so the task table is not a lifetime-capped leak.
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        let (task, output) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+            .unwrap();
+        let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
+        state.started(&identity, assignment.fence).unwrap();
+        state
+            .complete(&identity, completion(assignment.fence, output))
+            .unwrap();
+        state.release_object(output).unwrap();
+        assert!(!state.tasks.contains_key(&task));
+        assert!(!state.objects.contains_key(&output));
+    }
+
+    #[test]
+    fn expired_worker_is_evicted() {
+        // Dead ephemeral workers must be removed, not left as Dead records that
+        // grow the map and inflate every submit's schedulability scan.
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let node = NodeId::new();
+        let _ = register(&mut state, node); // lease_deadline_ms = 0 + 100
+        let expired = state.expire_workers(200).unwrap();
+        assert_eq!(expired, vec![node]);
+        assert!(!state.workers.contains_key(&node));
+        assert!(!state.pending_deletes.contains_key(&node));
+    }
+
+    #[test]
+    fn cancellation_index_tracks_only_pending() {
+        // cancellation_for scans this index instead of the whole task table, so it
+        // must hold exactly the tasks awaiting a worker cancel ack.
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        let (task, _) = state
+            .submit(
+                descriptor().key.clone(),
+                vec![],
+                ResourceSet::cpu_gpu(1.0, 0.0).unwrap(),
+                1,
+            )
+            .unwrap();
+        state.assign_next(identity.node_id).unwrap().unwrap();
+        state.cancel(task).unwrap();
+        assert!(state.cancel_requested.contains(&task));
+        let fence = state.cancellation_for(&identity).unwrap().unwrap();
+        assert_eq!(fence.task_id, task);
+        state.acknowledge_cancel(&identity, fence).unwrap();
+        assert!(state.cancel_requested.is_empty());
+        assert_eq!(state.tasks[&task].state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn unknown_task_id_report_does_not_panic() {
+        // Worker reports for a task the coordinator never had must map to
+        // TaskNotFound, not a HashMap-index panic in the idempotent short-circuit.
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        let bogus = TaskFence {
+            task_id: TaskId::new(),
+            attempt: Attempt(1),
+            lease_id: LeaseId::new(),
+        };
+        assert!(matches!(
+            state.started(&identity, bogus),
+            Err(Error::TaskNotFound(_))
+        ));
+        assert!(matches!(
+            state.fail(&identity, bogus, "x".into(), false),
+            Err(Error::TaskNotFound(_))
+        ));
+        assert!(matches!(
+            state.acknowledge_cancel(&identity, bogus),
+            Err(Error::TaskNotFound(_))
+        ));
+        assert!(matches!(
+            state.complete(&identity, completion(bogus, ObjectId::new())),
+            Err(Error::TaskNotFound(_))
+        ));
+    }
 }

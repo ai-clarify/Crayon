@@ -877,8 +877,8 @@ mod tests {
         assert_eq!(results.len(), 6);
         let ok_count = MAX_OBJECT_BYTES / object_size;
         assert_eq!(results.iter().filter(|r| r.is_ok()).count(), ok_count);
-        assert!(matches!(results[0], Ok(_)));
-        assert!(matches!(results[1], Ok(_)));
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
         for result in &results[ok_count..] {
             assert!(matches!(result, Err(Error::CapacityExceeded(_))));
         }

@@ -25,7 +25,7 @@ const WORKER_POLL_WAIT_MS: u64 = 2_000;
 const INLINE_RESULT_MAX_BYTES: usize = 64 * 1024;
 
 fn usage() -> ! {
-    eprintln!("usage: crayon-cluster coordinator <addr> [lease-ms] | worker <coordinator> <advertise> [node-id] [cpu] [operations] | submit <coordinator> <a> <b> | submit-detach <coordinator> <operation> <value> [object-id] [cpu] [max-attempts] | status <coordinator> <task-id> | workers <coordinator> | cancel <coordinator> <task-id> | get <coordinator> <object-id>");
+    eprintln!("usage: crayon-cluster coordinator <addr> [lease-ms] | worker <coordinator> <advertise> [node-id] [cpu] [operations] | submit <coordinator> <a> <b> | submit-detach <coordinator> <operation> <value> [object-id] [cpu] [max-attempts] | status <coordinator> <task-id> | workers <coordinator> | cancel <coordinator> <task-id> | get <coordinator> <object-id> | release <coordinator> <object-id>");
     std::process::exit(2)
 }
 
@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("workers") => run_workers(&args).await?,
         Some("cancel") => run_cancel(&args).await?,
         Some("get") => run_get(&args).await?,
+        Some("release") => run_release(&args).await?,
         _ => usage(),
     }
     Ok(())
@@ -737,6 +738,14 @@ async fn run_get(args: &[String]) -> Result<(), Error> {
     let (_, bytes) = connected_client(coordinator).await?.get_bytes(id).await?;
     let value: u64 = bincode::deserialize(&bytes)?;
     println!("{value}");
+    Ok(())
+}
+
+async fn run_release(args: &[String]) -> Result<(), Error> {
+    let coordinator = args.get(2).unwrap_or_else(|| usage());
+    let id = ObjectId::from_str(args.get(3).unwrap_or_else(|| usage())).map_err(Error::Protocol)?;
+    connected_client(coordinator).await?.release(id).await?;
+    println!("released");
     Ok(())
 }
 

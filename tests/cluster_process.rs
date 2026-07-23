@@ -294,3 +294,66 @@ fn protocol_deadline_and_frame_limits_are_bounded() {
         .status
         .success());
 }
+
+#[test]
+fn release_of_running_output_is_rejected_and_coordinator_survives() {
+    // Releasing a still-Reserved output of a running task must be refused, not
+    // delete the object and panic the coordinator on the task's completion.
+    let mut cluster = Cluster::start(5_000);
+    cluster.worker("sleep", 1.0);
+    let (task, output) = cluster.submit("sleep", 1_500, None, 1.0, 1);
+    cluster.eventually(Duration::from_secs(10), || {
+        cluster.status(&task).contains("Running")
+    });
+    let release = cluster.run(["release", &cluster.coordinator, &output]);
+    assert!(!release.status.success());
+    assert!(String::from_utf8_lossy(&release.stderr).contains("ObjectInUse"));
+    // Coordinator is still alive and the task still finishes.
+    cluster.eventually(Duration::from_secs(10), || {
+        cluster.status(&task).contains("Succeeded")
+    });
+    assert!(cluster
+        .run(["workers", &cluster.coordinator])
+        .status
+        .success());
+}
+
+#[test]
+fn busy_worker_survives_release_of_owned_output() {
+    // A client release of a completed output owned by a busy worker returns a
+    // DeleteObject on the worker's in-task busy-poll. The worker must delete it
+    // locally and keep running; before the fix this fataled the worker and
+    // abandoned the task it was executing.
+    let mut cluster = Cluster::start(5_000);
+    cluster.worker("sleep", 1.0);
+    let (task_a, output_a) = cluster.submit("sleep", 100, None, 1.0, 1);
+    cluster.eventually(Duration::from_secs(10), || {
+        cluster.status(&task_a).contains("Succeeded")
+    });
+    let (task_b, _) = cluster.submit("sleep", 3_000, None, 1.0, 1);
+    cluster.eventually(Duration::from_secs(10), || {
+        cluster.status(&task_b).contains("Running")
+    });
+    let release = cluster.run(["release", &cluster.coordinator, &output_a]);
+    assert!(
+        release.status.success(),
+        "{}",
+        String::from_utf8_lossy(&release.stderr)
+    );
+    cluster.eventually(Duration::from_secs(15), || {
+        cluster.status(&task_b).contains("Succeeded")
+    });
+}
+
+#[test]
+fn dead_worker_is_evicted_from_registry() {
+    // An expired worker must be removed from the registry, not left as a Dead
+    // record that grows the map for every ephemeral per-task worker.
+    let mut cluster = Cluster::start(300);
+    let address = cluster.worker("sleep", 1.0);
+    let node = cluster.workers[0].node_id.clone();
+    cluster.kill_worker(&node);
+    cluster.eventually(Duration::from_secs(10), || {
+        !stdout(cluster.run(["workers", &cluster.coordinator])).contains(&address)
+    });
+}
