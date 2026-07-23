@@ -1,0 +1,37 @@
+crayon-py/Cargo.lock
+  s_41c334c91b145e::t_365a1b3c3be442 1-732
+crayon-py/Cargo.toml
+  s_41c334c91b145e::t_c0605390ee1e2f 1-16
+crayon-py/pyproject.toml
+  s_2afa39eac5045a::t_219702c247c008 1-12
+crayon-py/src/lib.rs
+  s_41c334c91b145e::t_4eb6c752981857 1-253
+src/client.rs
+  s_41c334c91b145e::t_d155048485f27d 274-299
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f414a8e2a64a81b84c9dd3818004dd574b37485f",
+  "prompts": {},
+  "sessions": {
+    "s_2afa39eac5045a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5cdd2e04-b710-4054-9fce-eb8e05e76006",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_41c334c91b145e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5b548f5-e223-437a-a200-0fc66030f3de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
