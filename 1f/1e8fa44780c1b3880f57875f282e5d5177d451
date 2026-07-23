@@ -1,0 +1,25 @@
+Cargo.lock
+  s_549c9bc8bea5f9::t_b1a245486d706b 1-544
+Cargo.toml
+  s_549c9bc8bea5f9::t_24bad5d7a35bfb 7,23,28-31
+src/bin/crayon_cluster.rs
+  s_549c9bc8bea5f9::t_c71057c40a07c7 75-78,81-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1f1e8fa44780c1b3880f57875f282e5d5177d451",
+  "prompts": {},
+  "sessions": {
+    "s_549c9bc8bea5f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6970588b-ad57-4997-95fe-11a138746c2e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
