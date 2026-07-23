@@ -1,0 +1,23 @@
+RELEASE_NOTES.md
+  s_549c9bc8bea5f9::t_d538716bf98959 1-51
+docker-compose.yml
+  s_549c9bc8bea5f9::t_7137c5d35e7d31 17-21,25-28,30-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "16420fd49f2300aaeb408014a9c82a53ef89486b",
+  "prompts": {},
+  "sessions": {
+    "s_549c9bc8bea5f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6970588b-ad57-4997-95fe-11a138746c2e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
