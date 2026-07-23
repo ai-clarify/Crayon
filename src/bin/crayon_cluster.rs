@@ -230,8 +230,16 @@ async fn run_worker(
                 )
                 .await?;
             }
-            RpcReply::Worker(WorkerReply::Error(error)) => return Err(error),
-            _ => return Err(Error::Protocol("unexpected poll reply".into())),
+            RpcReply::Worker(WorkerReply::Error(error)) => {
+                eprintln!("worker poll error reply: {error}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            _ => {
+                eprintln!("worker unexpected poll reply");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
         }
     }
 }
