@@ -106,6 +106,8 @@ pub struct CoordinatorState {
     /// Tasks in `Waiting` state, so dependency reconciliation visits only blocked
     /// tasks instead of the whole table.
     waiting: HashSet<TaskId>,
+    /// Tasks in `CancelRequested`; lets `cancellation_for` skip its scan at 0.
+    cancel_requested: usize,
 }
 impl CoordinatorState {
     pub fn new(epoch: CoordinatorEpoch) -> Self {
@@ -119,6 +121,7 @@ impl CoordinatorState {
             pending_deletes: HashMap::new(),
             runnable: VecDeque::new(),
             waiting: HashSet::new(),
+            cancel_requested: 0,
         }
     }
     fn changed(&mut self) {
@@ -567,6 +570,7 @@ impl CoordinatorState {
                 let output = task.output;
                 if task.state == TaskState::CancelRequested {
                     task.state = TaskState::Cancelled;
+                    self.cancel_requested = self.cancel_requested.saturating_sub(1);
                     self.objects.get_mut(&output).unwrap().state = ObjectState::Cancelled;
                 } else if task.attempt.0 < task.max_attempts {
                     self.mark_runnable(id);
@@ -590,6 +594,9 @@ impl CoordinatorState {
     }
     pub fn cancellation_for(&self, identity: &WorkerIdentity) -> Result<Option<TaskFence>, Error> {
         self.check_identity(identity)?;
+        if self.cancel_requested == 0 {
+            return Ok(None);
+        }
         Ok(self.tasks.values().find_map(|task| {
             let (node, epoch, session, lease_id) = task.assigned?;
             (node == identity.node_id
@@ -625,6 +632,7 @@ impl CoordinatorState {
         let task = self.tasks.get_mut(&fence.task_id).unwrap();
         task.state = TaskState::Cancelled;
         task.assigned = None;
+        self.cancel_requested = self.cancel_requested.saturating_sub(1);
         self.objects.get_mut(&output).unwrap().state = ObjectState::Cancelled;
         self.reconcile_dependencies();
         self.changed();
@@ -642,10 +650,10 @@ impl CoordinatorState {
         let output = task.output;
         if task.assigned.is_some() {
             self.tasks.get_mut(&id).unwrap().state = TaskState::CancelRequested;
+            self.cancel_requested += 1;
         } else {
             self.tasks.get_mut(&id).unwrap().state = TaskState::Cancelled;
-            // Drop from the waiting index if it was blocked; a stale runnable
-            // queue entry is skipped by assign_next on pop.
+            // stale runnable-queue entry is skipped by assign_next on pop
             self.waiting.remove(&id);
             self.objects.get_mut(&output).unwrap().state = ObjectState::Cancelled;
             self.reconcile_dependencies();

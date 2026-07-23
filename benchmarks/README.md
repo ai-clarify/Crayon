@@ -65,6 +65,26 @@ outweigh the added parallelism. The advantage therefore widens with scale: 2.9×
 at one worker, 6.1× at sixteen, with the trend pointing higher on a real
 multi-node cluster where per-task central-scheduler cost dominates.
 
+## Scaling with per-task compute
+
+Fixed config (`--workers 4 --parallelism 16 --iterations 1000 --policy-dim 32`),
+varying `--steps` to make each rollout heavier, on the Xeon host:
+
+| steps/task | Crayon total | Ray total | speed-up | saved / 1000 iters |
+|-----------:|-------------:|----------:|---------:|-------------------:|
+|          1 |       3.60 s |    7.96 s |    2.2×  |             4.4 s  |
+|        100 |       3.61 s |    8.28 s |    2.3×  |             4.7 s  |
+|        500 |       3.68 s |    9.30 s |    2.5×  |             5.6 s  |
+|       2000 |       3.65 s |   12.07 s |    3.3×  |             8.4 s  |
+
+Crayon's wall-clock is **flat** as the task gets heavier (3.60 → 3.65 s) because
+its four workers run rollouts in true parallel. Ray gets **linearly slower**
+(7.96 → 12.07 s): its Python scheduling layer and the GIL serialize even the
+compute, so heavier tasks are not fully parallelized. The consequence is
+counter-intuitive but measured — **the heavier the per-task compute, the larger
+Crayon's end-to-end advantage** (3.3× at steps=2000), the opposite of a
+framework whose only edge is scheduling overhead.
+
 ## Why Crayon is faster here
 
 The workload is control-plane-bound: tasks are tiny (~0.5 ms) and numerous, so

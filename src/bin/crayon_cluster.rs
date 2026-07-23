@@ -415,7 +415,9 @@ async fn execute_assignment(
     let execution_registry = registry.clone();
     let mut execution =
         tokio::spawn(async move { execution_registry.execute(&operation, inputs).await });
-    let mut poll = tokio::time::interval(Duration::from_millis(50));
+    // first tick at +50ms, not t=0, so sub-50ms tasks skip the busy-poll entirely
+    let start = tokio::time::Instant::now() + Duration::from_millis(50);
+    let mut poll = tokio::time::interval_at(start, Duration::from_millis(50));
     let result = loop {
         tokio::select! {
             result = &mut execution => break Some(match result {

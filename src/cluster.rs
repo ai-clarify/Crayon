@@ -51,6 +51,8 @@ struct ReplayEntry {
 pub struct CoordinatorServer {
     pub cluster_id: ClusterId,
     pub state: Arc<Mutex<CoordinatorState>>,
+    /// Lock-free copy of the write-once state epoch, for epoch fencing.
+    epoch: CoordinatorEpoch,
     lease_ms: u64,
     connections: Arc<Semaphore>,
     replay: Arc<Mutex<HashMap<RequestId, ReplayEntry>>>,
@@ -61,9 +63,12 @@ pub struct CoordinatorServer {
 }
 impl CoordinatorServer {
     pub fn new(cluster_id: ClusterId, lease_ms: u64) -> Self {
+        // one epoch for both state and the hoisted copy
+        let epoch = CoordinatorEpoch::new();
         Self {
             cluster_id,
-            state: Arc::new(Mutex::new(CoordinatorState::new(CoordinatorEpoch::new()))),
+            state: Arc::new(Mutex::new(CoordinatorState::new(epoch))),
+            epoch,
             lease_ms,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             replay: Arc::new(Mutex::new(HashMap::new())),
@@ -222,7 +227,7 @@ impl CoordinatorServer {
     }
     fn validate_epoch(&self, envelope: &Envelope) -> Result<(), Error> {
         match envelope.coordinator_epoch {
-            Some(epoch) if epoch == self.state.lock().epoch => Ok(()),
+            Some(epoch) if epoch == self.epoch => Ok(()),
             Some(_) => Err(Error::StaleEpoch),
             None => Err(Error::Protocol(
                 "mutation requires coordinator epoch".into(),
@@ -326,7 +331,7 @@ impl CoordinatorServer {
             }),
             RpcRequest::Client(request) => RpcReply::Client(match request {
                 ClientRequest::Connect => ClientReply::Connected {
-                    coordinator_epoch: self.state.lock().epoch,
+                    coordinator_epoch: self.epoch,
                 },
                 ClientRequest::Put { codec, bytes } => {
                     if bytes.len() > MAX_OBJECT_BYTES {
