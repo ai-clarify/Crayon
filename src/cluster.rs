@@ -99,7 +99,11 @@ impl CoordinatorServer {
             }
         });
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, _) = tokio::select! {
+                accepted = listener.accept() => accepted?,
+                // SIGTERM/SIGINT: stop accepting and fall through to drain.
+                _ = shutdown_signal() => break,
+            };
             let permit = match self.connections.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => continue,
@@ -111,6 +115,12 @@ impl CoordinatorServer {
                 let _ = server.handle(stream).await;
             });
         }
+        // Graceful drain: no longer accepting, wait for in-flight handlers to
+        // finish (each holds a connection permit) up to a bounded deadline, then
+        // exit cleanly instead of being hard-killed mid-request.
+        let drain = self.connections.acquire_many(MAX_CONNECTIONS as u32);
+        let _ = tokio::time::timeout(Duration::from_secs(10), drain).await;
+        Ok(())
     }
     async fn handle(&self, mut stream: TcpStream) -> Result<(), Error> {
         let envelope = timeout_io(read_frame::<Envelope>(&mut stream))
@@ -338,8 +348,8 @@ impl CoordinatorServer {
                     identity,
                     fence,
                     message,
-                    retryable,
-                } => match self.state.lock().fail(&identity, fence, message, retryable) {
+                    class,
+                } => match self.state.lock().fail(&identity, fence, message, class) {
                     Ok(()) => WorkerReply::Accepted,
                     Err(error) => WorkerReply::Error(error),
                 },
@@ -636,6 +646,30 @@ pub fn now_ms() -> u64 {
 }
 pub fn checksum(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
+}
+/// Completes on the first shutdown signal: SIGTERM or SIGINT on Unix, Ctrl-C
+/// elsewhere. Drives the coordinator's graceful drain.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(term) => term,
+                // Cannot install SIGTERM (rare): fall back to Ctrl-C only.
+                Err(_) => {
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(test)]

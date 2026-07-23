@@ -13,7 +13,7 @@ categories = ["concurrency"]
 name = "crayon"
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "signal"] }
 serde = { version = "1", features = ["derive", "rc"] }
 bincode = "1"
 blake3 = "1"

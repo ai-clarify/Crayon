@@ -253,6 +253,15 @@ pub enum ClientReply {
     Released,
     Error(Error),
 }
+/// Why a task attempt failed, so the coordinator owns the retry decision instead
+/// of trusting a bare worker-supplied bool. `Permanent` failures (e.g. an
+/// operation panic) are never retried even if attempts remain; `Transient`
+/// failures (infra, missing input) retry up to `max_attempts`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FailureClass {
+    Transient,
+    Permanent,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerRequest {
     Register(RegisterWorker),
@@ -280,7 +289,7 @@ pub enum WorkerRequest {
         identity: WorkerIdentity,
         fence: TaskFence,
         message: String,
-        retryable: bool,
+        class: FailureClass,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -6,22 +6,24 @@ use crate::{
     },
     operation::{Codec, OperationDescriptor, OperationKey, TaskArg},
     protocol::{
-        RegisterWorker, TaskAssignment, TaskCompletion, TaskFence, TaskStatus, WorkerIdentity,
+        FailureClass, RegisterWorker, TaskAssignment, TaskCompletion, TaskFence, TaskStatus,
+        WorkerIdentity,
     },
     resources::ResourceSet,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 pub const MAX_TASKS: usize = 16_384;
 pub const MAX_OBJECTS: usize = 65_536;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkerState {
     Alive,
     Dead,
 }
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskState {
     Waiting,
     Runnable,
@@ -46,7 +48,7 @@ impl From<&TaskState> for TaskStatus {
         }
     }
 }
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ObjectState {
     Reserved,
     Available,
@@ -54,7 +56,7 @@ pub enum ObjectState {
     Cancelled,
     Lost,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub identity: WorkerIdentity,
     pub state: WorkerState,
@@ -66,7 +68,7 @@ pub struct WorkerRecord {
     pub operations: HashMap<OperationKey, OperationDescriptor>,
     pub lease_deadline_ms: u64,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub id: TaskId,
     pub operation: OperationKey,
@@ -78,11 +80,15 @@ pub struct TaskRecord {
     pub state: TaskState,
     pub assigned: Option<(NodeId, WorkerEpoch, WorkerSessionId, LeaseId)>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectRecord {
     pub id: ObjectId,
     pub state: ObjectState,
     pub codec: Option<Codec>,
+    // A durability snapshot persists the control-plane graph, not the object
+    // payloads (worker-local / re-derivable via lineage), so bytes are skipped —
+    // which also keeps the state serde-clean without serde's `rc` feature.
+    #[serde(skip)]
     pub bytes: Option<Arc<[u8]>>,
     pub size_bytes: Option<u64>,
     pub checksum: Option<[u8; 32]>,
@@ -91,6 +97,7 @@ pub struct ObjectRecord {
     pub ref_count: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinatorState {
     pub epoch: CoordinatorEpoch,
     pub revision: Revision,
@@ -383,22 +390,52 @@ impl CoordinatorState {
         }
         // Pop runnable ids, skipping stale entries and re-queuing tasks this
         // worker can't serve. Bounded by the runnable count, not the task table.
-        let (workers, runnable, tasks) = (&self.workers, &mut self.runnable, &self.tasks);
+        let (workers, runnable, tasks, objects) =
+            (&self.workers, &mut self.runnable, &self.tasks, &self.objects);
         let worker = &workers[&node_id];
-        let mut requeue: Vec<TaskId> = Vec::new();
+        // Prefer a runnable task whose input objects this worker already owns, so a
+        // downstream task runs where its inputs are local instead of refetching them
+        // across the network. Bounded look-ahead keeps the hot path cheap; with no
+        // local match it falls back to the first servable task in FIFO order.
+        const LOCALITY_LOOKAHEAD: usize = 16;
+        let mut requeue: Vec<TaskId> = Vec::new(); // not servable by this worker
+        let mut passed: Vec<TaskId> = Vec::new(); // servable, not local; keep FIFO priority
         let mut chosen = None;
+        let mut looked = 0;
         while let Some(id) = runnable.pop_front() {
             let Some(task) = tasks.get(&id) else { continue };
             if task.state != TaskState::Runnable {
                 continue;
             }
-            if worker.operations.contains_key(&task.operation)
-                && worker.available.can_fit(&task.resources)
+            if !(worker.operations.contains_key(&task.operation)
+                && worker.available.can_fit(&task.resources))
             {
+                requeue.push(id);
+                continue;
+            }
+            let local = task.args.iter().any(|arg| {
+                matches!(arg, TaskArg::Object(oid)
+                    if objects.get(oid).and_then(|object| object.owner) == Some(node_id))
+            });
+            if local {
                 chosen = Some(id);
                 break;
             }
-            requeue.push(id);
+            passed.push(id);
+            looked += 1;
+            if looked >= LOCALITY_LOOKAHEAD {
+                break;
+            }
+        }
+        if chosen.is_none() {
+            chosen = passed.first().copied();
+        }
+        // Servable-but-passed-over tasks go back to the front (FIFO priority kept);
+        // tasks this worker cannot serve go to the back, as before.
+        for id in passed.into_iter().rev() {
+            if Some(id) != chosen {
+                self.runnable.push_front(id);
+            }
         }
         for id in requeue {
             self.runnable.push_back(id);
@@ -533,7 +570,7 @@ impl CoordinatorState {
         identity: &WorkerIdentity,
         fence: TaskFence,
         message: String,
-        retryable: bool,
+        class: FailureClass,
     ) -> Result<(), Error> {
         // Idempotent: a duplicate failure report for an already-terminal task
         // is accepted so workers can safely retry reports. Look up first so an
@@ -558,7 +595,10 @@ impl CoordinatorState {
             ));
         }
         let resources = self.tasks[&fence.task_id].resources.clone();
-        let retry = retryable
+        // Coordinator-owned retry policy: only Transient failures retry, and only
+        // while attempts remain. A Permanent failure (e.g. an operation panic) is
+        // terminal even if attempts are left, so a crashing op is not retried.
+        let retry = matches!(class, FailureClass::Transient)
             && self.tasks[&fence.task_id].attempt.0 < self.tasks[&fence.task_id].max_attempts;
         let output = self.tasks[&fence.task_id].output;
         self.release(identity.node_id, &resources)?;
@@ -925,7 +965,7 @@ mod tests {
             .unwrap();
         let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
         state
-            .fail(&identity, assignment.fence, "boom".into(), false)
+            .fail(&identity, assignment.fence, "boom".into(), FailureClass::Permanent)
             .unwrap();
         assert!(matches!(state.tasks[&second].state, TaskState::Failed(_)));
         assert!(matches!(state.tasks[&third].state, TaskState::Failed(_)));
@@ -961,7 +1001,7 @@ mod tests {
             .unwrap();
         let first = state.assign_next(identity.node_id).unwrap().unwrap();
         state
-            .fail(&identity, first.fence, "retry".into(), true)
+            .fail(&identity, first.fence, "retry".into(), FailureClass::Transient)
             .unwrap();
         let second = state.assign_next(identity.node_id).unwrap().unwrap();
         assert_ne!(first.fence.attempt, second.fence.attempt);
@@ -1148,7 +1188,7 @@ mod tests {
             Err(Error::TaskNotFound(_))
         ));
         assert!(matches!(
-            state.fail(&identity, bogus, "x".into(), false),
+            state.fail(&identity, bogus, "x".into(), FailureClass::Transient),
             Err(Error::TaskNotFound(_))
         ));
         assert!(matches!(
@@ -1159,5 +1199,69 @@ mod tests {
             state.complete(&identity, completion(bogus, ObjectId::new())),
             Err(Error::TaskNotFound(_))
         ));
+    }
+
+    #[test]
+    fn permanent_failure_is_not_retried_despite_remaining_attempts() {
+        // A Permanent failure (e.g. an operation panic) is terminal even with
+        // attempts left; only Transient failures retry.
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        let (task, _) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 3)
+            .unwrap();
+        let a = state.assign_next(identity.node_id).unwrap().unwrap();
+        state
+            .fail(&identity, a.fence, "boom".into(), FailureClass::Permanent)
+            .unwrap();
+        assert!(matches!(state.tasks[&task].state, TaskState::Failed(_)));
+        // A Transient failure with attempts left retries instead.
+        let (task2, _) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 3)
+            .unwrap();
+        let b = state.assign_next(identity.node_id).unwrap().unwrap();
+        state
+            .fail(&identity, b.fence, "flaky".into(), FailureClass::Transient)
+            .unwrap();
+        assert_eq!(state.tasks[&task2].state, TaskState::Runnable);
+    }
+
+    #[test]
+    fn assign_prefers_a_task_with_local_inputs() {
+        // A worker that already owns an object should get the downstream task that
+        // consumes it, even when a non-local task sits ahead in the FIFO queue.
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        // Produce object O on this worker.
+        let (_, output) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+            .unwrap();
+        let a = state.assign_next(identity.node_id).unwrap().unwrap();
+        state.started(&identity, a.fence).unwrap();
+        state
+            .complete(&identity, completion(a.fence, output))
+            .unwrap();
+        // Enqueue a non-local task first, then a local one that consumes O.
+        let (non_local, _) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+            .unwrap();
+        let (local, _) = state
+            .submit(
+                descriptor().key.clone(),
+                vec![TaskArg::Object(output)],
+                ResourceSet::default(),
+                1,
+            )
+            .unwrap();
+        let picked = state.assign_next(identity.node_id).unwrap().unwrap();
+        assert_eq!(picked.fence.task_id, local);
+        assert_ne!(picked.fence.task_id, non_local);
+        // The non-local task keeps its place and is served next.
+        state.started(&identity, picked.fence).unwrap();
+        state
+            .complete(&identity, completion(picked.fence, state.tasks[&local].output))
+            .unwrap();
+        let next = state.assign_next(identity.node_id).unwrap().unwrap();
+        assert_eq!(next.fence.task_id, non_local);
     }
 }

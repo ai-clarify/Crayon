@@ -8,8 +8,9 @@ use crayon::{
     ids::{ClusterId, NodeId, ObjectId, TaskId, WorkerEpoch},
     operation::{Codec, OperationDescriptor, OperationKey, TaskArg},
     protocol::{
-        ClientReply, ClientRequest, Envelope, ObjectPayload, RegisterWorker, RpcReply, RpcRequest,
-        TaskAssignment, TaskCompletion, WorkerIdentity, WorkerReply, WorkerRequest,
+        ClientReply, ClientRequest, Envelope, FailureClass, ObjectPayload, RegisterWorker,
+        RpcReply, RpcRequest, TaskAssignment, TaskCompletion, WorkerIdentity, WorkerReply,
+        WorkerRequest,
     },
     resources::ResourceSet,
     worker::OperationRegistry,
@@ -418,7 +419,7 @@ async fn execute_assignment(
                     identity: identity.clone(),
                     fence: assignment.fence,
                     message: error.to_string(),
-                    retryable: true,
+                    class: FailureClass::Transient,
                 },
                 epoch,
             )
@@ -436,11 +437,17 @@ async fn execute_assignment(
     let result = loop {
         tokio::select! {
             result = &mut execution => break Some(match result {
-                Ok(value) => value,
-                Err(join_error) if join_error.is_panic() => Err(Error::Protocol(
-                    "operation panicked".into(),
+                // An operation error is treated as Transient (may succeed on retry);
+                // a panic is Permanent — retrying a crashing op just burns attempts.
+                Ok(value) => value.map_err(|error| (error, FailureClass::Transient)),
+                Err(join_error) if join_error.is_panic() => Err((
+                    Error::Protocol("operation panicked".into()),
+                    FailureClass::Permanent,
                 )),
-                Err(_) => Err(Error::Protocol("operation task aborted".into())),
+                Err(_) => Err((
+                    Error::Protocol("operation task aborted".into()),
+                    FailureClass::Transient,
+                )),
             }),
             _ = poll.tick() => {
                 // Busy worker: a non-blocking poll (wait_ms 0) purely to observe
@@ -509,14 +516,14 @@ async fn execute_assignment(
             )
             .await
         }
-        Err(error) => {
+        Err((error, class)) => {
             report(
                 coordinator,
                 WorkerRequest::Failed {
                     identity: identity.clone(),
                     fence: assignment.fence,
                     message: error.to_string(),
-                    retryable: true,
+                    class,
                 },
                 epoch,
             )

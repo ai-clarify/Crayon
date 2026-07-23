@@ -357,3 +357,42 @@ fn dead_worker_is_evicted_from_registry() {
         !stdout(cluster.run(["workers", &cluster.coordinator])).contains(&address)
     });
 }
+
+#[test]
+fn coordinator_exits_cleanly_on_sigterm() {
+    // SIGTERM must trigger a graceful drain and a clean exit; without a handler
+    // the default signal action terminates the process (non-success status).
+    let binary = env!("CARGO_BIN_EXE_crayon-cluster");
+    let addr = format!("127.0.0.1:{}", free_port());
+    let mut child = Command::new(binary)
+        .args(["coordinator", &addr, "5000"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !Command::new(binary)
+        .args(["workers", &addr])
+        .output()
+        .unwrap()
+        .status
+        .success()
+    {
+        assert!(Instant::now() < deadline, "coordinator never came up");
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            assert!(exit.success(), "coordinator did not exit cleanly on SIGTERM: {exit:?}");
+            return;
+        }
+        assert!(Instant::now() < deadline, "coordinator did not drain/exit on SIGTERM in 12s");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
