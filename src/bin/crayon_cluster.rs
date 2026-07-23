@@ -144,15 +144,23 @@ async fn run_worker(
         slots: 1,
         operations: registry.descriptors(),
     };
-    let registered = match rpc(
-        coordinator,
-        RpcRequest::Worker(WorkerRequest::Register(registration)),
-        None,
-    )
-    .await?
-    {
-        RpcReply::Worker(WorkerReply::Registered(value)) => value,
-        other => return Err(Error::Protocol(format!("registration failed: {other:?}"))),
+    let registered = 'register: loop {
+        match rpc(
+            coordinator,
+            RpcRequest::Worker(WorkerRequest::Register(registration.clone())),
+            None,
+        )
+        .await
+        {
+            Ok(RpcReply::Worker(WorkerReply::Registered(value))) => break 'register value,
+            Ok(other) => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                return Err(Error::Protocol(format!("registration failed: {other:?}")));
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     };
     let identity = registered.identity;
     let heartbeat_identity = identity.clone();
