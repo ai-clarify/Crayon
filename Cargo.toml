@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 description = "A small coordinator-based distributed task runtime"
 license = "MIT"
-repository = "https://github.com/cklxx/crayon"
+repository = "https://github.com/ai-clarify/Crayon"
 readme = "README.md"
 keywords = ["distributed", "task", "scheduler", "rust"]
 categories = ["concurrency"]
@@ -20,7 +20,12 @@ blake3 = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 parking_lot = "0.12"
 futures = "0.3"
+serde_json = "1"
 
 [[bin]]
 name = "crayon-cluster"
 path = "src/bin/crayon_cluster.rs"
+
+[[bin]]
+name = "cluster-benchmark"
+path = "src/bin/cluster_benchmark.rs"

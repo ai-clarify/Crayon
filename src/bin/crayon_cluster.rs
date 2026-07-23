@@ -72,11 +72,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn builtin_descriptor(name: &str) -> OperationDescriptor {
+    let (input_codec, output_codec, max_inline_arg_bytes) = match name {
+        "copy" => (Codec::RawBytes, Codec::RawBytes, 64 * 1024),
+        _ => (Codec::BincodeV1, Codec::BincodeV1, 1024),
+    };
     OperationDescriptor {
         key: OperationKey::new("builtin", name, 1),
-        input_codec: Codec::BincodeV1,
-        output_codec: Codec::BincodeV1,
-        max_inline_arg_bytes: 1024,
+        input_codec,
+        output_codec,
+        max_inline_arg_bytes,
     }
 }
 

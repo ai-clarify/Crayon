@@ -170,10 +170,12 @@ impl ClusterClient {
 
     pub async fn get<T: DeserializeOwned>(&self, reference: &ObjectRef<T>) -> Result<T, Error> {
         let (codec, bytes) = self.get_bytes(reference.id).await?;
-        if codec != Codec::BincodeV1 {
-            return Err(Error::ObjectConflict(reference.id));
+        match codec {
+            Codec::BincodeV1 => Ok(bincode::deserialize(&bytes)?),
+            _ => Err(Error::Protocol(format!(
+                "unsupported codec for get: {codec:?}"
+            ))),
         }
-        Ok(bincode::deserialize(&bytes)?)
     }
     pub async fn cancel(&self, task_id: TaskId) -> Result<(), Error> {
         match self.rpc(ClientRequest::Cancel(task_id)).await? {
@@ -229,6 +231,21 @@ impl<T: DeserializeOwned> TaskHandle<T> {
                 .map_err(|_| Error::DeadlineExceeded)??;
             match status.state {
                 TaskStatus::Succeeded => {
+                    for _ in 0..5 {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err(Error::DeadlineExceeded);
+                        }
+                        match tokio::time::timeout(remaining, self.client.get(&self.output)).await {
+                            Ok(Ok(value)) => return Ok(value),
+                            Ok(Err(Error::ObjectConflict(_) | Error::Protocol(_))) => {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            Ok(Err(error)) => return Err(error),
+                            Err(_) => return Err(Error::DeadlineExceeded),
+                        }
+                    }
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
                         return Err(Error::DeadlineExceeded);

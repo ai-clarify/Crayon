@@ -1,5 +1,4 @@
 target
-Cargo.lock
 *.whl
 .venv
 __pycache__/
