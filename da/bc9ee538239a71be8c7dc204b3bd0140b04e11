@@ -1,0 +1,21 @@
+src/arena.rs
+  s_2afa39eac5045a::t_78225506c0c74b 20-24,84-88,293-320
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dabc9ee538239a71be8c7dc204b3bd0140b04e11",
+  "prompts": {},
+  "sessions": {
+    "s_2afa39eac5045a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5cdd2e04-b710-4054-9fce-eb8e05e76006",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
