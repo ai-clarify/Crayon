@@ -44,6 +44,27 @@ accumulate — so the run length is unbounded. On the Xeon host this workload wa
 6.1× *slower* than Ray before the 0.3.0 control-plane rewrite; it is now 2.5×
 faster — a ~15× swing on the same hardware.
 
+## Scaling with worker count
+
+Control-plane-bound sweep (`--parallelism 32 --iterations 150 --steps 1
+--policy-dim 8`), one worker process per logical node, on the Xeon host. This
+isolates scheduler overhead: the task itself is nearly free, so throughput
+tracks how well each system's control plane scales with node count.
+
+| workers | Crayon (ep/s) | Ray 2.56 (ep/s) | Crayon advantage |
+|--------:|--------------:|----------------:|-----------------:|
+|       1 |          2764 |             958 |            2.9×  |
+|       4 |          5687 |            1972 |            2.9×  |
+|       8 |          6854 |            1587 |            4.3×  |
+|      16 |          6785 |            1120 |            6.1×  |
+
+Crayon rises with worker count and saturates at the host's core count (8), then
+holds. **Ray peaks at 4 workers and then regresses** — adding workers makes it
+slower, as central (GCS + Python) scheduling contention and plasma pressure
+outweigh the added parallelism. The advantage therefore widens with scale: 2.9×
+at one worker, 6.1× at sixteen, with the trend pointing higher on a real
+multi-node cluster where per-task central-scheduler cost dominates.
+
 ## Why Crayon is faster here
 
 The workload is control-plane-bound: tasks are tiny (~0.5 ms) and numerous, so
