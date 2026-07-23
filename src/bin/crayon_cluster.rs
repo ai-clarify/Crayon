@@ -154,14 +154,16 @@ async fn run_worker(
         {
             Ok(RpcReply::Worker(WorkerReply::Registered(value))) => break 'register value,
             Ok(other) => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                eprintln!("worker registration failed: {other:?}");
                 return Err(Error::Protocol(format!("registration failed: {other:?}")));
             }
-            Err(_) => {
+            Err(error) => {
+                eprintln!("worker registration rpc error: {error}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     };
+    eprintln!("worker registered successfully");
     let identity = registered.identity;
     let heartbeat_identity = identity.clone();
     let heartbeat_coordinator = coordinator.to_string();
@@ -197,7 +199,10 @@ async fn run_worker(
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                eprintln!("worker poll rpc error: {error}");
+                return Err(error);
+            }
         };
         match poll_reply {
             RpcReply::Worker(WorkerReply::Assignment(Some(assignment))) => {
