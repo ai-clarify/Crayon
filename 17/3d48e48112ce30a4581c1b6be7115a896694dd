@@ -1,0 +1,25 @@
+benchmarks/crayon_llm_rl.py
+  s_41c334c91b145e::t_75f2e66aebd7e3 1-222
+benchmarks/llm_sidecar.py
+  s_41c334c91b145e::t_4909ee63dc1194 1-140
+src/bin/crayon_cluster.rs
+  s_41c334c91b145e::t_49e50fcac9dfbe 140-251,310-374
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "173d48e48112ce30a4581c1b6be7115a896694dd",
+  "prompts": {},
+  "sessions": {
+    "s_41c334c91b145e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5b548f5-e223-437a-a200-0fc66030f3de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
