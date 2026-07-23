@@ -1,0 +1,25 @@
+Cargo.toml
+  s_41c334c91b145e::t_905aa429edc5b8 32-35
+benchmarks/ray_storage_benchmark.py
+  s_41c334c91b145e::t_fa3d3ce2129755 1-76
+src/bin/storage_benchmark.rs
+  s_41c334c91b145e::t_33a50537f0c030 1-258
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b7f011e788d17035421bc37a60f45eba9ac950e2",
+  "prompts": {},
+  "sessions": {
+    "s_41c334c91b145e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5b548f5-e223-437a-a200-0fc66030f3de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
