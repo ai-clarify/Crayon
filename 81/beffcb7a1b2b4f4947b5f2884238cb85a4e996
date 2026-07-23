@@ -1,0 +1,35 @@
+AGENTS.md
+  s_41c334c91b145e::t_fd4a16fd74047c 1-65
+CLAUDE.md
+  s_41c334c91b145e::t_07ca761c675f8d 1
+src/arena.rs
+  s_2afa39eac5045a::t_0f40292ee832ff 266
+src/bin/storage_benchmark.rs
+  s_2afa39eac5045a::t_dda3e4b2fb5ea4 4-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "81beffcb7a1b2b4f4947b5f2884238cb85a4e996",
+  "prompts": {},
+  "sessions": {
+    "s_2afa39eac5045a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5cdd2e04-b710-4054-9fce-eb8e05e76006",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_41c334c91b145e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5b548f5-e223-437a-a200-0fc66030f3de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
