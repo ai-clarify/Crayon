@@ -88,6 +88,48 @@ fn builtin_descriptor(name: &str) -> OperationDescriptor {
     }
 }
 
+fn rl_descriptor() -> OperationDescriptor {
+    OperationDescriptor {
+        key: OperationKey::new("rl", "rollout", 1),
+        input_codec: Codec::BincodeV1,
+        output_codec: Codec::BincodeV1,
+        max_inline_arg_bytes: 64 * 1024,
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct RolloutRequest {
+    policy_seed: u64,
+    theta: Vec<f32>,
+    env_seed: u64,
+    steps: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct RolloutResult {
+    env_seed: u64,
+    episode_return: f32,
+    steps: u32,
+}
+
+/// Simple seeded linear-policy bandit rollout. Deterministic given the request,
+/// so results are reproducible across runs and workers.
+fn run_rollout(request: &RolloutRequest) -> RolloutResult {
+    let mut state = request.env_seed ^ request.policy_seed;
+    let mut r#return = 0.0f32;
+    for _ in 0..request.steps {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let action = ((state >> 33) as usize) % request.theta.len().max(1);
+        let reward = ((state >> 1) & 0xff) as f32 / 255.0;
+        r#return += reward * request.theta[action];
+    }
+    RolloutResult {
+        env_seed: request.env_seed,
+        episode_return: r#return,
+        steps: request.steps,
+    }
+}
+
 fn bind_addr_for_advertise(advertise: &str) -> String {
     if let Some(port) = advertise.rsplit(':').next() {
         format!("0.0.0.0:{port}")
@@ -134,6 +176,16 @@ async fn run_worker(
             let millis: u64 = bincode::deserialize(&args[0])?;
             tokio::time::sleep(Duration::from_millis(millis)).await;
             Ok(bincode::serialize(&millis)?)
+        })?;
+    }
+    if matches!(operations, "all" | "rl") {
+        registry.register(rl_descriptor(), |args| async move {
+            if args.len() != 1 {
+                return Err(Error::Protocol("rl.rollout expects one argument".into()));
+            }
+            let request: RolloutRequest = bincode::deserialize(&args[0])?;
+            let result = run_rollout(&request);
+            Ok(bincode::serialize(&result)?)
         })?;
     }
     if registry.descriptors().is_empty() {
