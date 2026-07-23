@@ -185,13 +185,21 @@ async fn run_worker(
         }
     });
     loop {
-        match rpc(
+        let poll_reply = match rpc(
             coordinator,
             RpcRequest::Worker(WorkerRequest::Poll(identity.clone())),
             Some(identity.coordinator_epoch),
         )
-        .await?
+        .await
         {
+            Ok(reply) => reply,
+            Err(Error::Io(_) | Error::DeadlineExceeded) => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match poll_reply {
             RpcReply::Worker(WorkerReply::Assignment(Some(assignment))) => {
                 execute_assignment(
                     coordinator,
