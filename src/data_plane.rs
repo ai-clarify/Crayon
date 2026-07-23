@@ -8,7 +8,7 @@ pub struct LocalObjectStore(Arc<Mutex<HashMap<ObjectId, LocalObject>>>);
 #[derive(Clone)]
 pub struct LocalObject {
     pub codec: Codec,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
     pub checksum: [u8; 32],
 }
 impl LocalObjectStore {
@@ -16,15 +16,14 @@ impl LocalObjectStore {
         let checksum = checksum(&bytes);
         let object = LocalObject {
             codec,
-            bytes,
+            bytes: bytes.into(),
             checksum,
         };
         let mut objects = self.0.lock();
         if let Some(existing) = objects.get(&id) {
-            return if existing.checksum == object.checksum
-                && existing.bytes == object.bytes
-                && existing.codec == object.codec
-            {
+            // Content is fenced by the blake3 checksum: equal checksum => equal
+            // bytes (2^-256 collision), so no full-payload compare is needed.
+            return if existing.checksum == object.checksum && existing.codec == object.codec {
                 Ok(existing.clone())
             } else {
                 Err(Error::ObjectConflict(id))

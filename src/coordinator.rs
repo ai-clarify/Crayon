@@ -11,6 +11,7 @@ use crate::{
     resources::ResourceSet,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 pub const MAX_TASKS: usize = 16_384;
 pub const MAX_OBJECTS: usize = 65_536;
@@ -83,7 +84,7 @@ pub struct ObjectRecord {
     pub id: ObjectId,
     pub state: ObjectState,
     pub codec: Option<Codec>,
-    pub bytes: Option<Vec<u8>>,
+    pub bytes: Option<Arc<[u8]>>,
     pub size_bytes: Option<u64>,
     pub checksum: Option<[u8; 32]>,
     pub location: Option<String>,
@@ -233,8 +234,9 @@ impl CoordinatorState {
                 || existing.codec.as_ref() != Some(&codec)
                 || existing.size_bytes != Some(bytes.len() as u64)
                 || existing.checksum != Some(checksum)
-                || existing.bytes.as_deref() != Some(bytes.as_slice())
             {
+                // `id` is the blake3 digest of `bytes`, so a matching id already
+                // proves matching content -- no full-payload compare needed.
                 return Err(Error::ObjectConflict(id));
             }
             return Ok(id);
@@ -250,7 +252,7 @@ impl CoordinatorState {
                 codec: Some(codec),
                 size_bytes: Some(bytes.len() as u64),
                 checksum: Some(checksum),
-                bytes: Some(bytes),
+                bytes: Some(bytes.into()),
                 location: Some("coordinator".into()),
                 owner: None,
                 ref_count: 1,
@@ -961,7 +963,7 @@ mod tests {
                         size_bytes: 1,
                         checksum: crate::cluster::checksum(&[i]),
                         location: "127.0.0.1:9001".into(),
-                        bytes: Some(vec![i]),
+                        bytes: Some(vec![i].into()),
                     },
                 )
                 .unwrap();

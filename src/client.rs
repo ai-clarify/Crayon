@@ -221,7 +221,7 @@ impl ClusterClient {
         } = payload;
         if let Some(bytes) = bytes {
             verify_object(id, id, &bytes, checksum, size_bytes)?;
-            return Ok((codec, bytes));
+            return Ok((codec, bytes.to_vec()));
         }
         let reply = request(
             &location,
@@ -241,7 +241,7 @@ impl ClusterClient {
                 ..
             })) if local_codec == codec && actual == checksum && local_size == size_bytes => {
                 verify_object(id, local_id, &bytes, checksum, size_bytes)?;
-                Ok((codec, bytes))
+                Ok((codec, bytes.to_vec()))
             }
             _ => Err(Error::ObjectConflict(id)),
         }
