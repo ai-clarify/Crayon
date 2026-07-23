@@ -171,8 +171,7 @@ fn llm_problem(seed: u64) -> (u64, u64) {
 
 fn last_integer(text: &str) -> Option<u64> {
     text.split(|c: char| !c.is_ascii_digit())
-        .filter(|s| !s.is_empty() && s.len() < 10)
-        .next_back()
+        .rfind(|s| !s.is_empty() && s.len() < 10)
         .and_then(|s| s.parse().ok())
 }
 
