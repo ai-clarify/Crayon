@@ -22,9 +22,8 @@ services:
 
   acceptance:
     build: .
+    entrypoint: ["sh", "-c"]
     command:
-      - sh
-      - -c
       - "for i in $(seq 1 20); do crayon-cluster submit coordinator:7000 20 22 && exit 0; sleep 1; done; exit 1"
     depends_on:
       worker:
