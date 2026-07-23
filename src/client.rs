@@ -271,6 +271,32 @@ impl ClusterClient {
     pub async fn get_bytes(&self, id: ObjectId) -> Result<(Codec, Vec<u8>), Error> {
         self.fetch_object(id, 0).await
     }
+    /// `get_bytes` that blocks up to `timeout` for a still-running task's
+    /// reserved output — the raw-bytes twin of `TaskHandle::result`.
+    pub async fn get_bytes_within(
+        &self,
+        id: ObjectId,
+        timeout: Duration,
+    ) -> Result<(Codec, Vec<u8>), Error> {
+        self.fetch_object(id, timeout.as_millis() as u64).await
+    }
+    /// Raw-bytes twin of `results`: fetches many objects in one blocking batch,
+    /// without decoding. One slot per requested id, in order.
+    pub async fn get_bytes_many(
+        &self,
+        ids: &[ObjectId],
+        timeout: Duration,
+    ) -> Result<Vec<Result<(Codec, Vec<u8>), Error>>, Error> {
+        let payloads = self.fetch_batch(ids, timeout).await?;
+        let mut out = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            out.push(match payload {
+                Ok(payload) => self.payload_bytes(payload).await,
+                Err(error) => Err(error),
+            });
+        }
+        Ok(out)
+    }
     /// Fetches an object's bytes, blocking up to `wait_ms` for a reserved output
     /// to become available. Small outputs arrive inline; large ones redirect to
     /// the producing worker. `wait_ms: 0` returns immediately.

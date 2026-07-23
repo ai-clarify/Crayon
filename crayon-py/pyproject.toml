@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "crayon"
+version = "0.4.0"
+description = "Python client for the Crayon distributed task runtime"
+requires-python = ">=3.9"
+
+[tool.maturin]
+module-name = "crayon"
