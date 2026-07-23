@@ -110,7 +110,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for iteration in 0..args.iterations {
         let iter_start = Instant::now();
 
-        let mut handles = Vec::new();
+        // One RPC submits the whole iteration's rollouts; one blocking RPC awaits
+        // them all. Two round-trips per iteration instead of 2*parallelism.
+        let mut batch = Vec::with_capacity(args.parallelism);
         for w in 0..args.parallelism {
             let env_seed = (args.seed_base + iteration as u64 * 1000 + w as u64) % (1 << 31);
             let req = RolloutRequest {
@@ -119,25 +121,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 env_seed,
                 steps: args.steps,
             };
-            let req_bytes = bincode::serialize(&req)?;
-            let handle = client
-                .submit(
-                    &op,
-                    vec![TaskArg::Inline {
-                        codec: Codec::BincodeV1,
-                        bytes: req_bytes,
-                    }],
-                    ResourceSet::cpu_gpu(1.0, 0.0)?,
-                    args.max_attempts,
-                )
-                .await?;
-            handles.push(handle);
+            batch.push(vec![TaskArg::Inline {
+                codec: Codec::BincodeV1,
+                bytes: bincode::serialize(&req)?,
+            }]);
         }
+        let handles: Vec<_> = client
+            .submit_batch(
+                &op,
+                batch,
+                ResourceSet::cpu_gpu(1.0, 0.0)?,
+                args.max_attempts,
+            )
+            .await?
+            .into_iter()
+            .filter_map(|result| match result {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    eprintln!("iteration {iteration} submit rejected: {error}");
+                    None
+                }
+            })
+            .collect();
 
         let mut returns = Vec::new();
-        for handle in &handles {
-            match handle.result(Duration::from_secs(30)).await {
-                Ok(result) => returns.push(result.episode_return),
+        for result in client.results(&handles, Duration::from_secs(30)).await? {
+            match result {
+                Ok(rollout) => returns.push(rollout.episode_return),
                 Err(error) => eprintln!("iteration {iteration} task failed: {error}"),
             }
         }

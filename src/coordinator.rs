@@ -11,7 +11,7 @@ use crate::{
     resources::ResourceSet,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub const MAX_TASKS: usize = 16_384;
 pub const MAX_OBJECTS: usize = 65_536;
@@ -101,6 +101,13 @@ pub struct CoordinatorState {
     pub objects: HashMap<ObjectId, ObjectRecord>,
     pub operations: HashMap<OperationKey, OperationDescriptor>,
     pub pending_deletes: HashMap<NodeId, Vec<ObjectId>>,
+    /// FIFO of tasks in `Runnable` state, so scheduling picks the next candidate
+    /// without scanning every task. May hold stale ids (a task left Runnable via
+    /// cancel/retry); `assign_next` skips any entry no longer runnable.
+    runnable: VecDeque<TaskId>,
+    /// Tasks in `Waiting` state, so dependency reconciliation visits only blocked
+    /// tasks instead of the whole table.
+    waiting: HashSet<TaskId>,
 }
 impl CoordinatorState {
     pub fn new(epoch: CoordinatorEpoch) -> Self {
@@ -112,10 +119,29 @@ impl CoordinatorState {
             objects: HashMap::new(),
             operations: HashMap::new(),
             pending_deletes: HashMap::new(),
+            runnable: VecDeque::new(),
+            waiting: HashSet::new(),
         }
     }
     fn changed(&mut self) {
         self.revision.0 += 1;
+    }
+    /// Marks a task `Runnable` and enqueues it for scheduling. The queue may end
+    /// up with duplicate or stale ids; `assign_next` validates on pop, so the
+    /// only invariant is that every genuinely-runnable task is present at least once.
+    fn mark_runnable(&mut self, id: TaskId) {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.state = TaskState::Runnable;
+        }
+        self.waiting.remove(&id);
+        self.runnable.push_back(id);
+    }
+    /// Marks a task `Waiting` on unresolved dependencies and indexes it.
+    fn mark_waiting(&mut self, id: TaskId) {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.state = TaskState::Waiting;
+        }
+        self.waiting.insert(id);
     }
     pub fn register_worker(
         &mut self,
@@ -232,6 +258,27 @@ impl CoordinatorState {
         self.changed();
         Ok(id)
     }
+    /// Resolves an object to its payload or the error it currently maps to.
+    /// A reserved output of a still-running task is `ObjectPending` so a blocking
+    /// `Get`/`GetBatch` parks; a `Lost` object is `ObjectLost`; anything else
+    /// unavailable is a protocol error. Shared by single and batch fetch.
+    pub fn resolve_object(&self, id: ObjectId) -> Result<crate::protocol::ObjectPayload, Error> {
+        match self.objects.get(&id) {
+            Some(object) if object.state == ObjectState::Available => {
+                Ok(crate::protocol::ObjectPayload {
+                    id,
+                    codec: object.codec.clone().unwrap(),
+                    size_bytes: object.size_bytes.unwrap(),
+                    checksum: object.checksum.unwrap(),
+                    location: object.location.clone().unwrap(),
+                    bytes: object.bytes.clone(),
+                })
+            }
+            Some(object) if object.state == ObjectState::Lost => Err(Error::ObjectLost(id)),
+            Some(object) if object.state == ObjectState::Reserved => Err(Error::ObjectPending(id)),
+            _ => Err(Error::Protocol("object unavailable".into())),
+        }
+    }
     pub fn submit(
         &mut self,
         operation: OperationKey,
@@ -306,14 +353,17 @@ impl CoordinatorState {
                 resources,
                 max_attempts,
                 attempt: Attempt(0),
-                state: if waiting {
-                    TaskState::Waiting
-                } else {
-                    TaskState::Runnable
-                },
+                // Overwritten immediately by mark_runnable/mark_waiting below,
+                // under the same lock, before any observer can see it.
+                state: TaskState::Waiting,
                 assigned: None,
             },
         );
+        if waiting {
+            self.mark_waiting(id);
+        } else {
+            self.mark_runnable(id);
+        }
         self.changed();
         Ok((id, output))
     }
@@ -322,16 +372,32 @@ impl CoordinatorState {
         if worker.state != WorkerState::Alive || worker.free_slots == 0 {
             return Ok(None);
         }
-        let candidate = self
-            .tasks
-            .values()
-            .find(|task| {
-                task.state == TaskState::Runnable
-                    && worker.operations.contains_key(&task.operation)
-                    && worker.available.can_fit(&task.resources)
-            })
-            .map(|task| task.id);
-        let Some(id) = candidate else { return Ok(None) };
+        // Pop from the runnable queue, skipping stale entries (tasks no longer
+        // runnable) and re-queuing runnable tasks this worker cannot serve — for
+        // example a task needing an operation or resources it lacks. Bounded by
+        // the number of genuinely-runnable tasks, not the whole task table.
+        let mut requeue: Vec<TaskId> = Vec::new();
+        let mut chosen = None;
+        while let Some(id) = self.runnable.pop_front() {
+            let Some(task) = self.tasks.get(&id) else {
+                continue; // task gone
+            };
+            if task.state != TaskState::Runnable {
+                continue; // stale entry (retried elsewhere, cancelled, ...)
+            }
+            let worker = self.workers.get(&node_id).unwrap();
+            if worker.operations.contains_key(&task.operation)
+                && worker.available.can_fit(&task.resources)
+            {
+                chosen = Some(id);
+                break;
+            }
+            requeue.push(id); // runnable but not for this worker; keep it
+        }
+        for id in requeue {
+            self.runnable.push_back(id);
+        }
+        let Some(id) = chosen else { return Ok(None) };
         let attempt = Attempt(self.tasks[&id].attempt.0 + 1);
         let lease = LeaseId::new();
         let resources = self.tasks[&id].resources.clone();
@@ -472,12 +538,10 @@ impl CoordinatorState {
         self.release(identity.node_id, &resources)?;
         let task = self.tasks.get_mut(&fence.task_id).unwrap();
         task.assigned = None;
-        task.state = if retry {
-            TaskState::Runnable
+        if retry {
+            self.mark_runnable(fence.task_id);
         } else {
-            TaskState::Failed(message)
-        };
-        if !retry {
+            task.state = TaskState::Failed(message);
             self.objects.get_mut(&output).unwrap().state = ObjectState::Failed;
             self.reconcile_dependencies();
         }
@@ -502,14 +566,15 @@ impl CoordinatorState {
             for id in tasks {
                 let task = self.tasks.get_mut(&id).unwrap();
                 task.assigned = None;
+                let output = task.output;
                 if task.state == TaskState::CancelRequested {
                     task.state = TaskState::Cancelled;
-                    self.objects.get_mut(&task.output).unwrap().state = ObjectState::Cancelled;
+                    self.objects.get_mut(&output).unwrap().state = ObjectState::Cancelled;
                 } else if task.attempt.0 < task.max_attempts {
-                    task.state = TaskState::Runnable;
+                    self.mark_runnable(id);
                 } else {
                     task.state = TaskState::Failed("worker lease expired".into());
-                    self.objects.get_mut(&task.output).unwrap().state = ObjectState::Failed;
+                    self.objects.get_mut(&output).unwrap().state = ObjectState::Failed;
                 }
             }
             for object in self.objects.values_mut() {
@@ -581,6 +646,9 @@ impl CoordinatorState {
             self.tasks.get_mut(&id).unwrap().state = TaskState::CancelRequested;
         } else {
             self.tasks.get_mut(&id).unwrap().state = TaskState::Cancelled;
+            // Drop from the waiting index if it was blocked; a stale runnable
+            // queue entry is skipped by assign_next on pop.
+            self.waiting.remove(&id);
             self.objects.get_mut(&output).unwrap().state = ObjectState::Cancelled;
             self.reconcile_dependencies();
         }
@@ -619,12 +687,8 @@ impl CoordinatorState {
     fn reconcile_dependencies(&mut self) {
         loop {
             let mut changed = false;
-            let waiting: Vec<_> = self
-                .tasks
-                .values()
-                .filter(|task| task.state == TaskState::Waiting)
-                .map(|task| task.id)
-                .collect();
+            // Visit only blocked tasks, not the whole table.
+            let waiting: Vec<_> = self.waiting.iter().copied().collect();
             for id in waiting {
                 let dependencies: Vec<_> = self.tasks[&id]
                     .args
@@ -643,6 +707,7 @@ impl CoordinatorState {
                     let output = self.tasks[&id].output;
                     self.tasks.get_mut(&id).unwrap().state =
                         TaskState::Failed("dependency failed".into());
+                    self.waiting.remove(&id);
                     self.objects.get_mut(&output).unwrap().state = ObjectState::Failed;
                     changed = true;
                 } else if dependencies.iter().all(|object| {
@@ -650,7 +715,7 @@ impl CoordinatorState {
                         .get(object)
                         .is_some_and(|record| record.state == ObjectState::Available)
                 }) {
-                    self.tasks.get_mut(&id).unwrap().state = TaskState::Runnable;
+                    self.mark_runnable(id);
                     changed = true;
                 }
             }
@@ -862,5 +927,64 @@ mod tests {
             1,
         );
         assert!(matches!(result, Err(Error::InvalidResource(_))));
+    }
+
+    #[test]
+    fn scheduler_drains_queue_and_leaves_no_stale_index_entries() {
+        // Submit -> assign -> complete many single-slot tasks in sequence and
+        // confirm the runnable queue and waiting index return to empty. A leak
+        // here is exactly the O(n) scan regression the queue was added to kill.
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        for i in 0..50u8 {
+            let (_, output) = state
+                .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+                .unwrap();
+            let assignment = state
+                .assign_next(identity.node_id)
+                .unwrap()
+                .expect("a freshly submitted task must be assignable");
+            state.started(&identity, assignment.fence).unwrap();
+            state
+                .complete(
+                    &identity,
+                    crate::protocol::TaskCompletion {
+                        fence: assignment.fence,
+                        output_id: output,
+                        codec: Codec::RawBytes,
+                        size_bytes: 1,
+                        checksum: crate::cluster::checksum(&[i]),
+                        location: "127.0.0.1:9001".into(),
+                        bytes: Some(vec![i]),
+                    },
+                )
+                .unwrap();
+        }
+        assert!(state.runnable.is_empty(), "runnable queue leaked entries");
+        assert!(state.waiting.is_empty(), "waiting index leaked entries");
+        assert!(state.assign_next(identity.node_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn cancelled_waiting_task_is_dropped_from_index() {
+        // A task blocked on a dependency, then cancelled, must leave the waiting
+        // index so reconciliation never revisits a terminal task.
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let _ = register(&mut state, NodeId::new());
+        let (_, dep_output) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+            .unwrap();
+        let (blocked, _) = state
+            .submit(
+                descriptor().key.clone(),
+                vec![TaskArg::Object(dep_output)],
+                ResourceSet::default(),
+                1,
+            )
+            .unwrap();
+        assert!(state.waiting.contains(&blocked));
+        state.cancel(blocked).unwrap();
+        assert!(!state.waiting.contains(&blocked));
+        assert_eq!(state.tasks[&blocked].state, TaskState::Cancelled);
     }
 }

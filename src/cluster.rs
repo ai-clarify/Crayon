@@ -12,7 +12,7 @@ use tokio::{
 };
 
 use crate::{
-    coordinator::{CoordinatorState, ObjectState},
+    coordinator::CoordinatorState,
     error::Error,
     ids::{ClusterId, CoordinatorEpoch, RequestId},
     protocol::{
@@ -38,6 +38,10 @@ struct ReplayEntry {
     body_hash: [u8; 32],
     reply: RpcReply,
     expires_at_ms: u64,
+    /// Serialized reply size, computed once at insert. Kept on the entry so the
+    /// cache byte budget is a running sum instead of re-serializing every entry
+    /// on each request (which made cached submits O(n^2) under load).
+    bytes: usize,
 }
 
 #[derive(Clone)]
@@ -121,6 +125,10 @@ impl CoordinatorServer {
             RpcRequest::Client(ClientRequest::Get { wait_ms, .. }) if *wait_ms > 0 => {
                 self.long_poll(envelope, *wait_ms, client_get_ready).await
             }
+            RpcRequest::Client(ClientRequest::GetBatch { wait_ms, .. }) if *wait_ms > 0 => {
+                self.long_poll(envelope, *wait_ms, client_get_batch_ready)
+                    .await
+            }
             _ => self.dispatch_and_notify(envelope),
         }
     }
@@ -185,9 +193,9 @@ impl CoordinatorServer {
         }
         let reply = self.dispatch(envelope.body.clone());
         let entry_bytes = estimate_reply_bytes(&reply);
-        if replay.len() >= MAX_REPLAY_ENTRIES
-            || replay_bytes(&replay) + entry_bytes > MAX_REPLAY_BYTES
-        {
+        // Sum of stored sizes: one pass, no re-serialization.
+        let used: usize = replay.values().map(|entry| entry.bytes + 40).sum();
+        if replay.len() >= MAX_REPLAY_ENTRIES || used + entry_bytes + 40 > MAX_REPLAY_BYTES {
             return Ok(request_error(
                 &envelope.body,
                 Error::CapacityExceeded("replay cache limit reached".into()),
@@ -199,6 +207,7 @@ impl CoordinatorServer {
                 body_hash,
                 reply: reply.clone(),
                 expires_at_ms: envelope.deadline_unix_ms,
+                bytes: entry_bytes,
             },
         );
         Ok(reply)
@@ -344,6 +353,26 @@ impl CoordinatorServer {
                     Ok((task_id, output_id)) => ClientReply::Submitted { task_id, output_id },
                     Err(error) => ClientReply::Error(error),
                 },
+                ClientRequest::SubmitBatch(specs) => {
+                    let mut state = self.state.lock();
+                    let results = specs
+                        .into_iter()
+                        .map(|spec| {
+                            state
+                                .submit(
+                                    spec.operation,
+                                    spec.args,
+                                    spec.resources,
+                                    spec.max_attempts,
+                                )
+                                .map(|(task_id, output_id)| crate::protocol::SubmittedTask {
+                                    task_id,
+                                    output_id,
+                                })
+                        })
+                        .collect();
+                    ClientReply::SubmittedBatch(results)
+                }
                 ClientRequest::Status(id) => match self.state.lock().tasks.get(&id) {
                     Some(task) => ClientReply::Status(TaskView {
                         task_id: task.id,
@@ -354,25 +383,28 @@ impl CoordinatorServer {
                     }),
                     None => ClientReply::Error(Error::TaskNotFound(id)),
                 },
-                ClientRequest::Get { object: id, .. } => match self.state.lock().objects.get(&id) {
-                    Some(object) if object.state == ObjectState::Available => ClientReply::Object {
-                        id,
-                        codec: object.codec.clone().unwrap(),
-                        size_bytes: object.size_bytes.unwrap(),
-                        checksum: object.checksum.unwrap(),
-                        location: object.location.clone().unwrap(),
-                        bytes: object.bytes.clone(),
-                    },
-                    Some(object) if object.state == ObjectState::Lost => {
-                        ClientReply::Error(Error::ObjectLost(id))
+                ClientRequest::Get { object: id, .. } => {
+                    match self.state.lock().resolve_object(id) {
+                        Ok(payload) => ClientReply::Object {
+                            id: payload.id,
+                            codec: payload.codec,
+                            size_bytes: payload.size_bytes,
+                            checksum: payload.checksum,
+                            location: payload.location,
+                            bytes: payload.bytes,
+                        },
+                        Err(error) => ClientReply::Error(error),
                     }
-                    // Reserved output of a still-running task: report pending so a
-                    // blocking Get parks instead of erroring.
-                    Some(object) if object.state == ObjectState::Reserved => {
-                        ClientReply::Error(Error::ObjectPending(id))
-                    }
-                    _ => ClientReply::Error(Error::Protocol("object unavailable".into())),
-                },
+                }
+                ClientRequest::GetBatch { objects, .. } => {
+                    let state = self.state.lock();
+                    ClientReply::ObjectBatch(
+                        objects
+                            .into_iter()
+                            .map(|id| state.resolve_object(id))
+                            .collect(),
+                    )
+                }
                 ClientRequest::GetLocal(_) => ClientReply::Error(Error::Protocol(
                     "coordinator has no worker-local object endpoint".into(),
                 )),
@@ -421,6 +453,7 @@ fn is_mutation(request: &RpcRequest) -> bool {
             client,
             ClientRequest::Put { .. }
                 | ClientRequest::Submit { .. }
+                | ClientRequest::SubmitBatch(_)
                 | ClientRequest::Cancel(_)
                 | ClientRequest::Release(_)
         ),
@@ -446,6 +479,18 @@ fn client_get_ready(reply: &RpcReply) -> bool {
     )
 }
 
+/// A blocking `GetBatch` is satisfied only when every object has resolved; a
+/// single still-pending object keeps the whole batch parked. Callers that want
+/// partial results pass `wait_ms: 0` for an immediate, non-parking reply.
+fn client_get_batch_ready(reply: &RpcReply) -> bool {
+    match reply {
+        RpcReply::Client(ClientReply::ObjectBatch(results)) => !results
+            .iter()
+            .any(|result| matches!(result, Err(Error::ObjectPending(_)))),
+        _ => true,
+    }
+}
+
 /// Only client mutations are cached. Worker reports are idempotent at the
 /// coordinator state machine and Poll returns transient state, so caching them
 /// would only fill the cache under load without adding safety.
@@ -453,7 +498,10 @@ fn should_cache(request: &RpcRequest) -> bool {
     matches!(
         request,
         RpcRequest::Client(
-            ClientRequest::Submit { .. } | ClientRequest::Cancel(_) | ClientRequest::Release(_)
+            ClientRequest::Submit { .. }
+                | ClientRequest::SubmitBatch(_)
+                | ClientRequest::Cancel(_)
+                | ClientRequest::Release(_)
         )
     )
 }
@@ -462,14 +510,6 @@ fn estimate_reply_bytes(reply: &RpcReply) -> usize {
     bincode::serialize(reply)
         .map(|bytes| bytes.len())
         .unwrap_or(0)
-}
-
-fn replay_bytes(replay: &HashMap<RequestId, ReplayEntry>) -> usize {
-    replay.values().map(estimate_entry_bytes).sum()
-}
-
-fn estimate_entry_bytes(entry: &ReplayEntry) -> usize {
-    estimate_reply_bytes(&entry.reply) + 32 + 8
 }
 
 pub async fn request(address: &str, envelope: &Envelope) -> Result<RpcReply, Error> {

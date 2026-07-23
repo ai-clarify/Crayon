@@ -8,7 +8,8 @@ use crate::{
     ids::{ClusterId, CoordinatorEpoch, ObjectId, TaskId},
     operation::{Codec, Operation, TaskArg},
     protocol::{
-        ClientReply, ClientRequest, RpcReply, RpcRequest, TaskStatus, TaskView, WorkerView,
+        ClientReply, ClientRequest, ObjectPayload, RpcReply, RpcRequest, SubmitSpec, TaskStatus,
+        TaskView, WorkerView,
     },
     resources::ResourceSet,
 };
@@ -101,6 +102,81 @@ impl ClusterClient {
             _ => Err(Error::Protocol("unexpected submit reply".into())),
         }
     }
+    /// Submits many tasks of one operation in a single RPC — one round-trip for
+    /// the whole batch instead of one per task. Each element is that task's
+    /// arguments; the returned handles are in the same order. A spec the
+    /// coordinator rejects yields an `Err` in that slot, leaving the rest admitted.
+    pub async fn submit_batch<A, O>(
+        &self,
+        operation: &Operation<A, O>,
+        batch: Vec<Vec<TaskArg>>,
+        resources: ResourceSet,
+        max_attempts: u32,
+    ) -> Result<Vec<Result<TaskHandle<O>, Error>>, Error> {
+        let mut specs = Vec::with_capacity(batch.len());
+        for args in batch {
+            operation.descriptor().validate_args(&args)?;
+            specs.push(SubmitSpec {
+                operation: operation.descriptor().key.clone(),
+                args,
+                resources: resources.clone(),
+                max_attempts,
+            });
+        }
+        match self.rpc(ClientRequest::SubmitBatch(specs)).await? {
+            ClientReply::SubmittedBatch(results) => Ok(results
+                .into_iter()
+                .map(|result| {
+                    result.map(|task| TaskHandle {
+                        task_id: task.task_id,
+                        output: ObjectRef::new(task.output_id),
+                        client: self.clone(),
+                    })
+                })
+                .collect()),
+            ClientReply::Error(error) => Err(error),
+            _ => Err(Error::Protocol("unexpected submit batch reply".into())),
+        }
+    }
+    /// Fetches many objects in a single blocking RPC, waiting up to `timeout` for
+    /// all of them to resolve — the batch analogue of `TaskHandle::result` and a
+    /// direct parallel to `ray.get([refs])`. Results are in request order.
+    async fn fetch_batch(
+        &self,
+        ids: &[ObjectId],
+        timeout: Duration,
+    ) -> Result<Vec<Result<ObjectPayload, Error>>, Error> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::DeadlineExceeded);
+            }
+            let wait_ms = remaining.as_millis().min(u64::MAX as u128) as u64;
+            match self
+                .rpc(ClientRequest::GetBatch {
+                    objects: ids.to_vec(),
+                    wait_ms,
+                })
+                .await?
+            {
+                ClientReply::ObjectBatch(results) => {
+                    // The server parks until every object resolves or the wait
+                    // slice elapses; a still-pending slot means the slice expired,
+                    // so retry until the outer deadline fires.
+                    if results
+                        .iter()
+                        .any(|result| matches!(result, Err(Error::ObjectPending(_))))
+                    {
+                        continue;
+                    }
+                    return Ok(results);
+                }
+                ClientReply::Error(error) => return Err(error),
+                _ => return Err(Error::Protocol("unexpected get batch reply".into())),
+            }
+        }
+    }
     pub async fn status(&self, task_id: TaskId) -> Result<TaskView, Error> {
         match self.rpc(ClientRequest::Status(task_id)).await? {
             ClientReply::Status(status) => Ok(status),
@@ -130,59 +206,98 @@ impl ClusterClient {
             .await?
         {
             ClientReply::Object {
-                id: returned,
+                id,
                 codec,
-                bytes: Some(bytes),
-                checksum,
                 size_bytes,
-                ..
-            } => {
-                verify_object(id, returned, &bytes, checksum, size_bytes)?;
-                Ok((codec, bytes))
-            }
-            ClientReply::Object {
-                id: returned,
-                codec,
+                checksum,
                 location,
-                checksum,
-                size_bytes,
-                ..
+                bytes,
             } => {
-                let reply = request(
-                    &location,
-                    &envelope(
-                        self.cluster_id,
-                        RpcRequest::Client(ClientRequest::GetLocal(id)),
-                    ),
-                )
-                .await?;
-                match reply {
-                    RpcReply::Client(ClientReply::Object {
-                        id: local_id,
-                        codec: local_codec,
-                        bytes: Some(bytes),
-                        checksum: actual,
-                        size_bytes: local_size,
-                        ..
-                    }) if returned == id
-                        && local_codec == codec
-                        && actual == checksum
-                        && local_size == size_bytes =>
-                    {
-                        verify_object(id, local_id, &bytes, checksum, size_bytes)?;
-                        Ok((codec, bytes))
-                    }
-                    _ => Err(Error::ObjectConflict(id)),
-                }
+                self.payload_bytes(ObjectPayload {
+                    id,
+                    codec,
+                    size_bytes,
+                    checksum,
+                    location,
+                    bytes,
+                })
+                .await
             }
             ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected get reply".into())),
+        }
+    }
+    /// Resolves a payload to its bytes: inline outputs are verified and returned;
+    /// redirected (large) outputs are fetched from the producing worker and
+    /// validated against the coordinator's checksum/size. Shared by single and
+    /// batch fetch paths.
+    async fn payload_bytes(&self, payload: ObjectPayload) -> Result<(Codec, Vec<u8>), Error> {
+        let ObjectPayload {
+            id,
+            codec,
+            size_bytes,
+            checksum,
+            location,
+            bytes,
+        } = payload;
+        if let Some(bytes) = bytes {
+            verify_object(id, id, &bytes, checksum, size_bytes)?;
+            return Ok((codec, bytes));
+        }
+        let reply = request(
+            &location,
+            &envelope(
+                self.cluster_id,
+                RpcRequest::Client(ClientRequest::GetLocal(id)),
+            ),
+        )
+        .await?;
+        match reply {
+            RpcReply::Client(ClientReply::Object {
+                id: local_id,
+                codec: local_codec,
+                bytes: Some(bytes),
+                checksum: actual,
+                size_bytes: local_size,
+                ..
+            }) if local_codec == codec && actual == checksum && local_size == size_bytes => {
+                verify_object(id, local_id, &bytes, checksum, size_bytes)?;
+                Ok((codec, bytes))
+            }
+            _ => Err(Error::ObjectConflict(id)),
         }
     }
 
     pub async fn get<T: DeserializeOwned>(&self, reference: &ObjectRef<T>) -> Result<T, Error> {
         let (codec, bytes) = self.get_bytes(reference.id).await?;
         decode(codec, bytes)
+    }
+    /// Awaits many task outputs in one blocking RPC and decodes each — the batch
+    /// analogue of `TaskHandle::result`, matching `ray.get([refs])`. Results are
+    /// in `handles` order; a failed/cancelled task yields its precise error in
+    /// that slot without sinking the batch. Redirected large outputs are fetched
+    /// per-object after the batch resolves.
+    pub async fn results<T: DeserializeOwned>(
+        &self,
+        handles: &[TaskHandle<T>],
+        timeout: Duration,
+    ) -> Result<Vec<Result<T, Error>>, Error> {
+        let ids: Vec<ObjectId> = handles.iter().map(|handle| handle.output.id).collect();
+        let payloads = self.fetch_batch(&ids, timeout).await?;
+        let mut out = Vec::with_capacity(payloads.len());
+        for (payload, handle) in payloads.into_iter().zip(handles) {
+            out.push(match payload {
+                Ok(payload) => match self.payload_bytes(payload).await {
+                    Ok((codec, bytes)) => decode(codec, bytes),
+                    Err(error) => Err(error),
+                },
+                // Object resolved to a non-available terminal; get the precise
+                // failure/cancellation reason for this task.
+                Err(Error::Protocol(_)) => Err(handle.terminal_error().await),
+                Err(error) => Err(error),
+            });
+        }
+        Ok(out)
     }
     pub async fn cancel(&self, task_id: TaskId) -> Result<(), Error> {
         match self.rpc(ClientRequest::Cancel(task_id)).await? {

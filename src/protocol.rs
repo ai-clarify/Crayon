@@ -150,6 +150,10 @@ pub enum ClientRequest {
         resources: ResourceSet,
         max_attempts: u32,
     },
+    /// Submit many tasks in one RPC. Each spec is admitted independently; the
+    /// reply carries a per-spec result so a partial failure does not sink the
+    /// batch. Collapses N submit round-trips into one.
+    SubmitBatch(Vec<SubmitSpec>),
     Status(TaskId),
     /// Fetch an object, optionally blocking. The coordinator holds the request
     /// until the object is available or `wait_ms` elapses (`wait_ms: 0` returns
@@ -159,10 +163,42 @@ pub enum ClientRequest {
         object: ObjectId,
         wait_ms: u64,
     },
+    /// Fetch many objects in one RPC, blocking until every requested object has
+    /// resolved (available or terminal) or `wait_ms` elapses. Collapses N result
+    /// round-trips into one; mirrors `ray.get([refs])`.
+    GetBatch {
+        objects: Vec<ObjectId>,
+        wait_ms: u64,
+    },
     GetLocal(ObjectId),
     Workers,
     Cancel(TaskId),
     Release(ObjectId),
+}
+/// One task in a `SubmitBatch`, carrying the same fields as a single `Submit`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitSpec {
+    pub operation: OperationKey,
+    pub args: Vec<TaskArg>,
+    pub resources: ResourceSet,
+    pub max_attempts: u32,
+}
+/// A successfully admitted task: its id and reserved output id.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SubmittedTask {
+    pub task_id: TaskId,
+    pub output_id: ObjectId,
+}
+/// A resolved object's payload. Small outputs arrive with `bytes` set; large
+/// outputs carry `location` for a worker-local fetch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectPayload {
+    pub id: ObjectId,
+    pub codec: Codec,
+    pub size_bytes: u64,
+    pub checksum: [u8; 32],
+    pub location: String,
+    pub bytes: Option<Vec<u8>>,
 }
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskStatus {
@@ -211,6 +247,12 @@ pub enum ClientReply {
         task_id: TaskId,
         output_id: ObjectId,
     },
+    /// Per-spec admission results, in request order: `Ok` for admitted tasks,
+    /// `Err` for specs the coordinator rejected.
+    SubmittedBatch(Vec<Result<SubmittedTask, Error>>),
+    /// Per-object fetch results, in request order. Each is the resolved payload
+    /// or the error that object resolved to (failed/cancelled/lost/pending).
+    ObjectBatch(Vec<Result<ObjectPayload, Error>>),
     Status(TaskView),
     Workers(Vec<WorkerView>),
     Cancelled,
