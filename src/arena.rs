@@ -245,9 +245,9 @@ pub fn map_arena_mut(token: &str) -> Option<MmapMut> {
 }
 
 /// Multithreaded memcpy: a gigabyte copy is memory-bandwidth work one core
-/// can't saturate. Below 32MB the spawn cost beats the win, so copy plainly.
+/// can't saturate. Below 8MB the spawn cost beats the win, so copy plainly.
 pub fn copy_wide(dst: &mut [u8], src: &[u8]) {
-    const PAR_MIN: usize = 32 * 1024 * 1024;
+    const PAR_MIN: usize = 8 * 1024 * 1024;
     if src.len() < PAR_MIN {
         dst.copy_from_slice(src);
         return;
