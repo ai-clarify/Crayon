@@ -18,7 +18,10 @@ impl fmt::Display for TaskStatus {
 }
 
 pub const MAGIC: [u8; 4] = *b"CRYN";
-pub const PROTOCOL_MAJOR: u16 = 2;
+// Bumped to 3 in 0.4.0: `WorkerRequest::Failed` swapped its `retryable: bool`
+// for a `FailureClass` enum, a wire-incompatible change. Deploy all components
+// (coordinator, workers, clients) at the same major.
+pub const PROTOCOL_MAJOR: u16 = 3;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OBJECT_BYTES: usize = MAX_FRAME_BYTES - 64 * 1024;

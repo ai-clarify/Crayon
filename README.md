@@ -18,7 +18,7 @@ immutable object data plane.
 ## Install
 
 ```bash
-cargo install crayon-rs --version 0.2.0
+cargo install crayon-rs --version 0.4.0
 ```
 
 The package name is `crayon-rs`, the library import name is `crayon`, and the
@@ -50,14 +50,18 @@ binaries, 3 warmups + 30 measured samples, 4 KiB DAG payload:
 
 | Scenario | Workers | Concurrency | Median latency | Throughput |
 |---|---:|---:|---:|---:|
-| Task (`add`) | 1 | 1 | 53.0 ms | 19.2 ops/s |
-| DAG/object (`copy`) | 1 | 1 | 102.0 ms | 9.6 ops/s |
-| Task (`add`) | 2 | 2 | 53.2 ms | 18.9 ops/s |
-| DAG/object (`copy`) | 2 | 2 | 102.0 ms | 9.8 ops/s |
+| Task (`add`) | 1 | 1 | 0.5 ms | 2115 ops/s |
+| DAG/object (`copy`) | 1 | 1 | 23.2 ms | 43 ops/s |
+| Task (`add`) | 2 | 2 | 0.5 ms | 1791 ops/s |
+| DAG/object (`copy`) | 2 | 2 | 23.5 ms | 43 ops/s |
+| Task (`add`) | 8 | 8 | 1.3 ms | 684 ops/s |
+| DAG/object (`copy`) | 8 | 8 | 24.5 ms | 41 ops/s |
 
-These are absolute control-plane measurements for the 0.2 runtime. The removed
-0.1.x Python/V100 RL benchmark tested a different architecture and is not
-evidence for this release.
+Absolute control-plane measurements for the 0.4 event-driven runtime — ~100×
+lower task latency than the 0.2 polling runtime (53 ms). Throughput is
+single-stream (`1 / mean` latency); the DAG scenario is two sequential tasks
+plus a worker-local object fetch. The removed 0.1.x Python/V100 RL benchmark
+tested a different architecture and is not evidence for this release.
 
 ## Verify
 

@@ -1,29 +1,42 @@
-# Crayon v0.2.0
+# Crayon v0.4.0
 
-First coordinator-based Crayon runtime release.
+Reliability and scheduling release: hardens the control plane against the
+worker/coordinator failure edges found in review, adds a zero-copy object store,
+and implements the deferred M3–M5 roadmap items. See [CHANGELOG.md](CHANGELOG.md)
+for the full list.
 
 ## Compatibility notice
 
-This release replaces the 0.1.x in-process/Python architecture. Python
-bindings, actors, and the old RL benchmark are **not** part of 0.2.0. Wire
-protocol major version 2; coordinator, worker, and client processes must be
-upgraded together.
+Wire protocol **major version 3** (up from 2): `WorkerRequest::Failed` now
+carries a typed `FailureClass` instead of a `retryable` bool, a wire-incompatible
+change. Coordinator, worker, and client processes must be upgraded together; a
+mixed-version cluster is rejected at the envelope check.
 
-## Features
+## Highlights
 
-- One authoritative coordinator and independent worker processes.
-- Registered versioned Rust operations with fixed-point resource routing.
-- Fenced task attempts and worker-local immutable object data plane.
-- Direct worker-local object fetch with `ObjectId`, size, and BLAKE3 verification.
-- `cluster-benchmark` binary for task and DAG/object transfer measurements.
+- **Retry classification (M3).** A typed `FailureClass` (`Transient` /
+  `Permanent`) replaces the worker-supplied `retryable` bool. The coordinator
+  owns the retry policy — an operation panic is `Permanent` and terminal even
+  with attempts left, so a crashing op no longer burns its retry budget.
+- **Graceful drain (M4).** The coordinator handles `SIGTERM`/`SIGINT`: stop
+  accepting, drain in-flight handlers, exit cleanly instead of a hard kill.
+- **Object-locality scheduling (M5).** `assign_next` prefers a task whose input
+  objects the polling worker already owns (bounded look-ahead, FIFO fallback),
+  cutting cross-worker object refetches for DAGs.
+- **Zero-copy object store.** Payloads are `Arc<[u8]>`, shared across
+  completions, replies, and the replay cache instead of cloned.
 
-## Reliability
+## Reliability & hardening
 
-- RPC retries reuse the original request ID; the coordinator replays the first
-  response within one live coordinator epoch.
-- Typed `TaskFailed` and `TaskCancelled` results.
-- Transient heartbeat transport errors do not permanently stop heartbeats.
-- Coordinator can bind non-loopback addresses for container deployments.
+- `Release` of a still-`Reserved` output is rejected, and a released output
+  reclaims its terminal producer task — closing a coordinator panic cascade and
+  the unbounded task-table growth that made `MAX_TASKS` a lifetime cap.
+- Dead ephemeral workers are evicted from the registry; unknown-task-id worker
+  reports return `TaskNotFound` instead of panicking a connection handler.
+- `GetBatch` bounds its cloned inline bytes; the replay cache checks capacity
+  before dispatch (no duplicate-on-retry) and clamps entry TTL to a server bound.
+- A busy worker survives a `DeleteObject` for one of its outputs; mid-execution
+  lease loss or transient transport errors reconnect instead of killing it.
 
 ## Benchmark
 
@@ -32,20 +45,24 @@ binaries, 3 warmups + 30 measured samples, 4 KiB DAG payload:
 
 | Scenario | Workers | Concurrency | Median latency | Throughput |
 |---|---:|---:|---:|---:|
-| Task (`add`) | 1 | 1 | 53.0 ms | 19.2 ops/s |
-| DAG/object (`copy`) | 1 | 1 | 102.0 ms | 9.6 ops/s |
+| Task (`add`) | 1 | 1 | 0.5 ms | 2115 ops/s |
+| DAG/object (`copy`) | 1 | 1 | 23.2 ms | 43 ops/s |
+| Task (`add`) | 8 | 8 | 1.3 ms | 684 ops/s |
+| DAG/object (`copy`) | 8 | 8 | 24.5 ms | 41 ops/s |
 
-Raw benchmark artifacts are attached to this release. See
-[docs/benchmark.md](docs/benchmark.md) for methodology.
+Throughput is single-stream (`1 / mean` latency). Task latency is ~100× lower
+than the 0.2 polling runtime (53 ms), sustained from 0.3.0's event-driven
+dispatch. See [docs/benchmark.md](docs/benchmark.md) for methodology.
 
 ## Install
 
 ```bash
-cargo install crayon-rs --version 0.2.0
+cargo install crayon-rs --version 0.4.0
 ```
 
 ## Limits
 
 - Task execution is at-least-once; no exactly-once external side effects.
-- No coordinator persistence/HA, TLS/authentication, hard preemption, or
-  distributed reference counting.
+- No coordinator persistence/HA (a `durability_spike` proves it is a cheap
+  add-on, but it is deliberately unbuilt — see `docs/feature-prescreen.md`),
+  TLS/authentication, hard preemption, or distributed reference counting.

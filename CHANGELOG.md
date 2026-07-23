@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.4.0
+
+Reliability and scheduling release: hardens the control plane against the
+worker/coordinator failure edges found in review, adds a zero-copy object store,
+and implements the deferred M3–M5 roadmap items. Wire protocol major 2 → 3 (the
+`Failed` report gained a typed failure class); deploy all components together.
+
+### Features
+
+- **Retry classification (M3).** Task failures carry a typed `FailureClass`
+  (`Transient` / `Permanent`) instead of a worker-supplied `retryable` bool. The
+  coordinator owns the retry policy: a `Permanent` failure — e.g. an operation
+  panic — is terminal even with attempts remaining, so a crashing operation no
+  longer burns its whole retry budget.
+- **Graceful drain (M4).** The coordinator handles `SIGTERM`/`SIGINT`: it stops
+  accepting connections, drains in-flight request handlers, and exits cleanly
+  instead of being killed mid-request.
+- **Object-locality scheduling (M5).** `assign_next` prefers a runnable task
+  whose input objects the polling worker already owns (bounded look-ahead),
+  cutting cross-worker refetches for DAGs, with a FIFO fallback and no hot-path
+  regression.
+- **Zero-copy object store.** Object payloads are `Arc<[u8]>`, so completions,
+  replies, and the replay cache share bytes instead of cloning them.
+
+### Reliability & hardening
+
+- `Release` of a still-`Reserved` output is rejected, and a released output
+  reclaims its terminal producer task — closing a coordinator panic cascade and
+  the unbounded task-table growth that made `MAX_TASKS` a lifetime cap.
+- Dead workers are evicted from the registry (not left as `Dead` records) and
+  their pending deletes dropped — bounding the worker map for ephemeral,
+  per-task workers.
+- Worker reports for an unknown task id return `TaskNotFound` instead of
+  panicking a connection handler; `GetBatch` bounds its cloned inline bytes so a
+  crafted batch cannot exhaust coordinator memory under the state lock.
+- The mutation replay cache checks capacity before dispatching (no more
+  committed-but-uncached mutations that duplicate on retry) and clamps entry TTL
+  to a server bound instead of the client-controlled deadline.
+- A busy worker survives a `DeleteObject` for one of its outputs; mid-execution
+  lease loss or transient transport errors reconnect instead of killing it.
+
+### Performance
+
+- Shorter coordinator critical sections and a hoisted lock-free epoch on the hot
+  path; `cancellation_for` and dependency reconciliation scan bounded indexes
+  instead of the whole task table. V100 (Xeon 8260, loopback, 3 warmups + 30
+  samples, 4 KiB DAG payload): single `add` task 0.5 ms median / 2115 ops/s,
+  DAG/object `copy` 23 ms / 43 ops/s — ~100× / 4.4× lower control-plane latency
+  than 0.2, sustained from 0.3.0's event-driven rewrite.
+
+### Docs
+
+- `durability_spike` is a runnable binary that proves the four coordinator-
+  recovery claims and measures snapshot cost (a full 16 383-task control-plane
+  snapshot is 3.4 MiB, ~7 ms to serialize on V100); `feature-prescreen.md`
+  corrected to match.
+
 ## 0.3.0
 
 Performance release: the control plane is now event-driven and batched. On an
