@@ -153,10 +153,16 @@ fn llm_descriptor(name: &str) -> OperationDescriptor {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LlmRolloutCfg {
     version: u64,
-    /// Hex object id of the policy weights in the coordinator's arena.
+    /// Hex object id of the policy weights in the coordinator's arena; empty
+    /// means "use the base model as loaded" (e.g. a pure evaluation pass).
+    #[serde(default)]
     weights: String,
     seeds: Vec<u64>,
     max_new_tokens: u32,
+    /// Explicit prompts (e.g. GSM8K questions), one per seed. Empty means the
+    /// synthetic arithmetic prompts derived from the seeds.
+    #[serde(default)]
+    prompts: Vec<String>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LlmRollout {
@@ -169,10 +175,15 @@ fn llm_problem(seed: u64) -> (u64, u64) {
     (50 + (seed >> 8) % 900, 50 + seed % 900)
 }
 
-fn last_integer(text: &str) -> Option<u64> {
-    text.split(|c: char| !c.is_ascii_digit())
-        .rfind(|s| !s.is_empty() && s.len() < 10)
-        .and_then(|s| s.parse().ok())
+fn last_integer(text: &str) -> Option<i64> {
+    // Thousands separators are common in model output ("1,200"); drop them
+    // before splitting so the grouped digits parse as one number.
+    let text = text.replace(',', "");
+    text.split(|c: char| !c.is_ascii_digit() && c != '-')
+        .rfind(|s| s.chars().any(|c| c.is_ascii_digit()) && s.len() < 12)
+        .and_then(|s| s.trim_start_matches('-').parse::<i64>().ok().map(|n| {
+            if s.starts_with('-') { -n } else { n }
+        }))
 }
 
 /// A resident `benchmarks/llm_sidecar.py` process, spoken to over
@@ -232,9 +243,15 @@ impl LlmSidecar {
         Ok(())
     }
 
-    fn rollout(&mut self, seeds: &[u64], max_new_tokens: u32) -> Result<Vec<String>, Error> {
+    fn rollout(
+        &mut self,
+        seeds: &[u64],
+        prompts: &[String],
+        max_new_tokens: u32,
+    ) -> Result<Vec<String>, Error> {
         let reply = self.call(&serde_json::json!({
-            "cmd": "rollout", "seeds": seeds, "max_new_tokens": max_new_tokens,
+            "cmd": "rollout", "seeds": seeds, "prompts": prompts,
+            "max_new_tokens": max_new_tokens,
         }))?;
         reply["rollouts"]
             .as_array()
@@ -322,10 +339,11 @@ async fn run_worker(
                 }
                 let cfg: LlmRolloutCfg = serde_json::from_slice(&args[0])
                     .map_err(|e| Error::Protocol(format!("llm.rollout config: {e}")))?;
-                let weights_id = ObjectId::from_str(&cfg.weights)
-                    .map_err(|e| Error::Protocol(format!("llm.rollout weights id: {e}")))?;
-                let stale = sidecar.lock().unwrap().version != cfg.version;
+                let stale = !cfg.weights.is_empty()
+                    && sidecar.lock().unwrap().version != cfg.version;
                 let weights = if stale {
+                    let weights_id = ObjectId::from_str(&cfg.weights)
+                        .map_err(|e| Error::Protocol(format!("llm.rollout weights id: {e}")))?;
                     let client = ClusterClient::connect_to(&coordinator_addr, CLUSTER_ID);
                     Some(client.get_bytes(weights_id).await?.1)
                 } else {
@@ -336,7 +354,8 @@ async fn run_worker(
                     if let Some(weights) = weights {
                         sidecar.load(cfg.version, &weights)?;
                     }
-                    let completions = sidecar.rollout(&cfg.seeds, cfg.max_new_tokens)?;
+                    let completions =
+                        sidecar.rollout(&cfg.seeds, &cfg.prompts, cfg.max_new_tokens)?;
                     let rollouts: Vec<LlmRollout> = cfg
                         .seeds
                         .iter()
@@ -355,16 +374,30 @@ async fn run_worker(
         // Rule reward: the completion must contain the arithmetic answer as its
         // last integer. Pure Rust — no model, no GPU.
         registry.register(llm_descriptor("judge"), |args| async move {
-            if args.len() != 1 {
-                return Err(Error::Protocol("llm.judge expects [rollouts]".into()));
+            if args.is_empty() || args.len() > 2 {
+                return Err(Error::Protocol("llm.judge expects [rollouts, golds?]".into()));
             }
             let rollouts: Vec<LlmRollout> = serde_json::from_slice(&args[0])
                 .map_err(|e| Error::Protocol(format!("llm.judge input: {e}")))?;
+            // Optional dataset golds (seed -> answer, e.g. GSM8K); without them
+            // the answer derives from the seed's synthetic arithmetic problem.
+            let golds: std::collections::HashMap<u64, i64> = match args.get(1) {
+                Some(bytes) => serde_json::from_slice::<Vec<(u64, i64)>>(bytes)
+                    .map_err(|e| Error::Protocol(format!("llm.judge golds: {e}")))?
+                    .into_iter()
+                    .collect(),
+                None => rollouts
+                    .iter()
+                    .map(|r| {
+                        let (a, b) = llm_problem(r.seed);
+                        (r.seed, (a + b) as i64)
+                    })
+                    .collect(),
+            };
             let rewards: Vec<f32> = rollouts
                 .iter()
                 .map(|r| {
-                    let (a, b) = llm_problem(r.seed);
-                    (last_integer(&r.completion) == Some(a + b)) as u32 as f32
+                    (last_integer(&r.completion) == golds.get(&r.seed).copied()) as u32 as f32
                 })
                 .collect();
             serde_json::to_vec(&rewards)

@@ -62,8 +62,8 @@ class Sidecar:
         return {"ok": True}
 
     @torch.no_grad()
-    def rollout(self, seeds, max_new_tokens, temperature=1.0):
-        prompts = [prompt_for(s) for s in seeds]
+    def rollout(self, seeds, max_new_tokens, temperature=1.0, prompts=None):
+        prompts = prompts or [prompt_for(s) for s in seeds]
         enc = self.tok(prompts, return_tensors="pt", padding=True).to("cuda")
         out = self.model.generate(
             **enc,
@@ -126,7 +126,10 @@ def main():
         "save": lambda m: sidecar.save(m["out"]),
         "load": lambda m: sidecar.load(m["path"], m["version"]),
         "rollout": lambda m: sidecar.rollout(
-            m["seeds"], m["max_new_tokens"], m.get("temperature", 1.0)
+            m["seeds"],
+            m["max_new_tokens"],
+            m.get("temperature", 1.0),
+            m.get("prompts") or None,
         ),
         "learn": lambda m: sidecar.learn(m["items"], m["out"]),
     }
