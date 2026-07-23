@@ -1,0 +1,31 @@
+Cargo.toml
+  s_41c334c91b145e::t_022a75235b6cd6 17
+src/client.rs
+  s_41c334c91b145e::t_0aff1e7fe3d85e 224,244
+src/cluster.rs
+  s_41c334c91b145e::t_e0a514143ca790 349,764
+src/coordinator.rs
+  s_41c334c91b145e::t_b65de3007a81bf 14,87,238-239,255,966
+src/data_plane.rs
+  s_41c334c91b145e::t_eed39ea7d98b81 11,19,24-26
+src/protocol.rs
+  s_41c334c91b145e::t_41d4e3f8c9c6e1 11,139,202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "30e58fbef05543ce91f616377f1ed380597515bc",
+  "prompts": {},
+  "sessions": {
+    "s_41c334c91b145e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5b548f5-e223-437a-a200-0fc66030f3de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
