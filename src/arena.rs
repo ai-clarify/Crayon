@@ -17,7 +17,11 @@
 //! that can map it is co-located. Cross-host peers cannot map it and fall back
 //! to the network (bounded by the frame size, hence to <= one frame).
 
-use std::{collections::HashMap, fs, io, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use memmap2::MmapMut;
 use parking_lot::Mutex;
@@ -75,9 +79,13 @@ pub struct ArenaStore {
 
 impl ArenaStore {
     pub fn new() -> io::Result<Self> {
-        let token = uuid::Uuid::new_v4().simple().to_string();
         let dir = base_dir();
         fs::create_dir_all(&dir)?;
+        sweep_dead(&dir);
+        // Tag the token with our pid so `sweep_dead` can reap arenas orphaned by a
+        // SIGKILLed coordinator (which skips `Drop`). The token stays opaque to
+        // readers, which only ever map `arena-{token}`.
+        let token = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
         let path = dir.join(format!("arena-{token}"));
         let file = fs::OpenOptions::new()
             .read(true)
@@ -279,6 +287,34 @@ fn base_dir() -> PathBuf {
         shm.join("crayon")
     } else {
         std::env::temp_dir().join("crayon")
+    }
+}
+
+/// Removes arena files whose owning process is gone, so a coordinator killed by
+/// SIGKILL (bypassing `Drop`) does not leak its /dev/shm backing forever. Only
+/// runs where `/proc` exists (Linux, where the arena dir is /dev/shm); a live —
+/// or pid-reused — file is left alone, so it never deletes an in-use arena.
+fn sweep_dead(dir: &Path) {
+    if !Path::new("/proc").is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        // arena-{pid}-{uuid}
+        let Some(pid) = name
+            .strip_prefix("arena-")
+            .and_then(|rest| rest.split('-').next())
+        else {
+            continue;
+        };
+        if pid.parse::<u32>().is_ok() && !Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 
