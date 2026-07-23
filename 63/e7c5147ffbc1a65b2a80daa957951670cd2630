@@ -1,0 +1,23 @@
+src/client.rs
+  s_4f38e0ae4afc24::t_5a978ed7e0906d 74,151,204,235,242,297-307,357
+src/protocol.rs
+  s_4f38e0ae4afc24::t_1c754417be6eac 238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "63e7c5147ffbc1a65b2a80daa957951670cd2630",
+  "prompts": {},
+  "sessions": {
+    "s_4f38e0ae4afc24": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e23dc347-c63a-44a5-a3fc-fcb120e42466",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
