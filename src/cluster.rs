@@ -120,12 +120,18 @@ impl CoordinatorServer {
         }
     }
     async fn handle(&self, mut stream: TcpStream) -> Result<(), Error> {
-        let envelope = timeout_io(read_frame::<Envelope>(&mut stream))
-            .await?
-            .ok_or_else(|| Error::Protocol("connection closed before request".into()))?;
-        envelope.validate(self.cluster_id, now_ms())?;
-        let reply = self.dispatch_blocking(&envelope).await?;
-        timeout_io(write_frame(&mut stream, &reply)).await
+        // Serve frames until the peer hangs up, so a client reuses one
+        // connection across RPCs instead of paying a TCP setup per call.
+        // An idle connection is closed by the read timeout; the client's
+        // retry reconnects.
+        loop {
+            let Some(envelope) = timeout_io(read_frame::<Envelope>(&mut stream)).await? else {
+                return Ok(());
+            };
+            envelope.validate(self.cluster_id, now_ms())?;
+            let reply = self.dispatch_blocking(&envelope).await?;
+            timeout_io(write_frame(&mut stream, &reply)).await?;
+        }
     }
     /// Parks long-poll variants (`Poll`, blocking `Get`/`GetBatch`) until ready or
     /// their wait elapses; everything else dispatches immediately.
@@ -658,19 +664,52 @@ fn estimate_reply_bytes(reply: &RpcReply) -> usize {
         .unwrap_or(0)
 }
 
+/// Idle connections kept per address for reuse. Capped so a burst of clones
+/// doesn't hoard file descriptors.
+fn connection_pool() -> &'static std::sync::Mutex<HashMap<String, Vec<TcpStream>>> {
+    static POOL: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<TcpStream>>>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(Default::default)
+}
+const POOL_MAX_PER_ADDR: usize = 8;
+
 pub async fn request(address: &str, envelope: &Envelope) -> Result<RpcReply, Error> {
     for attempt_number in 0..2 {
         let remaining_ms = envelope.deadline_unix_ms.saturating_sub(now_ms());
         if remaining_ms == 0 {
             return Err(Error::DeadlineExceeded);
         }
+        // First attempt may reuse a pooled connection; a retry always dials
+        // fresh, since a pooled stream failing usually means the server closed
+        // it while idle (and its pool-mates are just as stale).
+        let pooled = if attempt_number == 0 {
+            connection_pool()
+                .lock()
+                .unwrap()
+                .get_mut(address)
+                .and_then(Vec::pop)
+        } else {
+            None
+        };
         let attempt = tokio::time::timeout(Duration::from_millis(remaining_ms), async {
-            let mut stream = TcpStream::connect(address).await?;
-            let _ = stream.set_nodelay(true);
+            let mut stream = match pooled {
+                Some(stream) => stream,
+                None => {
+                    let stream = TcpStream::connect(address).await?;
+                    let _ = stream.set_nodelay(true);
+                    stream
+                }
+            };
             write_frame(&mut stream, envelope).await?;
-            read_frame(&mut stream)
+            let reply = read_frame(&mut stream)
                 .await?
-                .ok_or_else(|| Error::Io("connection closed before reply".into()))
+                .ok_or_else(|| Error::Io("connection closed before reply".into()))?;
+            let mut pool = connection_pool().lock().unwrap();
+            let idle = pool.entry(address.to_string()).or_default();
+            if idle.len() < POOL_MAX_PER_ADDR {
+                idle.push(stream);
+            }
+            Ok(reply)
         })
         .await;
         match attempt {
