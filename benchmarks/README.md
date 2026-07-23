@@ -53,17 +53,21 @@ tracks how well each system's control plane scales with node count.
 
 | workers | Crayon (ep/s) | Ray 2.56 (ep/s) | Crayon advantage |
 |--------:|--------------:|----------------:|-----------------:|
-|       1 |          2764 |             958 |            2.9×  |
-|       4 |          5687 |            1972 |            2.9×  |
-|       8 |          6854 |            1587 |            4.3×  |
-|      16 |          6785 |            1120 |            6.1×  |
+|       1 |          2902 |             958 |            3.0×  |
+|       2 |          4782 |               — |               —  |
+|       4 |          6377 |            1972 |            3.2×  |
+|       8 |          7531 |            1587 |            4.7×  |
+|      16 |          8709 |            1120 |            7.8×  |
 
-Crayon rises with worker count and saturates at the host's core count (8), then
-holds. **Ray peaks at 4 workers and then regresses** — adding workers makes it
-slower, as central (GCS + Python) scheduling contention and plasma pressure
-outweigh the added parallelism. The advantage therefore widens with scale: 2.9×
-at one worker, 6.1× at sixteen, with the trend pointing higher on a real
-multi-node cluster where per-task central-scheduler cost dominates.
+Crayon rises with worker count past the host's core count. **Ray peaks at 4
+workers and then regresses** — adding workers makes it slower, as central (GCS +
+Python) scheduling contention and plasma pressure outweigh the added
+parallelism. The advantage therefore widens with scale: 3.0× at one worker, 7.8×
+at sixteen, with the trend pointing higher on a real multi-node cluster where
+per-task central-scheduler cost dominates. These are post-`4adf025` numbers:
+shortening the coordinator's critical sections lifted 16-worker throughput 28%
+(6785 → 8709), and the gain grows with worker count because it removes shared-lock
+contention.
 
 ## Scaling with per-task compute
 
