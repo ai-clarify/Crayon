@@ -1,0 +1,25 @@
+src/client.rs
+  s_4854aaee89b37c::t_5b7938bb1f7bd9 8,20,31-44,48-57
+src/error.rs
+  s_4854aaee89b37c::t_94b850dbc6875f 14-15
+src/protocol.rs
+  s_4854aaee89b37c::t_4539f03251db1c 78-86,135,184-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b232aef396dddadae8be50d6f55c0f85a82d4e33",
+  "prompts": {},
+  "sessions": {
+    "s_4854aaee89b37c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f92d4164-a0d1-4298-82d4-3032ced81ea5",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
