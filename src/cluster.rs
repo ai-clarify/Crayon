@@ -361,7 +361,7 @@ impl CoordinatorServer {
                                     size_bytes: bytes.len() as u64,
                                     checksum,
                                     location: "coordinator".into(),
-                                    bytes: Some(bytes),
+                                    bytes: Some(bytes.into()),
                                 })
                             }
                             Err(error) => ClientReply::Error(error),
@@ -799,7 +799,7 @@ mod tests {
                         size_bytes: 1,
                         checksum: checksum(&[7]),
                         location: "127.0.0.1:9001".into(),
-                        bytes: Some(vec![7]),
+                        bytes: Some(vec![7].into()),
                     },
                 }),
             ),

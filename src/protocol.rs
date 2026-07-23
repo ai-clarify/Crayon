@@ -8,6 +8,7 @@ use crate::{
     resources::ResourceSet,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::fmt;
 
 impl fmt::Display for TaskStatus {
@@ -135,7 +136,7 @@ pub struct TaskCompletion {
     /// Small outputs are shipped inline with the completion so the coordinator
     /// can answer `Get` in one hop instead of redirecting to the worker.
     /// `None` for large outputs, which are fetched from `location` on demand.
-    pub bytes: Option<Vec<u8>>,
+    pub bytes: Option<Arc<[u8]>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientRequest {
@@ -198,7 +199,7 @@ pub struct ObjectPayload {
     pub size_bytes: u64,
     pub checksum: [u8; 32],
     pub location: String,
-    pub bytes: Option<Vec<u8>>,
+    pub bytes: Option<Arc<[u8]>>,
 }
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskStatus {

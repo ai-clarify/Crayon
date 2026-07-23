@@ -14,7 +14,7 @@ name = "crayon"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 bincode = "1"
 blake3 = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -29,3 +29,7 @@ path = "src/bin/crayon_cluster.rs"
 [[bin]]
 name = "cluster-benchmark"
 path = "src/bin/cluster_benchmark.rs"
+
+[[bin]]
+name = "storage-benchmark"
+path = "src/bin/storage_benchmark.rs"
