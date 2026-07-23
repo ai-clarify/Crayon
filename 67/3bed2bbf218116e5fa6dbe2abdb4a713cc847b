@@ -1,0 +1,29 @@
+docs/acceptance.md
+  s_549c9bc8bea5f9::t_14dd66d33b1ecf 31-35
+src/bin/crayon_cluster.rs
+  s_549c9bc8bea5f9::t_faac7c409c7422 148,151,155-159
+src/client.rs
+  s_549c9bc8bea5f9::t_d08d4c41e36d7d 10-12,204-205,208-229
+src/cluster.rs
+  s_549c9bc8bea5f9::t_beced2950754b9 26-33,41,50,82,85-109,270-276,278-301,303,357-531
+src/error.rs
+  s_549c9bc8bea5f9::t_222510b078c0cb 15-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "673bed2bbf218116e5fa6dbe2abdb4a713cc847b",
+  "prompts": {},
+  "sessions": {
+    "s_549c9bc8bea5f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6970588b-ad57-4997-95fe-11a138746c2e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
