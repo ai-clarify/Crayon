@@ -29,3 +29,7 @@ path = "src/bin/crayon_cluster.rs"
 [[bin]]
 name = "cluster-benchmark"
 path = "src/bin/cluster_benchmark.rs"
+
+[[bin]]
+name = "storage-benchmark"
+path = "src/bin/storage_benchmark.rs"
