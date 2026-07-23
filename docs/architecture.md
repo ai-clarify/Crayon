@@ -52,3 +52,31 @@ on accepted completion, failure, worker expiry, or cancellation acknowledgement.
 The coordinator is intentionally not durable or highly available. Restarting it
 creates a new epoch and ends the existing session. Workers and clients must
 reconnect to the new session. Application state requires explicit checkpoints.
+
+## Protocol compatibility
+
+The wire protocol has a major version. Coordinator, worker, and client processes
+must use compatible protocol versions; there is no negotiation or rolling
+upgrade support. A client discovers the current coordinator epoch before
+submitting mutations, and a restarted coordinator rejects stale epochs.
+
+## RPC retry and replay
+
+A client retries an RPC once on ambiguous transport failure, reusing the
+original request ID. The coordinator replays the first response for a request ID
+until its deadline, so a lost response cannot repeat a mutation within one live
+coordinator epoch. Replay state is in memory and is lost on coordinator
+restart. This does not make task execution or external side effects exactly-once.
+
+## Client results
+
+`TaskHandle::result` distinguishes successful results, `TaskFailed`,
+`TaskCancelled`, and deadline expiration. Failed and cancelled tasks return
+typed errors instead of timing out.
+
+## Heartbeats
+
+Workers send periodic heartbeats. A transient transport error or deadline does
+not permanently stop heartbeat delivery; coordinator rejection, protocol
+incompatibility, or stale identity still terminates the worker loop.
+

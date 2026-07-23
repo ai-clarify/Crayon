@@ -44,6 +44,13 @@ target/debug/crayon-cluster submit 127.0.0.1:7000 20 22
 
 Expected output: `42`.
 
+## Benchmark
+
+The benchmark is a release-only measurement, not a functional PR gate. A
+semantic smoke run (`--warmups 1 --samples 3`) must pass on supported platforms
+before a release. Full results are generated on the target machine and attached
+to the GitHub Release; raw samples are not committed.
+
 ## Not yet claimed
 
 Coordinator restart persistence, stale-report replay injection, chunked objects,
