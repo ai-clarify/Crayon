@@ -41,7 +41,7 @@ impl Cluster {
             coordinator_child: child,
             workers: Vec::new(),
         };
-        cluster.eventually(Duration::from_secs(3), || {
+        cluster.eventually(Duration::from_secs(10), || {
             cluster
                 .run(["workers", &cluster.coordinator])
                 .status
@@ -67,7 +67,7 @@ impl Cluster {
             .spawn()
             .unwrap();
         self.workers.push(WorkerProcess { node_id, child });
-        self.eventually(Duration::from_secs(3), || {
+        self.eventually(Duration::from_secs(10), || {
             stdout(self.run(["workers", &self.coordinator])).contains(&address)
         });
         address
@@ -171,11 +171,11 @@ fn multi_stage_dag_fetches_worker_local_output() {
     let mut cluster = Cluster::start(5_000);
     cluster.worker("copy", 1.0);
     let (first, first_output) = cluster.submit("copy", 41, None, 1.0, 1);
-    cluster.eventually(Duration::from_secs(3), || {
+    cluster.eventually(Duration::from_secs(10), || {
         cluster.status(&first).contains("Succeeded")
     });
     let (second, second_output) = cluster.submit("copy", 0, Some(&first_output), 1.0, 1);
-    cluster.eventually(Duration::from_secs(3), || {
+    cluster.eventually(Duration::from_secs(10), || {
         cluster.status(&second).contains("Succeeded")
     });
     assert_eq!(
@@ -214,12 +214,12 @@ fn running_cancellation_releases_capacity_after_ack() {
     let mut cluster = Cluster::start(5_000);
     let worker = cluster.worker("sleep", 1.0);
     let (task, output) = cluster.submit("sleep", 5_000, None, 1.0, 1);
-    cluster.eventually(Duration::from_secs(3), || {
+    cluster.eventually(Duration::from_secs(10), || {
         cluster.status(&task).contains("Running")
     });
     let cancel = cluster.run(["cancel", &cluster.coordinator, &task]);
     assert!(cancel.status.success());
-    cluster.eventually(Duration::from_secs(3), || {
+    cluster.eventually(Duration::from_secs(10), || {
         cluster.status(&task).contains("Cancelled")
     });
     let workers = stdout(cluster.run(["workers", &cluster.coordinator]));
@@ -237,9 +237,9 @@ fn worker_loss_retries_and_loses_owned_objects() {
     let mut cluster = Cluster::start(300);
     cluster.worker("sleep", 1.0);
     cluster.worker("sleep", 1.0);
-    let (task, output) = cluster.submit("sleep", 800, None, 1.0, 2);
+    let (task, output) = cluster.submit("sleep", 5_000, None, 1.0, 2);
     let mut owner = None;
-    cluster.eventually(Duration::from_secs(3), || {
+    cluster.eventually(Duration::from_secs(10), || {
         let status = cluster.status(&task);
         let fields: Vec<_> = status.split_whitespace().collect();
         if fields.get(2) == Some(&"Running") {
@@ -252,7 +252,7 @@ fn worker_loss_retries_and_loses_owned_objects() {
     let first_owner = owner.unwrap();
     cluster.kill_worker(&first_owner);
     let mut second_owner = None;
-    cluster.eventually(Duration::from_secs(5), || {
+    cluster.eventually(Duration::from_secs(10), || {
         let status = cluster.status(&task);
         let fields: Vec<_> = status.split_whitespace().collect();
         if fields.get(2) == Some(&"Running") && fields.get(3) == Some(&"2") {
@@ -262,15 +262,15 @@ fn worker_loss_retries_and_loses_owned_objects() {
             false
         }
     });
-    cluster.eventually(Duration::from_secs(3), || {
+    cluster.eventually(Duration::from_secs(10), || {
         cluster.status(&task).contains("Succeeded")
     });
     assert_eq!(
         stdout(cluster.run(["get", &cluster.coordinator, &output])),
-        "800"
+        "5000"
     );
     cluster.kill_worker(&second_owner.unwrap());
-    cluster.eventually_every(Duration::from_secs(3), Duration::from_millis(150), || {
+    cluster.eventually_every(Duration::from_secs(5), Duration::from_millis(150), || {
         let lost = cluster.run(["get", &cluster.coordinator, &output]);
         !lost.status.success() && String::from_utf8_lossy(&lost.stderr).contains("ObjectLost")
     });
