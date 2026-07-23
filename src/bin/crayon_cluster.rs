@@ -456,6 +456,7 @@ async fn execute_assignment(
                         size_bytes: object.bytes.len() as u64,
                         checksum: object.checksum,
                         location: advertise.to_string(),
+                        bytes: Some(object.bytes.clone()),
                     },
                 },
                 epoch,

@@ -132,6 +132,10 @@ pub struct TaskCompletion {
     pub size_bytes: u64,
     pub checksum: [u8; 32],
     pub location: String,
+    /// Small outputs are shipped inline with the completion so the coordinator
+    /// can answer `Get` in one hop instead of redirecting to the worker.
+    /// `None` for large outputs, which are fetched from `location` on demand.
+    pub bytes: Option<Vec<u8>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientRequest {

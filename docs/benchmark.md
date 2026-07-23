@@ -65,3 +65,73 @@ These numbers measure the control-plane and worker-local object path of the
 0.2 coordinator runtime. They are not a universal framework-overhead comparison
 and are not comparable to the deleted 0.1.x Python/RL benchmark. Payload size
 has little effect at 4–64 KiB because control-plane latency dominates.
+
+# RL rollout benchmark
+
+`rl_benchmark` is a long-running distributed RL training simulation that
+exercises multi-stage task graphs, object dependencies, retries, and
+cancellation on a real coordinator/worker cluster. It simulates the
+rollout-collection phase: the coordinator hands out seeded environment
+rollouts to workers, each worker runs a fixed number of steps with the current
+policy parameters, and the coordinator aggregates episode returns and nudges
+the policy each iteration.
+
+This is a verification workload, not a performance claim. It exists to keep the
+runtime honest under sustained load and to provide an apples-to-apples
+comparison point with `benchmarks/ray_rl_benchmark.py`.
+
+## Run
+
+```bash
+cargo build --release --bin crayon-cluster --bin rl_benchmark
+
+./target/release/rl_benchmark \
+  --workers 2 \
+  --parallelism 8 \
+  --iterations 100 \
+  --steps 100 \
+  --policy-dim 16 \
+  --artifact-dir benchmark_artifacts/rl
+```
+
+The benchmark starts its own coordinator and workers on loopback; startup is
+excluded from timing. Every iteration submits `--parallelism` rollout tasks,
+waits for all of them, and applies a policy update. A task failure is logged
+but does not abort the run.
+
+Arguments:
+
+- `--workers`: number of real worker processes.
+- `--parallelism`: outstanding rollout tasks per iteration.
+- `--iterations`: number of policy-update iterations.
+- `--steps`: environment steps per rollout.
+- `--policy-dim`: linear policy parameter dimension.
+- `--max-attempts`: task retry limit.
+- `--seed`: base seed for environment generation.
+- `--artifact-dir`: output directory.
+
+## Artifacts
+
+Each run emits:
+
+- `manifest.json`: topology, parameters, total episodes, total time, and
+  episodes/second.
+- `samples.csv`: per-iteration episode count, mean return, and elapsed
+  milliseconds.
+- `process-*.log`: merged coordinator/worker stdout/stderr.
+
+## Ray comparison
+
+`benchmarks/ray_rl_benchmark.py` runs the same seeded bandit environment,
+linear policy, and per-iteration update under Ray so the two systems can be
+compared on identical per-task compute. It emits the same `manifest.json` and
+`samples.csv` schema. Install Ray (`pip install ray`) and run:
+
+```bash
+python benchmarks/ray_rl_benchmark.py \
+  --workers 2 \
+  --parallelism 8 \
+  --iterations 100 \
+  --steps 100
+```
+

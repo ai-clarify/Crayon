@@ -377,7 +377,7 @@ impl CoordinatorState {
     pub fn complete(
         &mut self,
         identity: &WorkerIdentity,
-        report: TaskCompletion,
+        mut report: TaskCompletion,
     ) -> Result<(), Error> {
         let task = &self.tasks[&report.fence.task_id];
         // Idempotent: a duplicate completion for an already-succeeded task with
@@ -404,6 +404,15 @@ impl CoordinatorState {
             .operations
             .get(&task.operation)
             .ok_or_else(|| Error::OperationUnavailable(task.operation.to_string()))?;
+        // Inline bytes, when shipped, must match the reported size and checksum;
+        // a mismatch means the worker sent inconsistent data.
+        if let Some(bytes) = &report.bytes {
+            if bytes.len() as u64 != report.size_bytes
+                || crate::cluster::checksum(bytes) != report.checksum
+            {
+                return Err(Error::ObjectConflict(task.output));
+            }
+        }
         if task.output != report.output_id
             || self.objects[&task.output].state != ObjectState::Reserved
             || report.codec != descriptor.output_codec
@@ -425,6 +434,7 @@ impl CoordinatorState {
         object.checksum = Some(report.checksum);
         object.location = Some(report.location);
         object.owner = Some(identity.node_id);
+        object.bytes = report.bytes.take();
         self.reconcile_dependencies();
         self.changed();
         Ok(())

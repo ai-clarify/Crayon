@@ -207,12 +207,27 @@ struct Args {
     artifact_dir: PathBuf,
 }
 
+fn print_help() {
+    eprintln!(
+        "rl_benchmark — long-running distributed RL rollout simulation\n\
+\n\
+USAGE:\n    rl_benchmark [OPTIONS]\n\
+\n\
+OPTIONS:\n    --workers <N>        number of worker processes (default: 2)\n    --parallelism <N>    outstanding rollout tasks per iteration (default: 8)\n    --iterations <N>     number of policy-update iterations (default: 100)\n    --steps <N>          environment steps per rollout (default: 100)\n    --policy-dim <N>     linear policy parameter dimension (default: 16)\n    --max-attempts <N>   task retry limit (default: 3)\n    --seed <N>           base seed for environment generation (default: 42)\n    --artifact-dir <P>   output directory (default: benchmark_artifacts/rl)\n    -h, --help           print this help and exit\n"
+    );
+}
+
 fn parse_args() -> Args {
     let mut values = HashMap::new();
     let mut iter = std::env::args().skip(1);
     while let Some(key) = iter.next() {
+        if key == "-h" || key == "--help" {
+            print_help();
+            std::process::exit(0);
+        }
         let Some(value) = iter.next() else {
             eprintln!("missing value for {key}");
+            print_help();
             std::process::exit(2);
         };
         values.insert(key, value);

@@ -627,6 +627,7 @@ mod tests {
                         size_bytes: 1,
                         checksum: checksum(&[7]),
                         location: "127.0.0.1:9001".into(),
+                        bytes: Some(vec![7]),
                     },
                 }),
             ),
