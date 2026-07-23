@@ -20,17 +20,29 @@ overhead, not algorithm speed**. Identical `mean_return` at the final iteration
 
 ## Result
 
-Same machine (Apple M4 Pro, 14 logical CPUs), same config
-(`--workers 4 --parallelism 16 --iterations 1000 --steps 500 --policy-dim 32 --seed 42`):
+Config for every run:
+`--workers 4 --parallelism 16 --iterations 1000 --steps 500 --policy-dim 32 --seed 42`.
 
-| System        | episodes/s | total time | per iteration |
-|---------------|-----------:|-----------:|--------------:|
-| **Crayon**    |   **2341** |     6.84 s |        6.8 ms |
-| Ray 2.53      |        486 |    32.91 s |       32.9 ms |
-| **Speed-up**  |   **4.8×** |            |               |
+On a server-class host (Intel Xeon Platinum 8260, 8 logical CPUs):
+
+| System         | episodes/s | total time | per iteration |
+|----------------|-----------:|-----------:|--------------:|
+| **Crayon**     |   **4311** |     3.71 s |        3.7 ms |
+| Ray 2.56.1     |       1752 |     9.13 s |        9.1 ms |
+| **Speed-up**   |   **2.5×** |            |               |
+
+On a laptop-class host (Apple M4 Pro, 14 logical CPUs):
+
+| System         | episodes/s | total time | per iteration |
+|----------------|-----------:|-----------:|--------------:|
+| **Crayon**     |   **2341** |     6.84 s |        6.8 ms |
+| Ray 2.53       |        486 |    32.91 s |       32.9 ms |
+| **Speed-up**   |   **4.8×** |            |               |
 
 Crayon's per-iteration cost is flat to completion — no degradation as tasks
-accumulate — so the run length is unbounded.
+accumulate — so the run length is unbounded. On the Xeon host this workload was
+6.1× *slower* than Ray before the 0.3.0 control-plane rewrite; it is now 2.5×
+faster — a ~15× swing on the same hardware.
 
 ## Why Crayon is faster here
 
