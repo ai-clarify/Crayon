@@ -1,0 +1,21 @@
+benchmarks/README.md
+  s_4854aaee89b37c::t_44f31582283180 68-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4adf025174eed42cbd5b127e9410962483f47e56",
+  "prompts": {},
+  "sessions": {
+    "s_4854aaee89b37c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f92d4164-a0d1-4298-82d4-3032ced81ea5",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
