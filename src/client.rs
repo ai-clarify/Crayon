@@ -83,17 +83,27 @@ impl ClusterClient {
     /// the cluster lifetime; distributed reference counting is intentionally unsupported.
     pub async fn put<T: Serialize>(&self, value: &T) -> Result<ObjectRef<T>, Error> {
         let bytes = bincode::serialize(value)?;
+        self.put_raw(Codec::BincodeV1, &bytes)
+            .await
+            .map(ObjectRef::new)
+    }
+    /// Stores raw bytes with no serialization envelope — the moral twin of
+    /// `ray.put(bytes)`. Fetch with `get_bytes`.
+    pub async fn put_bytes(&self, bytes: &[u8]) -> Result<ObjectId, Error> {
+        self.put_raw(Codec::RawBytes, bytes).await
+    }
+    async fn put_raw(&self, codec: Codec, bytes: &[u8]) -> Result<ObjectId, Error> {
         if self.arena_writer.lock().is_some() {
-            return self.put_arena(bytes).await;
+            return self.put_arena(codec, bytes).await;
         }
         match self
             .rpc(ClientRequest::Put {
-                codec: Codec::BincodeV1,
-                bytes,
+                codec,
+                bytes: bytes.to_vec(),
             })
             .await?
         {
-            ClientReply::Object(payload) => Ok(ObjectRef::new(payload.id)),
+            ClientReply::Object(payload) => Ok(payload.id),
             ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected put reply".into())),
         }
@@ -101,18 +111,18 @@ impl ClusterClient {
     /// Same-host put: reserve an arena slot, write the bytes into shared memory
     /// at the granted offset, then commit. The payload never crosses a socket,
     /// so object size is bounded by the arena, not the RPC frame — gigabytes work.
-    async fn put_arena<T>(&self, bytes: Vec<u8>) -> Result<ObjectRef<T>, Error> {
-        let checksum = checksum(&bytes);
+    async fn put_arena(&self, codec: Codec, bytes: &[u8]) -> Result<ObjectId, Error> {
+        let checksum = checksum(bytes);
         let reply = self
             .rpc(ClientRequest::ArenaReserve {
-                codec: Codec::BincodeV1,
+                codec,
                 size_bytes: bytes.len() as u64,
                 checksum,
             })
             .await?;
         match reply {
             // Content already stored: reserve resolved as a get.
-            ClientReply::Object(payload) => Ok(ObjectRef::new(payload.id)),
+            ClientReply::Object(payload) => Ok(payload.id),
             ClientReply::ArenaReserved { id, offset } => {
                 {
                     let mut writer = self.arena_writer.lock();
@@ -124,10 +134,10 @@ impl ClusterClient {
                         .checked_add(bytes.len())
                         .filter(|&end| end <= map.len())
                         .ok_or_else(|| Error::Protocol("arena offset out of bounds".into()))?;
-                    map[start..end].copy_from_slice(&bytes);
+                    crate::arena::copy_wide(&mut map[start..end], bytes);
                 }
                 match self.rpc(ClientRequest::ArenaCommit(id)).await? {
-                    ClientReply::Object(payload) => Ok(ObjectRef::new(payload.id)),
+                    ClientReply::Object(payload) => Ok(payload.id),
                     ClientReply::Error(error) => Err(error),
                     _ => Err(Error::Protocol("unexpected commit reply".into())),
                 }
@@ -309,7 +319,7 @@ impl ClusterClient {
                     // trust the offset and skip re-hashing (as plasma does). Only
                     // the offset bounds, checked above, need guarding.
                     let _ = checksum;
-                    return Ok((codec, map[start..end].to_vec()));
+                    return Ok((codec, crate::arena::to_vec_wide(&map[start..end])));
                 }
             }
         }

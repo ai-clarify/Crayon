@@ -16,7 +16,7 @@ name = "crayon"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
 serde = { version = "1", features = ["derive", "rc"] }
 bincode = "1"
-blake3 = "1"
+blake3 = { version = "1", features = ["rayon"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 parking_lot = "0.12"
 futures = "0.3"

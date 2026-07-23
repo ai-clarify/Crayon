@@ -244,6 +244,34 @@ pub fn map_arena_mut(token: &str) -> Option<MmapMut> {
     unsafe { MmapMut::map_mut(&file).ok() }
 }
 
+/// Multithreaded memcpy: a gigabyte copy is memory-bandwidth work one core
+/// can't saturate. Below 32MB the spawn cost beats the win, so copy plainly.
+pub fn copy_wide(dst: &mut [u8], src: &[u8]) {
+    const PAR_MIN: usize = 32 * 1024 * 1024;
+    if src.len() < PAR_MIN {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    let chunk = src.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (d, s) in dst.chunks_mut(chunk).zip(src.chunks(chunk)) {
+            scope.spawn(move || d.copy_from_slice(s));
+        }
+    });
+}
+
+/// `src.to_vec()` with the copy parallelized (and the redundant zero-fill of a
+/// `vec![0; n]` skipped) — the read half of the same bandwidth problem.
+pub fn to_vec_wide(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len());
+    // SAFETY: `copy_wide` overwrites every byte before the Vec is used; u8 has
+    // no validity invariant.
+    unsafe { out.set_len(src.len()) };
+    copy_wide(&mut out, src);
+    out
+}
+
 fn base_dir() -> PathBuf {
     let shm = PathBuf::from("/dev/shm");
     if shm.is_dir() {

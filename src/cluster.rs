@@ -737,7 +737,14 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 pub fn checksum(bytes: &[u8]) -> [u8; 32] {
-    *blake3::hash(bytes).as_bytes()
+    // A gigabyte-scale hash is a full memory pass; fan it out across cores.
+    if bytes.len() >= 1 << 20 {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update_rayon(bytes);
+        *hasher.finalize().as_bytes()
+    } else {
+        *blake3::hash(bytes).as_bytes()
+    }
 }
 
 #[cfg(test)]
