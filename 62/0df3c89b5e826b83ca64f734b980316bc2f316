@@ -1,0 +1,23 @@
+benchmarks/crayon_llm_rl.py
+  s_41c334c91b145e::t_308e7a8f6c8ec8 79,83
+benchmarks/llm_sidecar.py
+  s_41c334c91b145e::t_b0a046d19e581f 85-88,92-114,117,119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "620df3c89b5e826b83ca64f734b980316bc2f316",
+  "prompts": {},
+  "sessions": {
+    "s_41c334c91b145e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5b548f5-e223-437a-a200-0fc66030f3de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
