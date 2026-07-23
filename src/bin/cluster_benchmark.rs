@@ -372,6 +372,9 @@ fn write_artifacts(args: &Args, samples: &[Sample]) -> Result<(), Error> {
         "git_sha": git_sha(),
         "git_dirty": git_dirty(),
         "rust_version": rust_version(),
+        "os": os_info(),
+        "cpu_model": cpu_model(),
+        "logical_cpus": logical_cpus(),
         "workers": args.workers,
         "concurrency": args.concurrency,
         "warmups": args.warmups,
@@ -480,4 +483,40 @@ fn rust_version() -> String {
     )
     .trim()
     .to_string()
+}
+
+fn os_info() -> String {
+    String::from_utf8_lossy(
+        &std::process::Command::new("uname")
+            .args(["-s", "-r", "-m"])
+            .output()
+            .map(|output| output.stdout)
+            .unwrap_or_default(),
+    )
+    .trim()
+    .to_string()
+}
+
+fn cpu_model() -> String {
+    if let Ok(output) = std::process::Command::new("lscpu").output() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(value) = line.strip_prefix("Model name:") {
+                return value.trim().to_string();
+            }
+        }
+    }
+    if let Ok(output) = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg("machdep.cpu.brand_string")
+        .output()
+    {
+        return String::from_utf8_lossy(&output.stdout).trim().to_string();
+    }
+    "unknown".into()
+}
+
+fn logical_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0)
 }
