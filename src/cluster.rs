@@ -272,6 +272,18 @@ impl CoordinatorServer {
             )),
         }
     }
+    /// Rewrites a payload to its arena form when the object lives in the arena:
+    /// inline bytes are dropped and a same-host reader takes the offset instead.
+    /// A cross-host client cannot map the arena and refetches via `GetLocal`.
+    fn arena_annotate(&self, payload: &mut ObjectPayload) {
+        if let Some(meta) = self.arena.meta(payload.id) {
+            payload.bytes = None;
+            payload.arena = Some(crate::arena::ArenaRef {
+                token: self.arena.token().to_string(),
+                offset: meta.offset,
+            });
+        }
+    }
     fn dispatch(&self, request: RpcRequest) -> RpcReply {
         match request {
             RpcRequest::Worker(request) => RpcReply::Worker(match request {
@@ -441,17 +453,7 @@ impl CoordinatorServer {
                 ClientRequest::Get { object: id, .. } => {
                     match self.state.lock().resolve_object(id) {
                         Ok(mut payload) => {
-                            // Same-host objects travel as an arena offset, not
-                            // bytes: the client reads them from its cached arena
-                            // mapping. A cross-host client cannot map the arena
-                            // and refetches bytes via GetLocal below.
-                            if let Some(meta) = self.arena.meta(id) {
-                                payload.bytes = None;
-                                payload.arena = Some(crate::arena::ArenaRef {
-                                    token: self.arena.token().to_string(),
-                                    offset: meta.offset,
-                                });
-                            }
+                            self.arena_annotate(&mut payload);
                             ClientReply::Object(payload)
                         }
                         Err(error) => ClientReply::Error(error),
@@ -526,13 +528,7 @@ impl CoordinatorServer {
                     // repeat reserve of stored content resolves as a plain get.
                     // (Unhashed large puts use random ids and never dedup.)
                     if let Ok(mut payload) = self.state.lock().resolve_object(id) {
-                        if let Some(meta) = self.arena.meta(id) {
-                            payload.bytes = None;
-                            payload.arena = Some(crate::arena::ArenaRef {
-                                token: self.arena.token().to_string(),
-                                offset: meta.offset,
-                            });
-                        }
+                        self.arena_annotate(&mut payload);
                         ClientReply::Object(payload)
                     } else {
                         match self.arena.reserve(id, size_bytes, codec, checksum) {
@@ -547,24 +543,17 @@ impl CoordinatorServer {
                     self.arena.commit(id);
                     match self.arena.meta(id) {
                         Some(meta) => {
-                            match self.state.lock().put_meta(
+                            let registered = self.state.lock().put_meta(
                                 id,
                                 meta.codec.clone(),
                                 meta.size,
                                 meta.checksum,
-                            ) {
-                                Ok(id) => ClientReply::Object(ObjectPayload {
-                                    id,
-                                    codec: meta.codec,
-                                    size_bytes: meta.size,
-                                    checksum: meta.checksum,
-                                    location: "coordinator".into(),
-                                    bytes: None,
-                                    arena: Some(crate::arena::ArenaRef {
-                                        token: self.arena.token().to_string(),
-                                        offset: meta.offset,
-                                    }),
-                                }),
+                            );
+                            match registered.and_then(|id| self.state.lock().resolve_object(id)) {
+                                Ok(mut payload) => {
+                                    self.arena_annotate(&mut payload);
+                                    ClientReply::Object(payload)
+                                }
                                 Err(error) => ClientReply::Error(error),
                             }
                         }

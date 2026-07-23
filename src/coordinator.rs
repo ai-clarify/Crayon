@@ -235,41 +235,12 @@ impl CoordinatorState {
     pub fn put(&mut self, codec: Codec, bytes: Vec<u8>) -> Result<ObjectId, Error> {
         let checksum = crate::cluster::checksum(&bytes);
         let id = ObjectId::from_checksum(checksum);
-        if let Some(existing) = self.objects.get(&id) {
-            if existing.state != ObjectState::Available
-                || existing.codec.as_ref() != Some(&codec)
-                || existing.size_bytes != Some(bytes.len() as u64)
-                || existing.checksum != Some(checksum)
-            {
-                // `id` is the blake3 digest of `bytes`, so a matching id already
-                // proves matching content -- no full-payload compare needed.
-                return Err(Error::ObjectConflict(id));
-            }
-            return Ok(id);
-        }
-        if self.objects.len() >= MAX_OBJECTS {
-            return Err(Error::CapacityExceeded("object store limit reached".into()));
-        }
-        self.objects.insert(
-            id,
-            ObjectRecord {
-                id,
-                state: ObjectState::Available,
-                codec: Some(codec),
-                size_bytes: Some(bytes.len() as u64),
-                checksum: Some(checksum),
-                bytes: Some(bytes.into()),
-                location: Some("coordinator".into()),
-                owner: None,
-                ref_count: 1,
-            },
-        );
-        self.changed();
-        Ok(id)
+        let size_bytes = bytes.len() as u64;
+        self.admit_object(id, codec, size_bytes, checksum, Some(bytes.into()))
     }
     /// Registers a client-put object whose bytes live in the shared-memory
     /// arena: the record carries metadata only, and readers are handed an
-    /// arena offset instead of inline bytes. Mirrors `put`'s dedup and caps.
+    /// arena offset instead of inline bytes.
     pub fn put_meta(
         &mut self,
         id: ObjectId,
@@ -277,12 +248,25 @@ impl CoordinatorState {
         size_bytes: u64,
         checksum: [u8; 32],
     ) -> Result<ObjectId, Error> {
+        self.admit_object(id, codec, size_bytes, checksum, None)
+    }
+    fn admit_object(
+        &mut self,
+        id: ObjectId,
+        codec: Codec,
+        size_bytes: u64,
+        checksum: [u8; 32],
+        bytes: Option<Arc<[u8]>>,
+    ) -> Result<ObjectId, Error> {
         if let Some(existing) = self.objects.get(&id) {
             if existing.state != ObjectState::Available
                 || existing.codec.as_ref() != Some(&codec)
                 || existing.size_bytes != Some(size_bytes)
                 || existing.checksum != Some(checksum)
             {
+                // A content-derived id already proves matching content; random
+                // (unhashed) ids never repeat. Either way metadata equality is
+                // the whole check -- no full-payload compare.
                 return Err(Error::ObjectConflict(id));
             }
             return Ok(id);
@@ -298,7 +282,7 @@ impl CoordinatorState {
                 codec: Some(codec),
                 size_bytes: Some(size_bytes),
                 checksum: Some(checksum),
-                bytes: None,
+                bytes,
                 location: Some("coordinator".into()),
                 owner: None,
                 ref_count: 1,
