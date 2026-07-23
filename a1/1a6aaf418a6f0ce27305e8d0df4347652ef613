@@ -1,0 +1,21 @@
+benchmarks/ray_rl_benchmark.py
+  s_4854aaee89b37c::t_e0b039a0ccc699 1-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a11a6aaf418a6f0ce27305e8d0df4347652ef613",
+  "prompts": {},
+  "sessions": {
+    "s_4854aaee89b37c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f92d4164-a0d1-4298-82d4-3032ced81ea5",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
