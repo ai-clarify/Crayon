@@ -1,0 +1,45 @@
+src/arena.rs
+  s_41c334c91b145e::t_fe4157bda896cd 3-8,10-18,22,26,28-30,32,40-57,60-63,65,68,87-89,107-129,131-133,135-173,180-206,209,212-213,224-231,234-244,261,264-272,274-279,282,284-291
+src/client.rs
+  s_2afa39eac5045a::t_d4b15954444be7 3,28-32,45,53-56,58-60,86-88,101-138
+src/cluster.rs
+  s_41c334c91b145e::t_5a859ef2c0db65 357,367,432,436,481,484-499,503-555,603-604
+src/coordinator.rs
+  s_2afa39eac5045a::t_9a85671100266a 263-302
+src/protocol.rs
+  s_3064b64847b273::t_f193e0357a57a9 175-183,251-253,256-262
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1d0c0edf33c574f4cdceffd81018493c332c37f2",
+  "prompts": {},
+  "sessions": {
+    "s_2afa39eac5045a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5cdd2e04-b710-4054-9fce-eb8e05e76006",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3064b64847b273": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa8ef3227322d7a02",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_41c334c91b145e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5b548f5-e223-437a-a200-0fc66030f3de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
