@@ -1,0 +1,35 @@
+docs/feature-prescreen.md
+  s_4f38e0ae4afc24::t_6b4206fafc62dd 1-259
+src/client.rs
+  s_4854aaee89b37c::t_4ed78b247c6397 119-131,185,203-211,245-248,256-265,269-280
+src/coordinator.rs
+  s_4f38e0ae4afc24::t_99b96c94586e53 13,20,25,50,58,70,82,95
+src/error.rs
+  s_4854aaee89b37c::t_c516ea8db87753 20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7b6df8c1fd140c2a308cc57e59fcfe4132613d61",
+  "prompts": {},
+  "sessions": {
+    "s_4854aaee89b37c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f92d4164-a0d1-4298-82d4-3032ced81ea5",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_4f38e0ae4afc24": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e23dc347-c63a-44a5-a3fc-fcb120e42466",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
