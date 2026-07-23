@@ -11,6 +11,8 @@ pub enum Error {
     OperationConflict(String),
     IllegalTransition(String),
     StaleFence,
+    StaleEpoch,
+    CapacityExceeded(String),
     TaskNotFound(TaskId),
     TaskFailed(TaskId, String),
     TaskCancelled(TaskId),

@@ -12,6 +12,10 @@ use crate::{
 };
 use std::collections::HashMap;
 
+pub const MAX_TASKS: usize = 16_384;
+pub const MAX_OBJECTS: usize = 65_536;
+pub const MAX_INLINE_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum WorkerState {
     Alive,
@@ -92,6 +96,7 @@ pub struct CoordinatorState {
     pub workers: HashMap<NodeId, WorkerRecord>,
     pub tasks: HashMap<TaskId, TaskRecord>,
     pub objects: HashMap<ObjectId, ObjectRecord>,
+    pub operations: HashMap<OperationKey, OperationDescriptor>,
 }
 impl CoordinatorState {
     pub fn new(epoch: CoordinatorEpoch) -> Self {
@@ -101,6 +106,7 @@ impl CoordinatorState {
             workers: HashMap::new(),
             tasks: HashMap::new(),
             objects: HashMap::new(),
+            operations: HashMap::new(),
         }
     }
     fn changed(&mut self) {
@@ -126,15 +132,9 @@ impl CoordinatorState {
                     return Err(Error::OperationConflict(descriptor.key.to_string()));
                 }
             }
-            for worker in self
-                .workers
-                .values()
-                .filter(|worker| worker.state == WorkerState::Alive)
-            {
-                if let Some(existing) = worker.operations.get(&descriptor.key) {
-                    if existing != descriptor {
-                        return Err(Error::OperationConflict(descriptor.key.to_string()));
-                    }
+            if let Some(existing) = self.operations.get(&descriptor.key) {
+                if existing != descriptor {
+                    return Err(Error::OperationConflict(descriptor.key.to_string()));
                 }
             }
         }
@@ -160,6 +160,9 @@ impl CoordinatorState {
             session_id: WorkerSessionId::new(),
             coordinator_epoch: self.epoch,
         };
+        for (key, descriptor) in &operations {
+            self.operations.insert(key.clone(), descriptor.clone());
+        }
         self.workers.insert(
             request.node_id,
             WorkerRecord {
@@ -204,6 +207,9 @@ impl CoordinatorState {
             }
             return Ok(id);
         }
+        if self.objects.len() >= MAX_OBJECTS {
+            return Err(Error::CapacityExceeded("object store limit reached".into()));
+        }
         self.objects.insert(
             id,
             ObjectRecord {
@@ -232,19 +238,14 @@ impl CoordinatorState {
                 "max_attempts must be positive".into(),
             ));
         }
-        let descriptors: Vec<_> = self
-            .workers
-            .values()
-            .filter(|worker| worker.state == WorkerState::Alive)
-            .filter_map(|worker| worker.operations.get(&operation))
-            .collect();
-        let descriptor = descriptors
-            .first()
-            .copied()
-            .ok_or_else(|| Error::OperationUnavailable(operation.to_string()))?;
-        if descriptors.iter().any(|candidate| *candidate != descriptor) {
-            return Err(Error::OperationConflict(operation.to_string()));
+        if self.tasks.len() >= MAX_TASKS {
+            return Err(Error::CapacityExceeded("task limit reached".into()));
         }
+        let descriptor = self
+            .operations
+            .get(&operation)
+            .cloned()
+            .ok_or_else(|| Error::OperationUnavailable(operation.to_string()))?;
         descriptor.validate_args(&args)?;
         if !self.workers.values().any(|worker| {
             worker.state == WorkerState::Alive
@@ -376,7 +377,10 @@ impl CoordinatorState {
             ));
         }
         let worker = &self.workers[&identity.node_id];
-        let descriptor = &worker.operations[&task.operation];
+        let descriptor = self
+            .operations
+            .get(&task.operation)
+            .ok_or_else(|| Error::OperationUnavailable(task.operation.to_string()))?;
         if task.output != report.output_id
             || self.objects[&task.output].state != ObjectState::Reserved
             || report.codec != descriptor.output_codec

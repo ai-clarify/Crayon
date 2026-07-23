@@ -5,7 +5,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::{
     cluster::{checksum, envelope, request},
     error::Error,
-    ids::{ClusterId, ObjectId, TaskId},
+    ids::{ClusterId, CoordinatorEpoch, ObjectId, TaskId},
     operation::{Codec, Operation, TaskArg},
     protocol::{
         ClientReply, ClientRequest, RpcReply, RpcRequest, TaskStatus, TaskView, WorkerView,
@@ -17,6 +17,7 @@ use crate::{
 pub struct ClusterClient {
     address: String,
     cluster_id: ClusterId,
+    coordinator_epoch: Option<CoordinatorEpoch>,
 }
 impl ClusterClient {
     /// Connects using the default all-zero cluster id used by `crayon-cluster`.
@@ -27,15 +28,33 @@ impl ClusterClient {
         Self {
             address: address.into(),
             cluster_id,
+            coordinator_epoch: None,
+        }
+    }
+    /// Discovers the current coordinator epoch. Mutation requests after this
+    /// call are fenced to the discovered epoch; a restarted coordinator rejects
+    /// them with `Error::StaleEpoch`.
+    pub async fn connect_epoch(&mut self) -> Result<CoordinatorEpoch, Error> {
+        match self.rpc_raw(ClientRequest::Connect, None).await? {
+            ClientReply::Connected { coordinator_epoch } => {
+                self.coordinator_epoch = Some(coordinator_epoch);
+                Ok(coordinator_epoch)
+            }
+            ClientReply::Error(error) => Err(error),
+            _ => Err(Error::Protocol("unexpected connect reply".into())),
         }
     }
     async fn rpc(&self, body: ClientRequest) -> Result<ClientReply, Error> {
-        match request(
-            &self.address,
-            &envelope(self.cluster_id, RpcRequest::Client(body)),
-        )
-        .await?
-        {
+        self.rpc_raw(body, self.coordinator_epoch).await
+    }
+    async fn rpc_raw(
+        &self,
+        body: ClientRequest,
+        coordinator_epoch: Option<CoordinatorEpoch>,
+    ) -> Result<ClientReply, Error> {
+        let mut envelope = envelope(self.cluster_id, RpcRequest::Client(body));
+        envelope.coordinator_epoch = coordinator_epoch;
+        match request(&self.address, &envelope).await? {
             RpcReply::Client(reply) => Ok(reply),
             _ => Err(Error::Protocol("unexpected worker reply".into())),
         }

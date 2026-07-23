@@ -24,6 +24,8 @@ use crate::{
 
 const MAX_CONNECTIONS: usize = 256;
 const RETRY_DELAY: Duration = Duration::from_millis(25);
+const MAX_REPLAY_ENTRIES: usize = 4_096;
+const MAX_REPLAY_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ReplayEntry {
@@ -39,6 +41,7 @@ pub struct CoordinatorServer {
     lease_ms: u64,
     connections: Arc<Semaphore>,
     replay: Arc<Mutex<HashMap<RequestId, ReplayEntry>>>,
+    require_loopback: bool,
 }
 impl CoordinatorServer {
     pub fn new(cluster_id: ClusterId, lease_ms: u64) -> Self {
@@ -48,9 +51,19 @@ impl CoordinatorServer {
             lease_ms,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             replay: Arc::new(Mutex::new(HashMap::new())),
+            require_loopback: true,
         }
     }
+    /// Allows the coordinator to bind to non-loopback addresses. Unauthenticated
+    /// clusters must stay on loopback; cross-host deployments require mTLS.
+    pub fn allow_remote_bind(mut self) -> Self {
+        self.require_loopback = false;
+        self
+    }
     pub async fn serve(self, bind: &str) -> Result<(), Error> {
+        if self.require_loopback {
+            crate::protocol::require_loopback_addr(bind)?;
+        }
         let listener = TcpListener::bind(bind).await?;
         let reaper = self.clone();
         tokio::spawn(async move {
@@ -83,6 +96,12 @@ impl CoordinatorServer {
         timeout_io(write_frame(&mut stream, &reply)).await
     }
     fn dispatch_once(&self, envelope: &Envelope) -> Result<RpcReply, Error> {
+        if is_mutation(&envelope.body) {
+            self.validate_epoch(envelope)?;
+        }
+        if !should_cache(&envelope.body) {
+            return Ok(self.dispatch(envelope.body.clone()));
+        }
         let now = now_ms();
         let body_hash = checksum(&bincode::serialize(&envelope.body)?);
         let mut replay = self.replay.lock();
@@ -97,6 +116,15 @@ impl CoordinatorServer {
             return Ok(entry.reply.clone());
         }
         let reply = self.dispatch(envelope.body.clone());
+        let entry_bytes = estimate_reply_bytes(&reply);
+        if replay.len() >= MAX_REPLAY_ENTRIES
+            || replay_bytes(&replay) + entry_bytes > MAX_REPLAY_BYTES
+        {
+            return Ok(request_error(
+                &envelope.body,
+                Error::CapacityExceeded("replay cache limit reached".into()),
+            ));
+        }
         replay.insert(
             envelope.request_id,
             ReplayEntry {
@@ -107,15 +135,37 @@ impl CoordinatorServer {
         );
         Ok(reply)
     }
+    fn validate_epoch(&self, envelope: &Envelope) -> Result<(), Error> {
+        match envelope.coordinator_epoch {
+            Some(epoch) if epoch == self.state.lock().epoch => Ok(()),
+            Some(_) => Err(Error::StaleEpoch),
+            None => Err(Error::Protocol(
+                "mutation requires coordinator epoch".into(),
+            )),
+        }
+    }
     fn dispatch(&self, request: RpcRequest) -> RpcReply {
         match request {
             RpcRequest::Worker(request) => RpcReply::Worker(match request {
                 WorkerRequest::Register(request) => {
                     let registration = {
                         let mut state = self.state.lock();
-                        match state.register_worker(request, now_ms(), self.lease_ms) {
-                            Ok(identity) => Ok((identity, state.revision)),
-                            Err(error) => Err(error),
+                        if self.require_loopback {
+                            if let Err(error) =
+                                crate::protocol::require_loopback_addr(&request.advertise_addr)
+                            {
+                                Err(error)
+                            } else {
+                                match state.register_worker(request, now_ms(), self.lease_ms) {
+                                    Ok(identity) => Ok((identity, state.revision)),
+                                    Err(error) => Err(error),
+                                }
+                            }
+                        } else {
+                            match state.register_worker(request, now_ms(), self.lease_ms) {
+                                Ok(identity) => Ok((identity, state.revision)),
+                                Err(error) => Err(error),
+                            }
                         }
                     };
                     match registration {
@@ -177,6 +227,9 @@ impl CoordinatorServer {
                 },
             }),
             RpcRequest::Client(request) => RpcReply::Client(match request {
+                ClientRequest::Connect => ClientReply::Connected {
+                    coordinator_epoch: self.state.lock().epoch,
+                },
                 ClientRequest::Put { codec, bytes } => {
                     if bytes.len() > MAX_OBJECT_BYTES {
                         ClientReply::Error(Error::Protocol("object too large".into()))
@@ -272,6 +325,48 @@ fn request_error(request: &RpcRequest, error: Error) -> RpcReply {
         RpcRequest::Client(_) => RpcReply::Client(ClientReply::Error(error)),
         RpcRequest::Worker(_) => RpcReply::Worker(WorkerReply::Error(error)),
     }
+}
+
+fn is_mutation(request: &RpcRequest) -> bool {
+    match request {
+        RpcRequest::Client(client) => matches!(
+            client,
+            ClientRequest::Put { .. } | ClientRequest::Submit { .. } | ClientRequest::Cancel(_)
+        ),
+        RpcRequest::Worker(worker) => {
+            !matches!(worker, WorkerRequest::Register(_) | WorkerRequest::Poll(_))
+        }
+    }
+}
+
+/// Put is idempotent and its reply carries the full payload, so it is not cached.
+fn should_cache(request: &RpcRequest) -> bool {
+    match request {
+        RpcRequest::Client(client) => {
+            matches!(
+                client,
+                ClientRequest::Submit { .. } | ClientRequest::Cancel(_)
+            )
+        }
+        RpcRequest::Worker(worker) => !matches!(
+            worker,
+            WorkerRequest::Register(_) | WorkerRequest::Poll(_) | WorkerRequest::Heartbeat(_)
+        ),
+    }
+}
+
+fn estimate_reply_bytes(reply: &RpcReply) -> usize {
+    bincode::serialize(reply)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
+fn replay_bytes(replay: &HashMap<RequestId, ReplayEntry>) -> usize {
+    replay.values().map(estimate_entry_bytes).sum()
+}
+
+fn estimate_entry_bytes(entry: &ReplayEntry) -> usize {
+    estimate_reply_bytes(&entry.reply) + 32 + 8
 }
 
 pub async fn request(address: &str, envelope: &Envelope) -> Result<RpcReply, Error> {
@@ -378,6 +473,11 @@ mod tests {
         Envelope::new(cluster, body, now_ms().saturating_add(10_000))
     }
 
+    fn with_epoch(server: &CoordinatorServer, mut envelope: Envelope) -> Envelope {
+        envelope.coordinator_epoch = Some(server.state.lock().epoch);
+        envelope
+    }
+
     fn registered_server() -> (CoordinatorServer, crate::protocol::WorkerIdentity) {
         let cluster = ClusterId::new();
         let server = CoordinatorServer::new(cluster, 5_000);
@@ -403,17 +503,20 @@ mod tests {
     #[test]
     fn duplicate_submit_is_dispatched_once() {
         let (server, _) = registered_server();
-        let request = future_envelope(
-            server.cluster_id,
-            RpcRequest::Client(ClientRequest::Submit {
-                operation: descriptor().key,
-                args: vec![TaskArg::Inline {
-                    codec: Codec::RawBytes,
-                    bytes: vec![1],
-                }],
-                resources: ResourceSet::default(),
-                max_attempts: 1,
-            }),
+        let request = with_epoch(
+            &server,
+            future_envelope(
+                server.cluster_id,
+                RpcRequest::Client(ClientRequest::Submit {
+                    operation: descriptor().key,
+                    args: vec![TaskArg::Inline {
+                        codec: Codec::RawBytes,
+                        bytes: vec![1],
+                    }],
+                    resources: ResourceSet::default(),
+                    max_attempts: 1,
+                }),
+            ),
         );
         let first = server.dispatch_once(&request).unwrap();
         let second = server.dispatch_once(&request).unwrap();
@@ -428,14 +531,33 @@ mod tests {
     #[test]
     fn request_id_cannot_be_reused_with_another_body() {
         let (server, _) = registered_server();
-        let first = future_envelope(
-            server.cluster_id,
-            RpcRequest::Client(ClientRequest::Workers),
+        let first = with_epoch(
+            &server,
+            future_envelope(
+                server.cluster_id,
+                RpcRequest::Client(ClientRequest::Submit {
+                    operation: descriptor().key,
+                    args: vec![],
+                    resources: ResourceSet::default(),
+                    max_attempts: 1,
+                }),
+            ),
         );
         server.dispatch_once(&first).unwrap();
-        let mut conflicting = future_envelope(
-            server.cluster_id,
-            RpcRequest::Client(ClientRequest::Status(crate::ids::TaskId::new())),
+        let mut conflicting = with_epoch(
+            &server,
+            future_envelope(
+                server.cluster_id,
+                RpcRequest::Client(ClientRequest::Submit {
+                    operation: descriptor().key,
+                    args: vec![TaskArg::Inline {
+                        codec: Codec::RawBytes,
+                        bytes: vec![1],
+                    }],
+                    resources: ResourceSet::default(),
+                    max_attempts: 1,
+                }),
+            ),
         );
         conflicting.request_id = first.request_id;
         assert!(matches!(
@@ -448,14 +570,17 @@ mod tests {
     fn completion_reply_is_replayed_without_releasing_twice() {
         let (server, identity) = registered_server();
         let submit = server
-            .dispatch_once(&future_envelope(
-                server.cluster_id,
-                RpcRequest::Client(ClientRequest::Submit {
-                    operation: descriptor().key,
-                    args: vec![],
-                    resources: ResourceSet::cpu_gpu(1.0, 0.0).unwrap(),
-                    max_attempts: 1,
-                }),
+            .dispatch_once(&with_epoch(
+                &server,
+                future_envelope(
+                    server.cluster_id,
+                    RpcRequest::Client(ClientRequest::Submit {
+                        operation: descriptor().key,
+                        args: vec![],
+                        resources: ResourceSet::cpu_gpu(1.0, 0.0).unwrap(),
+                        max_attempts: 1,
+                    }),
+                ),
             ))
             .unwrap();
         let RpcReply::Client(ClientReply::Submitted { task_id, output_id }) = submit else {
@@ -473,19 +598,22 @@ mod tests {
             .started(&identity, assignment.fence)
             .unwrap();
         let node_id = identity.node_id;
-        let completion = future_envelope(
-            server.cluster_id,
-            RpcRequest::Worker(WorkerRequest::Completed {
-                identity,
-                report: crate::protocol::TaskCompletion {
-                    fence: assignment.fence,
-                    output_id,
-                    codec: Codec::RawBytes,
-                    size_bytes: 1,
-                    checksum: checksum(&[7]),
-                    location: "127.0.0.1:9001".into(),
-                },
-            }),
+        let completion = with_epoch(
+            &server,
+            future_envelope(
+                server.cluster_id,
+                RpcRequest::Worker(WorkerRequest::Completed {
+                    identity,
+                    report: crate::protocol::TaskCompletion {
+                        fence: assignment.fence,
+                        output_id,
+                        codec: Codec::RawBytes,
+                        size_bytes: 1,
+                        checksum: checksum(&[7]),
+                        location: "127.0.0.1:9001".into(),
+                    },
+                }),
+            ),
         );
         assert!(matches!(
             server.dispatch_once(&completion),

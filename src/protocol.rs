@@ -75,6 +75,15 @@ pub fn validate_advertise_addr(value: &str) -> Result<SocketAddr, Error> {
     }
     Ok(addr)
 }
+pub fn require_loopback_addr(value: &str) -> Result<SocketAddr, Error> {
+    let addr = validate_advertise_addr(value)?;
+    if !addr.ip().is_loopback() {
+        return Err(Error::InvalidAddress(format!(
+            "unauthenticated mode requires loopback address: {value}"
+        )));
+    }
+    Ok(addr)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerIdentity {
@@ -123,6 +132,7 @@ pub struct TaskCompletion {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientRequest {
+    Connect,
     Put {
         codec: Codec,
         bytes: Vec<u8>,
@@ -171,6 +181,9 @@ pub struct WorkerView {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientReply {
+    Connected {
+        coordinator_epoch: CoordinatorEpoch,
+    },
     Object {
         id: ObjectId,
         codec: Codec,

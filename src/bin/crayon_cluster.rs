@@ -133,6 +133,7 @@ async fn run_worker(
     let registered = match rpc(
         coordinator,
         RpcRequest::Worker(WorkerRequest::Register(registration)),
+        None,
     )
     .await?
     {
@@ -151,6 +152,7 @@ async fn run_worker(
             match rpc(
                 &heartbeat_coordinator,
                 RpcRequest::Worker(WorkerRequest::Heartbeat(heartbeat_identity.clone())),
+                Some(heartbeat_identity.coordinator_epoch),
             )
             .await
             {
@@ -164,6 +166,7 @@ async fn run_worker(
         match rpc(
             coordinator,
             RpcRequest::Worker(WorkerRequest::Poll(identity.clone())),
+            Some(identity.coordinator_epoch),
         )
         .await?
         {
@@ -182,12 +185,13 @@ async fn run_worker(
                 tokio::time::sleep(Duration::from_millis(50)).await
             }
             RpcReply::Worker(WorkerReply::Cancel(fence)) => {
-                accept(
+                report(
                     coordinator,
                     WorkerRequest::Cancelled {
                         identity: identity.clone(),
                         fence,
                     },
+                    identity.coordinator_epoch,
                 )
                 .await?;
             }
@@ -205,19 +209,21 @@ async fn execute_assignment(
     registry: Arc<OperationRegistry>,
     objects: LocalObjectStore,
 ) -> Result<(), Error> {
-    accept(
+    let epoch = identity.coordinator_epoch;
+    report(
         coordinator,
         WorkerRequest::Started {
             identity: identity.clone(),
             fence: assignment.fence,
         },
+        epoch,
     )
     .await?;
     let client = ClusterClient::connect_to(coordinator, CLUSTER_ID);
     let inputs = match fetch_inputs(&client, &assignment).await {
         Ok(inputs) => inputs,
         Err(error) => {
-            accept(
+            report(
                 coordinator,
                 WorkerRequest::Failed {
                     identity: identity.clone(),
@@ -225,6 +231,7 @@ async fn execute_assignment(
                     message: error.to_string(),
                     retryable: true,
                 },
+                epoch,
             )
             .await?;
             return Ok(());
@@ -233,28 +240,38 @@ async fn execute_assignment(
     let operation = assignment.clone();
     let execution_registry = registry.clone();
     let mut execution =
-        Box::pin(async move { execution_registry.execute(&operation, inputs).await });
+        tokio::spawn(async move { execution_registry.execute(&operation, inputs).await });
     let mut poll = tokio::time::interval(Duration::from_millis(50));
     let result = loop {
         tokio::select! {
-            result = &mut execution => break Some(result),
+            result = &mut execution => break Some(match result {
+                Ok(value) => value,
+                Err(join_error) if join_error.is_panic() => Err(Error::Protocol(
+                    "operation panicked".into(),
+                )),
+                Err(_) => Err(Error::Protocol("operation task aborted".into())),
+            }),
             _ = poll.tick() => {
-                match rpc(coordinator, RpcRequest::Worker(WorkerRequest::Poll(identity.clone()))).await? {
-                    RpcReply::Worker(WorkerReply::Cancel(fence)) if fence == assignment.fence => break None,
-                    RpcReply::Worker(WorkerReply::Assignment(None)) => {}
-                    RpcReply::Worker(WorkerReply::Error(error)) => return Err(error),
-                    _ => return Err(Error::Protocol("worker received assignment while busy".into())),
+                match rpc(coordinator, RpcRequest::Worker(WorkerRequest::Poll(identity.clone())), Some(epoch)).await {
+                    Ok(RpcReply::Worker(WorkerReply::Cancel(fence))) if fence == assignment.fence => break None,
+                    Ok(RpcReply::Worker(WorkerReply::Assignment(None))) => {}
+                    Ok(RpcReply::Worker(WorkerReply::Error(Error::StaleEpoch))) => return Ok(()),
+                    Ok(RpcReply::Worker(WorkerReply::Error(error))) => return Err(error),
+                    Ok(_) => return Err(Error::Protocol("worker received assignment while busy".into())),
+                    Err(Error::Io(_) | Error::DeadlineExceeded) => {}
+                    Err(error) => return Err(error),
                 }
             }
         }
     };
     let Some(result) = result else {
-        accept(
+        report(
             coordinator,
             WorkerRequest::Cancelled {
                 identity: identity.clone(),
                 fence: assignment.fence,
             },
+            epoch,
         )
         .await?;
         return Ok(());
@@ -266,7 +283,7 @@ async fn execute_assignment(
                 .ok_or_else(|| Error::OperationUnavailable(assignment.operation.to_string()))?;
             let object =
                 objects.put(assignment.output_id, descriptor.output_codec.clone(), bytes)?;
-            accept(
+            report(
                 coordinator,
                 WorkerRequest::Completed {
                     identity: identity.clone(),
@@ -279,11 +296,12 @@ async fn execute_assignment(
                         location: advertise.to_string(),
                     },
                 },
+                epoch,
             )
             .await
         }
         Err(error) => {
-            accept(
+            report(
                 coordinator,
                 WorkerRequest::Failed {
                     identity: identity.clone(),
@@ -291,9 +309,36 @@ async fn execute_assignment(
                     message: error.to_string(),
                     retryable: true,
                 },
+                epoch,
             )
             .await
         }
+    }
+}
+
+/// Reports a worker status update. Terminal-state conflicts and stale fences
+/// are treated as "the coordinator already knows" so a single task cannot
+/// terminate the worker session.
+async fn report(
+    coordinator: &str,
+    request_body: WorkerRequest,
+    coordinator_epoch: crayon::ids::CoordinatorEpoch,
+) -> Result<(), Error> {
+    match rpc(
+        coordinator,
+        RpcRequest::Worker(request_body),
+        Some(coordinator_epoch),
+    )
+    .await?
+    {
+        RpcReply::Worker(WorkerReply::Accepted) => Ok(()),
+        RpcReply::Worker(WorkerReply::Error(
+            Error::IllegalTransition(_) | Error::StaleFence | Error::StaleEpoch,
+        )) => Ok(()),
+        RpcReply::Worker(WorkerReply::Error(error)) => Err(error),
+        _ => Err(Error::Protocol(
+            "coordinator did not accept worker report".into(),
+        )),
     }
 }
 
@@ -364,17 +409,20 @@ async fn serve_objects(advertise: &str, objects: LocalObjectStore) -> Result<(),
     Ok(())
 }
 
-async fn rpc(address: &str, body: RpcRequest) -> Result<RpcReply, Error> {
-    request(address, &envelope(CLUSTER_ID, body)).await
+async fn rpc(
+    address: &str,
+    body: RpcRequest,
+    coordinator_epoch: Option<crayon::ids::CoordinatorEpoch>,
+) -> Result<RpcReply, Error> {
+    let mut envelope = envelope(CLUSTER_ID, body);
+    envelope.coordinator_epoch = coordinator_epoch;
+    request(address, &envelope).await
 }
-async fn accept(coordinator: &str, request_body: WorkerRequest) -> Result<(), Error> {
-    match rpc(coordinator, RpcRequest::Worker(request_body)).await? {
-        RpcReply::Worker(WorkerReply::Accepted) => Ok(()),
-        RpcReply::Worker(WorkerReply::Error(error)) => Err(error),
-        _ => Err(Error::Protocol(
-            "coordinator did not accept worker report".into(),
-        )),
-    }
+
+async fn connected_client(coordinator: &str) -> Result<ClusterClient, Error> {
+    let mut client = ClusterClient::connect(coordinator);
+    client.connect_epoch().await?;
+    Ok(client)
 }
 
 async fn run_submit_detach(args: &[String]) -> Result<(), Error> {
@@ -390,12 +438,13 @@ async fn run_submit_detach(args: &[String]) -> Result<(), Error> {
         "sleep" => builtin_descriptor("sleep"),
         _ => return Err(Error::OperationUnavailable(operation_name.clone())),
     };
+    let input_codec = descriptor.input_codec.clone();
     let operation = crayon::Operation::<u64, u64>::new(descriptor)?;
     let arg = if let Some(id) = args.get(5).filter(|value| value.as_str() != "-") {
         TaskArg::Object(ObjectId::from_str(id).map_err(Error::Protocol)?)
     } else {
         TaskArg::Inline {
-            codec: Codec::BincodeV1,
+            codec: input_codec,
             bytes: bincode::serialize(&value)?,
         }
     };
@@ -411,7 +460,8 @@ async fn run_submit_detach(args: &[String]) -> Result<(), Error> {
         .transpose()
         .map_err(|error| Error::Protocol(format!("invalid max attempts: {error}")))?
         .unwrap_or(1);
-    let task = ClusterClient::connect(coordinator)
+    let task = connected_client(coordinator)
+        .await?
         .submit(
             &operation,
             vec![arg],
@@ -427,7 +477,7 @@ async fn run_status(args: &[String]) -> Result<(), Error> {
     let coordinator = args.get(2).unwrap_or_else(|| usage());
     let id = TaskId::from_str(args.get(3).unwrap_or_else(|| usage()))
         .map_err(|error| Error::Protocol(error.to_string()))?;
-    let view = ClusterClient::connect(coordinator).status(id).await?;
+    let view = connected_client(coordinator).await?.status(id).await?;
     println!(
         "{} {} {} {} {}",
         view.task_id,
@@ -443,7 +493,7 @@ async fn run_status(args: &[String]) -> Result<(), Error> {
 
 async fn run_workers(args: &[String]) -> Result<(), Error> {
     let coordinator = args.get(2).unwrap_or_else(|| usage());
-    for worker in ClusterClient::connect(coordinator).workers().await? {
+    for worker in connected_client(coordinator).await?.workers().await? {
         println!(
             "{} {} {} {} {}",
             worker.identity.node_id,
@@ -465,7 +515,7 @@ async fn run_cancel(args: &[String]) -> Result<(), Error> {
     let coordinator = args.get(2).unwrap_or_else(|| usage());
     let id = TaskId::from_str(args.get(3).unwrap_or_else(|| usage()))
         .map_err(|error| Error::Protocol(error.to_string()))?;
-    ClusterClient::connect(coordinator).cancel(id).await?;
+    connected_client(coordinator).await?.cancel(id).await?;
     println!("cancelled");
     Ok(())
 }
@@ -473,7 +523,7 @@ async fn run_cancel(args: &[String]) -> Result<(), Error> {
 async fn run_get(args: &[String]) -> Result<(), Error> {
     let coordinator = args.get(2).unwrap_or_else(|| usage());
     let id = ObjectId::from_str(args.get(3).unwrap_or_else(|| usage())).map_err(Error::Protocol)?;
-    let (_, bytes) = ClusterClient::connect(coordinator).get_bytes(id).await?;
+    let (_, bytes) = connected_client(coordinator).await?.get_bytes(id).await?;
     let value: u64 = bincode::deserialize(&bytes)?;
     println!("{value}");
     Ok(())
@@ -481,7 +531,8 @@ async fn run_get(args: &[String]) -> Result<(), Error> {
 
 async fn run_client(coordinator: &str, a: i64, b: i64) -> Result<(), Error> {
     let operation = crayon::Operation::<(i64, i64), i64>::new(builtin_descriptor("add"))?;
-    let client = ClusterClient::connect_to(coordinator, CLUSTER_ID);
+    let mut client = ClusterClient::connect_to(coordinator, CLUSTER_ID);
+    client.connect_epoch().await?;
     let task = client
         .submit(
             &operation,
