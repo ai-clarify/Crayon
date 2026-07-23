@@ -137,6 +137,118 @@ fn run_rollout(request: &RolloutRequest) -> RolloutResult {
     }
 }
 
+// ---- Real-LLM RL pipeline (roles: llm-actor via Python sidecar, llm-judge in
+// Rust). Wire shapes are shared with src/bin/llm_rl.rs — keep in sync.
+
+fn llm_descriptor(name: &str) -> OperationDescriptor {
+    OperationDescriptor {
+        key: OperationKey::new("llm", name, 1),
+        // JSON on both sides so a Python driver reads and writes args directly.
+        input_codec: Codec::JsonV1,
+        output_codec: Codec::JsonV1,
+        max_inline_arg_bytes: 64 * 1024,
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LlmRolloutCfg {
+    version: u64,
+    /// Hex object id of the policy weights in the coordinator's arena.
+    weights: String,
+    seeds: Vec<u64>,
+    max_new_tokens: u32,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LlmRollout {
+    seed: u64,
+    completion: String,
+}
+
+/// Seed -> arithmetic problem; mirrors `prompt_for` in benchmarks/llm_sidecar.py.
+fn llm_problem(seed: u64) -> (u64, u64) {
+    (50 + (seed >> 8) % 900, 50 + seed % 900)
+}
+
+fn last_integer(text: &str) -> Option<u64> {
+    text.split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty() && s.len() < 10)
+        .next_back()
+        .and_then(|s| s.parse().ok())
+}
+
+/// A resident `benchmarks/llm_sidecar.py` process, spoken to over
+/// newline-delimited JSON. Spawned lazily on first use; configuration comes
+/// from CRAYON_LLM_SIDECAR (script path) and CRAYON_LLM_MODEL (model dir).
+#[derive(Default)]
+struct LlmSidecar {
+    version: u64,
+    io: Option<(std::process::ChildStdin, std::io::BufReader<std::process::ChildStdout>)>,
+}
+
+impl LlmSidecar {
+    fn call(&mut self, request: &serde_json::Value) -> Result<serde_json::Value, Error> {
+        use std::io::{BufRead, Write};
+        if self.io.is_none() {
+            let script = std::env::var("CRAYON_LLM_SIDECAR")
+                .map_err(|_| Error::Protocol("CRAYON_LLM_SIDECAR not set".into()))?;
+            let model = std::env::var("CRAYON_LLM_MODEL")
+                .map_err(|_| Error::Protocol("CRAYON_LLM_MODEL not set".into()))?;
+            let mut child = std::process::Command::new("python3")
+                .arg(&script)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| Error::Protocol(format!("spawn sidecar: {e}")))?;
+            let stdin = child.stdin.take().unwrap();
+            let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+            self.io = Some((stdin, stdout));
+            self.call(&serde_json::json!({"cmd": "init", "model": model}))?;
+        }
+        let (stdin, stdout) = self.io.as_mut().unwrap();
+        writeln!(stdin, "{request}").map_err(|e| Error::Protocol(format!("sidecar: {e}")))?;
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .map_err(|e| Error::Protocol(format!("sidecar: {e}")))?;
+        let reply: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|e| Error::Protocol(format!("sidecar reply: {e}")))?;
+        if let Some(error) = reply.get("error") {
+            return Err(Error::Protocol(format!("sidecar: {error}")));
+        }
+        Ok(reply)
+    }
+
+    fn load(&mut self, version: u64, weights: &[u8]) -> Result<(), Error> {
+        let path = std::env::temp_dir().join(format!(
+            "crayon-llm-{}-{version}.pt",
+            std::process::id()
+        ));
+        std::fs::write(&path, weights)?;
+        let result = self.call(&serde_json::json!({
+            "cmd": "load", "path": path, "version": version,
+        }));
+        let _ = std::fs::remove_file(&path);
+        result?;
+        self.version = version;
+        Ok(())
+    }
+
+    fn rollout(&mut self, seeds: &[u64], max_new_tokens: u32) -> Result<Vec<String>, Error> {
+        let reply = self.call(&serde_json::json!({
+            "cmd": "rollout", "seeds": seeds, "max_new_tokens": max_new_tokens,
+        }))?;
+        reply["rollouts"]
+            .as_array()
+            .map(|rollouts| {
+                rollouts
+                    .iter()
+                    .map(|r| r["completion"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .ok_or_else(|| Error::Protocol("sidecar rollout reply malformed".into()))
+    }
+}
+
 fn bind_addr_for_advertise(advertise: &str) -> String {
     if let Some(port) = advertise.rsplit(':').next() {
         format!("0.0.0.0:{port}")
@@ -193,6 +305,71 @@ async fn run_worker(
             let request: RolloutRequest = bincode::deserialize(&args[0])?;
             let result = run_rollout(&request);
             Ok(bincode::serialize(&result)?)
+        })?;
+    }
+    if operations == "llm-actor" {
+        // Real-LLM rollout: a resident Python sidecar holds the model on the
+        // GPU; this op syncs it to the requested policy version (weights fetched
+        // from the coordinator's arena once per version, not per task) and asks
+        // it to generate completions for the seeded arithmetic prompts.
+        let sidecar = Arc::new(std::sync::Mutex::new(LlmSidecar::default()));
+        let coordinator_addr = coordinator.to_string();
+        registry.register(llm_descriptor("rollout"), move |args| {
+            let sidecar = sidecar.clone();
+            let coordinator_addr = coordinator_addr.clone();
+            async move {
+                if args.len() != 1 {
+                    return Err(Error::Protocol("llm.rollout expects [config]".into()));
+                }
+                let cfg: LlmRolloutCfg = serde_json::from_slice(&args[0])
+                    .map_err(|e| Error::Protocol(format!("llm.rollout config: {e}")))?;
+                let weights_id = ObjectId::from_str(&cfg.weights)
+                    .map_err(|e| Error::Protocol(format!("llm.rollout weights id: {e}")))?;
+                let stale = sidecar.lock().unwrap().version != cfg.version;
+                let weights = if stale {
+                    let client = ClusterClient::connect_to(&coordinator_addr, CLUSTER_ID);
+                    Some(client.get_bytes(weights_id).await?.1)
+                } else {
+                    None
+                };
+                tokio::task::spawn_blocking(move || {
+                    let mut sidecar = sidecar.lock().unwrap();
+                    if let Some(weights) = weights {
+                        sidecar.load(cfg.version, &weights)?;
+                    }
+                    let completions = sidecar.rollout(&cfg.seeds, cfg.max_new_tokens)?;
+                    let rollouts: Vec<LlmRollout> = cfg
+                        .seeds
+                        .iter()
+                        .zip(completions)
+                        .map(|(&seed, completion)| LlmRollout { seed, completion })
+                        .collect();
+                    serde_json::to_vec(&rollouts)
+                        .map_err(|e| Error::Protocol(format!("llm.rollout encode: {e}")))
+                })
+                .await
+                .map_err(|_| Error::Protocol("llm sidecar task aborted".into()))?
+            }
+        })?;
+    }
+    if operations == "llm-judge" {
+        // Rule reward: the completion must contain the arithmetic answer as its
+        // last integer. Pure Rust — no model, no GPU.
+        registry.register(llm_descriptor("judge"), |args| async move {
+            if args.len() != 1 {
+                return Err(Error::Protocol("llm.judge expects [rollouts]".into()));
+            }
+            let rollouts: Vec<LlmRollout> = serde_json::from_slice(&args[0])
+                .map_err(|e| Error::Protocol(format!("llm.judge input: {e}")))?;
+            let rewards: Vec<f32> = rollouts
+                .iter()
+                .map(|r| {
+                    let (a, b) = llm_problem(r.seed);
+                    (last_integer(&r.completion) == Some(a + b)) as u32 as f32
+                })
+                .collect();
+            serde_json::to_vec(&rewards)
+                .map_err(|e| Error::Protocol(format!("llm.judge encode: {e}")))
         })?;
     }
     if registry.descriptors().is_empty() {
