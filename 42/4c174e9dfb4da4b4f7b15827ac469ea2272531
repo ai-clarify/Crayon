@@ -1,0 +1,45 @@
+CHANGELOG.md
+  s_2afa39eac5045a::t_f79cd8680fcd2e 3-38
+Cargo.lock
+  s_2afa39eac5045a::t_408d8cf19db5c7 92
+Cargo.toml
+  s_2afa39eac5045a::t_7dcd88214d3cbd 3
+README.md
+  s_2afa39eac5045a::t_5d72d95c54cf76 21
+RELEASE_NOTES.md
+  s_2afa39eac5045a::t_c4d469c75b6e63 1,3-6,10-14,18-36,41-42,49
+crayon-py/Cargo.lock
+  s_2afa39eac5045a::t_026e6136d80d84 98,108
+crayon-py/Cargo.toml
+  s_2afa39eac5045a::t_66fe59816ae238 3
+crayon-py/pyproject.toml
+  s_2afa39eac5045a::t_cdf1b55ab87b62 7
+src/protocol.rs
+  s_2afa39eac5045a::t_09364ea24c6f63 21-25
+benchmarks/crayon_gsm8k.py
+  s_2afa39eac5045a::t_2ef5ae193da291 58,115
+benchmarks/llm_sidecar.py
+  s_2afa39eac5045a::t_1b4f715bb5c053 68-72,77
+benchmarks/ray_gsm8k.py
+  s_2afa39eac5045a::t_8e5369508a72bc 68,89
+src/bin/crayon_cluster.rs
+  s_2afa39eac5045a::t_72bed49fb6e049 162-164,170-173,258,262,366
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "424c174e9dfb4da4b4f7b15827ac469ea2272531",
+  "prompts": {},
+  "sessions": {
+    "s_2afa39eac5045a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5cdd2e04-b710-4054-9fce-eb8e05e76006",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
