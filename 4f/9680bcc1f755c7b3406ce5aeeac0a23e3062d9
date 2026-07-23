@@ -1,0 +1,25 @@
+benchmarks/llm_sidecar.py
+  s_41c334c91b145e::t_e77c4780642c43 65-66,129-132
+src/bin/crayon_cluster.rs
+  s_41c334c91b145e::t_8de6ed8b5b0ff5 156-158,162-165,178-186,246-251,253-254,342-343,345-346,357-358,377-378,382-396,400
+benchmarks/crayon_gsm8k.py
+  s_41c334c91b145e::t_5a33b23cac89e4 1-182
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4f9680bcc1f755c7b3406ce5aeeac0a23e3062d9",
+  "prompts": {},
+  "sessions": {
+    "s_41c334c91b145e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5b548f5-e223-437a-a200-0fc66030f3de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
