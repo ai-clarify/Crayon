@@ -58,6 +58,10 @@ pub struct CoordinatorServer {
     /// blocking `Get`) wake immediately instead of spinning on a timer.
     wakeup: Arc<Notify>,
     require_loopback: bool,
+    /// Same-host shared-memory arena: client-put payloads are published here so
+    /// a co-located `get` maps the arena once and reads them zero-copy instead
+    /// of pulling the bytes over TCP.
+    arena: Arc<crate::arena::ArenaStore>,
 }
 impl CoordinatorServer {
     pub fn new(cluster_id: ClusterId, lease_ms: u64) -> Self {
@@ -72,6 +76,9 @@ impl CoordinatorServer {
             replay: Arc::new(Mutex::new(HashMap::new())),
             wakeup: Arc::new(Notify::new()),
             require_loopback: true,
+            arena: Arc::new(
+                crate::arena::ArenaStore::new().expect("create shared-memory object arena"),
+            ),
         }
     }
     /// Allows the coordinator to bind to non-loopback addresses. Unauthenticated
@@ -355,6 +362,8 @@ impl CoordinatorServer {
                         match self.state.lock().put(codec.clone(), bytes.clone()) {
                             Ok(id) => {
                                 let checksum = checksum(&bytes);
+                                // Publish into the arena so a same-host get is zero-copy.
+                                self.arena.put(id, &bytes);
                                 ClientReply::Object(ObjectPayload {
                                     id,
                                     codec,
@@ -362,6 +371,7 @@ impl CoordinatorServer {
                                     checksum,
                                     location: "coordinator".into(),
                                     bytes: Some(bytes.into()),
+                                    arena: None,
                                 })
                             }
                             Err(error) => ClientReply::Error(error),
@@ -413,7 +423,20 @@ impl CoordinatorServer {
                 },
                 ClientRequest::Get { object: id, .. } => {
                     match self.state.lock().resolve_object(id) {
-                        Ok(payload) => ClientReply::Object(payload),
+                        Ok(mut payload) => {
+                            // Same-host objects travel as an arena offset, not
+                            // bytes: the client reads them from its cached arena
+                            // mapping. A cross-host client cannot map the arena
+                            // and refetches bytes via GetLocal below.
+                            if let Some(offset) = self.arena.locate(id) {
+                                payload.bytes = None;
+                                payload.arena = Some(crate::arena::ArenaRef {
+                                    token: self.arena.token().to_string(),
+                                    offset,
+                                });
+                            }
+                            ClientReply::Object(payload)
+                        }
                         Err(error) => ClientReply::Error(error),
                     }
                 }
@@ -453,9 +476,14 @@ impl CoordinatorServer {
                     }
                     ClientReply::ObjectBatch(results)
                 }
-                ClientRequest::GetLocal(_) => ClientReply::Error(Error::Protocol(
-                    "coordinator has no worker-local object endpoint".into(),
-                )),
+                ClientRequest::GetLocal(id) => {
+                    // Explicit byte fetch: the cross-host fallback for a shmem
+                    // object whose file the caller could not map. Always inlines.
+                    match self.state.lock().resolve_object(id) {
+                        Ok(payload) => ClientReply::Object(payload),
+                        Err(error) => ClientReply::Error(error),
+                    }
+                }
                 ClientRequest::Workers => {
                     let state = self.state.lock();
                     ClientReply::Workers(
@@ -480,7 +508,10 @@ impl CoordinatorServer {
                     Err(error) => ClientReply::Error(error),
                 },
                 ClientRequest::Release(id) => match self.state.lock().release_object(id) {
-                    Ok(()) => ClientReply::Released,
+                    Ok(()) => {
+                        self.arena.release(id);
+                        ClientReply::Released
+                    }
                     Err(error) => ClientReply::Error(error),
                 },
             }),

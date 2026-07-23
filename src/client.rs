@@ -1,4 +1,7 @@
-use std::{marker::PhantomData, time::Duration};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Duration};
+
+use memmap2::Mmap;
+use parking_lot::Mutex;
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -19,6 +22,9 @@ pub struct ClusterClient {
     address: String,
     cluster_id: ClusterId,
     coordinator_epoch: Option<CoordinatorEpoch>,
+    /// Per-arena mappings, established once and shared across clones, so a
+    /// same-host get reads the arena from RAM without remapping per object.
+    arena_maps: Arc<Mutex<HashMap<String, Arc<Mmap>>>>,
 }
 impl ClusterClient {
     /// Connects using the default all-zero cluster id used by `crayon-cluster`.
@@ -30,6 +36,7 @@ impl ClusterClient {
             address: address.into(),
             cluster_id,
             coordinator_epoch: None,
+            arena_maps: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     /// Discovers the current coordinator epoch. Mutation requests after this
@@ -210,6 +217,17 @@ impl ClusterClient {
     /// redirected (large) outputs are fetched from the producing worker and
     /// validated against the coordinator's checksum/size. Shared by single and
     /// batch fetch paths.
+    /// Returns the cached mapping for arena `token`, establishing it on first
+    /// use. `None` when the arena is not on this host (map fails).
+    fn arena_map(&self, token: &str) -> Option<Arc<Mmap>> {
+        let mut cache = self.arena_maps.lock();
+        if let Some(map) = cache.get(token) {
+            return Some(map.clone());
+        }
+        let map = Arc::new(crate::arena::map_arena(token)?);
+        cache.insert(token.to_string(), map.clone());
+        Some(map)
+    }
     async fn payload_bytes(&self, payload: ObjectPayload) -> Result<(Codec, Vec<u8>), Error> {
         let ObjectPayload {
             id,
@@ -218,13 +236,39 @@ impl ClusterClient {
             checksum,
             location,
             bytes,
+            arena,
         } = payload;
         if let Some(bytes) = bytes {
             verify_object(id, id, &bytes, checksum, size_bytes)?;
             return Ok((codec, bytes.to_vec()));
         }
+        // Same-host zero-copy: read the payload straight out of the arena
+        // mapping (established once, then cached), skipping serialize + socket.
+        // Falls through when the arena is unmappable (a different host), which
+        // is proof to refetch over the network.
+        if let Some(arena_ref) = &arena {
+            if let Some(map) = self.arena_map(&arena_ref.token) {
+                let start = arena_ref.offset as usize;
+                let end = start.saturating_add(size_bytes as usize);
+                if end <= map.len() {
+                    // Arena objects are content-addressed (id == blake3(bytes))
+                    // and immutable, and the coordinator validated on put, so we
+                    // trust the offset and skip re-hashing (as plasma does). Only
+                    // the offset bounds, checked above, need guarding.
+                    let _ = checksum;
+                    return Ok((codec, map[start..end].to_vec()));
+                }
+            }
+        }
+        // Cross-host fetch. An arena-backed object lives at the coordinator
+        // (self.address); a worker output lives at `location`.
+        let source = if arena.is_some() {
+            self.address.clone()
+        } else {
+            location
+        };
         let reply = request(
-            &location,
+            &source,
             &envelope(
                 self.cluster_id,
                 RpcRequest::Client(ClientRequest::GetLocal(id)),

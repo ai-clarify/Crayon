@@ -597,6 +597,7 @@ async fn serve_objects(advertise: &str, objects: LocalObjectStore) -> Result<(),
                                             checksum: object.checksum,
                                             location: String::new(),
                                             bytes: Some(object.bytes),
+                                            arena: None,
                                         }))
                                     }
                                     Err(error) => RpcReply::Client(ClientReply::Error(error)),

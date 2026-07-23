@@ -200,6 +200,10 @@ pub struct ObjectPayload {
     pub checksum: [u8; 32],
     pub location: String,
     pub bytes: Option<Arc<[u8]>>,
+    /// Set when the payload lives in the host-local shared-memory arena: a
+    /// same-host reader maps the arena and reads it zero-copy at `arena.offset`
+    /// instead of receiving `bytes`.
+    pub arena: Option<crate::arena::ArenaRef>,
 }
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskStatus {

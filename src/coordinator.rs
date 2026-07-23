@@ -274,6 +274,7 @@ impl CoordinatorState {
                     checksum: object.checksum.unwrap(),
                     location: object.location.clone().unwrap(),
                     bytes: object.bytes.clone(),
+                    arena: None,
                 })
             }
             Some(object) if object.state == ObjectState::Lost => Err(Error::ObjectLost(id)),

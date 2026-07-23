@@ -7,6 +7,7 @@ pub mod client;
 pub mod cluster;
 pub mod coordinator;
 pub mod data_plane;
+pub mod arena;
 pub mod error;
 pub mod ids;
 pub mod operation;
