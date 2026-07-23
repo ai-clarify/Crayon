@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_549c9bc8bea5f9::t_c19b620840bb9d 3-26
+Cargo.lock
+  s_549c9bc8bea5f9::t_7d70ec9e6045a9 91
+Cargo.toml
+  s_549c9bc8bea5f9::t_6f56e7caa83b49 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cb27f8398c64b51ab239f598ad233b8f9b5a9e00",
+  "prompts": {},
+  "sessions": {
+    "s_549c9bc8bea5f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6970588b-ad57-4997-95fe-11a138746c2e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
