@@ -1,0 +1,21 @@
+src/bin/crayon_cluster.rs
+  s_549c9bc8bea5f9::t_a374bdbd8ff9da 29-31,106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4bb2fb756a34b0f85421cad0f4f97f1350307db7",
+  "prompts": {},
+  "sessions": {
+    "s_549c9bc8bea5f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6970588b-ad57-4997-95fe-11a138746c2e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
