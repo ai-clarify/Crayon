@@ -189,13 +189,26 @@ impl CoordinatorServer {
                 }
                 WorkerRequest::Poll(identity) => {
                     let mut state = self.state.lock();
-                    match state.cancellation_for(&identity) {
-                        Ok(Some(fence)) => WorkerReply::Cancel(fence),
-                        Ok(None) => match state.assign_next(identity.node_id) {
-                            Ok(value) => WorkerReply::Assignment(value),
+                    let mut deletes = state.take_pending_deletes(identity.node_id);
+                    if let Some(id) = deletes.first().copied() {
+                        deletes.remove(0);
+                        if !deletes.is_empty() {
+                            state
+                                .pending_deletes
+                                .entry(identity.node_id)
+                                .or_default()
+                                .extend(deletes);
+                        }
+                        WorkerReply::DeleteObject(id)
+                    } else {
+                        match state.cancellation_for(&identity) {
+                            Ok(Some(fence)) => WorkerReply::Cancel(fence),
+                            Ok(None) => match state.assign_next(identity.node_id) {
+                                Ok(value) => WorkerReply::Assignment(value),
+                                Err(error) => WorkerReply::Error(error),
+                            },
                             Err(error) => WorkerReply::Error(error),
-                        },
-                        Err(error) => WorkerReply::Error(error),
+                        }
                     }
                 }
                 WorkerRequest::Cancelled { identity, fence } => {
@@ -315,6 +328,10 @@ impl CoordinatorServer {
                     Ok(()) => ClientReply::Cancelled,
                     Err(error) => ClientReply::Error(error),
                 },
+                ClientRequest::Release(id) => match self.state.lock().release_object(id) {
+                    Ok(()) => ClientReply::Released,
+                    Err(error) => ClientReply::Error(error),
+                },
             }),
         }
     }
@@ -331,7 +348,10 @@ fn is_mutation(request: &RpcRequest) -> bool {
     match request {
         RpcRequest::Client(client) => matches!(
             client,
-            ClientRequest::Put { .. } | ClientRequest::Submit { .. } | ClientRequest::Cancel(_)
+            ClientRequest::Put { .. }
+                | ClientRequest::Submit { .. }
+                | ClientRequest::Cancel(_)
+                | ClientRequest::Release(_)
         ),
         RpcRequest::Worker(worker) => {
             !matches!(worker, WorkerRequest::Register(_) | WorkerRequest::Poll(_))
@@ -345,7 +365,7 @@ fn should_cache(request: &RpcRequest) -> bool {
         RpcRequest::Client(client) => {
             matches!(
                 client,
-                ClientRequest::Submit { .. } | ClientRequest::Cancel(_)
+                ClientRequest::Submit { .. } | ClientRequest::Cancel(_) | ClientRequest::Release(_)
             )
         }
         RpcRequest::Worker(worker) => !matches!(

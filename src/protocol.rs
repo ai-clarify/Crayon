@@ -151,6 +151,7 @@ pub enum ClientRequest {
     GetLocal(ObjectId),
     Workers,
     Cancel(TaskId),
+    Release(ObjectId),
 }
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskStatus {
@@ -202,6 +203,7 @@ pub enum ClientReply {
     Status(TaskView),
     Workers(Vec<WorkerView>),
     Cancelled,
+    Released,
     Error(Error),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +245,7 @@ pub enum WorkerReply {
     Registered(RegisteredWorker),
     Assignment(Option<TaskAssignment>),
     Cancel(TaskFence),
+    DeleteObject(ObjectId),
     Accepted,
     Error(Error),
 }

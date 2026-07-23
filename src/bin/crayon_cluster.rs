@@ -140,11 +140,62 @@ async fn run_worker(
         return Err(Error::OperationUnavailable(operations.into()));
     }
     let registry = Arc::new(registry);
+    let node_id = node_id.unwrap_or_default();
+    let mut backoff_ms: u64 = 0;
+    loop {
+        match run_worker_session(
+            coordinator,
+            advertise,
+            node_id,
+            cpu,
+            registry.clone(),
+            objects.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(WorkerSessionEnd::Reconnect) => {
+                backoff_ms = if backoff_ms == 0 {
+                    100
+                } else {
+                    (backoff_ms * 2).min(5_000)
+                };
+                let jitter = backoff_ms / 4;
+                let delay = backoff_ms + (rand_jitter() % jitter);
+                eprintln!("worker reconnecting in {delay}ms");
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            Err(WorkerSessionEnd::Fatal(error)) => return Err(error),
+        }
+    }
+}
+
+enum WorkerSessionEnd {
+    Reconnect,
+    Fatal(Error),
+}
+
+fn rand_jitter() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+async fn run_worker_session(
+    coordinator: &str,
+    advertise: &str,
+    node_id: NodeId,
+    cpu: f64,
+    registry: Arc<OperationRegistry>,
+    objects: LocalObjectStore,
+) -> Result<(), WorkerSessionEnd> {
     let registration = RegisterWorker {
-        node_id: node_id.unwrap_or_default(),
+        node_id,
         worker_epoch: WorkerEpoch::new(),
         advertise_addr: advertise.into(),
-        resources: ResourceSet::cpu_gpu(cpu, 0.0)?,
+        resources: ResourceSet::cpu_gpu(cpu, 0.0).map_err(WorkerSessionEnd::Fatal)?,
         slots: 1,
         operations: registry.descriptors(),
     };
@@ -159,7 +210,9 @@ async fn run_worker(
             Ok(RpcReply::Worker(WorkerReply::Registered(value))) => break 'register value,
             Ok(other) => {
                 eprintln!("worker registration failed: {other:?}");
-                return Err(Error::Protocol(format!("registration failed: {other:?}")));
+                return Err(WorkerSessionEnd::Fatal(Error::Protocol(format!(
+                    "registration failed: {other:?}"
+                ))));
             }
             Err(error) => {
                 eprintln!("worker registration rpc error: {error}");
@@ -203,9 +256,10 @@ async fn run_worker(
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
+            Err(Error::StaleEpoch | Error::StaleFence) => return Err(WorkerSessionEnd::Reconnect),
             Err(error) => {
                 eprintln!("worker poll rpc error: {error}");
-                return Err(error);
+                return Err(WorkerSessionEnd::Reconnect);
             }
         };
         match poll_reply {
@@ -218,7 +272,8 @@ async fn run_worker(
                     registry.clone(),
                     objects.clone(),
                 )
-                .await?;
+                .await
+                .map_err(WorkerSessionEnd::Fatal)?;
             }
             RpcReply::Worker(WorkerReply::Assignment(None)) => {
                 tokio::time::sleep(Duration::from_millis(50)).await
@@ -232,7 +287,15 @@ async fn run_worker(
                     },
                     identity.coordinator_epoch,
                 )
-                .await?;
+                .await
+                .map_err(WorkerSessionEnd::Fatal)?;
+            }
+            RpcReply::Worker(WorkerReply::DeleteObject(id)) => {
+                objects.delete(id);
+            }
+            RpcReply::Worker(WorkerReply::Error(Error::StaleEpoch | Error::StaleFence)) => {
+                eprintln!("worker session fenced, re-registering");
+                return Err(WorkerSessionEnd::Reconnect);
             }
             RpcReply::Worker(WorkerReply::Error(error)) => {
                 eprintln!("worker poll error reply: {error}");

@@ -184,6 +184,13 @@ impl ClusterClient {
             _ => Err(Error::Protocol("unexpected cancel reply".into())),
         }
     }
+    pub async fn release(&self, id: ObjectId) -> Result<(), Error> {
+        match self.rpc(ClientRequest::Release(id)).await? {
+            ClientReply::Released => Ok(()),
+            ClientReply::Error(error) => Err(error),
+            _ => Err(Error::Protocol("unexpected release reply".into())),
+        }
+    }
 }
 
 fn verify_object(

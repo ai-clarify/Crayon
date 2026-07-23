@@ -88,6 +88,7 @@ pub struct ObjectRecord {
     pub checksum: Option<[u8; 32]>,
     pub location: Option<String>,
     pub owner: Option<NodeId>,
+    pub ref_count: u32,
 }
 
 pub struct CoordinatorState {
@@ -97,6 +98,7 @@ pub struct CoordinatorState {
     pub tasks: HashMap<TaskId, TaskRecord>,
     pub objects: HashMap<ObjectId, ObjectRecord>,
     pub operations: HashMap<OperationKey, OperationDescriptor>,
+    pub pending_deletes: HashMap<NodeId, Vec<ObjectId>>,
 }
 impl CoordinatorState {
     pub fn new(epoch: CoordinatorEpoch) -> Self {
@@ -107,6 +109,7 @@ impl CoordinatorState {
             tasks: HashMap::new(),
             objects: HashMap::new(),
             operations: HashMap::new(),
+            pending_deletes: HashMap::new(),
         }
     }
     fn changed(&mut self) {
@@ -221,6 +224,7 @@ impl CoordinatorState {
                 bytes: Some(bytes),
                 location: Some("coordinator".into()),
                 owner: None,
+                ref_count: 1,
             },
         );
         self.changed();
@@ -287,6 +291,7 @@ impl CoordinatorState {
                 checksum: None,
                 location: None,
                 owner: None,
+                ref_count: 1,
             },
         );
         self.tasks.insert(
@@ -538,6 +543,35 @@ impl CoordinatorState {
         }
         self.changed();
         Ok(())
+    }
+    pub fn release_object(&mut self, id: ObjectId) -> Result<(), Error> {
+        let object = match self.objects.get(&id) {
+            Some(object) => object.clone(),
+            None => return Ok(()),
+        };
+        if self.object_in_use(&id) {
+            return Err(Error::ObjectInUse(id));
+        }
+        if let Some(owner) = object.owner {
+            self.pending_deletes.entry(owner).or_default().push(id);
+        }
+        self.objects.remove(&id);
+        self.changed();
+        Ok(())
+    }
+    pub fn take_pending_deletes(&mut self, node: NodeId) -> Vec<ObjectId> {
+        self.pending_deletes.remove(&node).unwrap_or_default()
+    }
+    fn object_in_use(&self, id: &ObjectId) -> bool {
+        self.tasks.values().any(|task| {
+            !matches!(
+                task.state,
+                TaskState::Succeeded | TaskState::Failed(_) | TaskState::Cancelled
+            ) && task.args.iter().any(|arg| match arg {
+                TaskArg::Object(dep) => dep == id,
+                _ => false,
+            })
+        })
     }
     fn reconcile_dependencies(&mut self) {
         loop {
