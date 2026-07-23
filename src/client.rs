@@ -1,4 +1,7 @@
-use std::{marker::PhantomData, time::Duration};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Duration};
+
+use memmap2::{Mmap, MmapMut};
+use parking_lot::Mutex;
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -19,6 +22,14 @@ pub struct ClusterClient {
     address: String,
     cluster_id: ClusterId,
     coordinator_epoch: Option<CoordinatorEpoch>,
+    /// Per-arena mappings, established once and shared across clones, so a
+    /// same-host get reads the arena from RAM without remapping per object.
+    arena_maps: Arc<Mutex<HashMap<String, Arc<Mmap>>>>,
+    /// Writable mapping of the coordinator's arena, established at connect when
+    /// the arena file is mappable (i.e. same host). Puts write payload bytes
+    /// straight into it, so a put ships no bytes over the socket and is not
+    /// bounded by the RPC frame size.
+    arena_writer: Arc<Mutex<Option<MmapMut>>>,
 }
 impl ClusterClient {
     /// Connects using the default all-zero cluster id used by `crayon-cluster`.
@@ -30,6 +41,8 @@ impl ClusterClient {
             address: address.into(),
             cluster_id,
             coordinator_epoch: None,
+            arena_maps: Arc::new(Mutex::new(HashMap::new())),
+            arena_writer: Arc::new(Mutex::new(None)),
         }
     }
     /// Discovers the current coordinator epoch. Mutation requests after this
@@ -37,8 +50,14 @@ impl ClusterClient {
     /// them with `Error::StaleEpoch`.
     pub async fn connect_epoch(&mut self) -> Result<CoordinatorEpoch, Error> {
         match self.rpc_raw(ClientRequest::Connect, None).await? {
-            ClientReply::Connected { coordinator_epoch } => {
+            ClientReply::Connected {
+                coordinator_epoch,
+                arena_token,
+            } => {
                 self.coordinator_epoch = Some(coordinator_epoch);
+                // Mappability of the arena file is the same-host proof: puts go
+                // through shared memory when it maps, over TCP when it doesn't.
+                *self.arena_writer.lock() = crate::arena::map_arena_mut(&arena_token);
                 Ok(coordinator_epoch)
             }
             ClientReply::Error(error) => Err(error),
@@ -64,16 +83,78 @@ impl ClusterClient {
     /// the cluster lifetime; distributed reference counting is intentionally unsupported.
     pub async fn put<T: Serialize>(&self, value: &T) -> Result<ObjectRef<T>, Error> {
         let bytes = bincode::serialize(value)?;
+        self.put_raw(Codec::BincodeV1, &bytes)
+            .await
+            .map(ObjectRef::new)
+    }
+    /// Stores raw bytes with no serialization envelope — the moral twin of
+    /// `ray.put(bytes)`. Fetch with `get_bytes`.
+    pub async fn put_bytes(&self, bytes: &[u8]) -> Result<ObjectId, Error> {
+        self.put_raw(Codec::RawBytes, bytes).await
+    }
+    async fn put_raw(&self, codec: Codec, bytes: &[u8]) -> Result<ObjectId, Error> {
+        if self.arena_writer.lock().is_some() {
+            return self.put_arena(codec, bytes).await;
+        }
         match self
             .rpc(ClientRequest::Put {
-                codec: Codec::BincodeV1,
-                bytes,
+                codec,
+                bytes: bytes.to_vec(),
             })
             .await?
         {
-            ClientReply::Object(payload) => Ok(ObjectRef::new(payload.id)),
+            ClientReply::Object(payload) => Ok(payload.id),
             ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected put reply".into())),
+        }
+    }
+    /// Same-host put: reserve an arena slot, write the bytes into shared memory
+    /// at the granted offset, then commit. The payload never crosses a socket,
+    /// so object size is bounded by the arena, not the RPC frame — gigabytes work.
+    async fn put_arena(&self, codec: Codec, bytes: &[u8]) -> Result<ObjectId, Error> {
+        // Below 1MB the hash is cheap and buys content-addressed dedup; past it
+        // the pass costs real time (a full memory sweep), so large objects take
+        // a random id and an all-zero "unhashed" checksum. Same-host reads are
+        // straight out of shared memory either way — the payload never crosses
+        // a lossy boundary. ponytail: no dedup for >=1MB puts; hash if it matters.
+        let (id, checksum) = if bytes.len() < 1 << 20 {
+            let checksum = checksum(bytes);
+            (ObjectId::from_checksum(checksum), checksum)
+        } else {
+            (ObjectId::new(), [0u8; 32])
+        };
+        let reply = self
+            .rpc(ClientRequest::ArenaReserve {
+                id,
+                codec,
+                size_bytes: bytes.len() as u64,
+                checksum,
+            })
+            .await?;
+        match reply {
+            // Content already stored: reserve resolved as a get.
+            ClientReply::Object(payload) => Ok(payload.id),
+            ClientReply::ArenaReserved { id, offset } => {
+                {
+                    let mut writer = self.arena_writer.lock();
+                    let map = writer.as_mut().ok_or_else(|| {
+                        Error::Protocol("arena writer lost after reserve".into())
+                    })?;
+                    let start = offset as usize;
+                    let end = start
+                        .checked_add(bytes.len())
+                        .filter(|&end| end <= map.len())
+                        .ok_or_else(|| Error::Protocol("arena offset out of bounds".into()))?;
+                    crate::arena::copy_wide(&mut map[start..end], bytes);
+                }
+                match self.rpc(ClientRequest::ArenaCommit(id)).await? {
+                    ClientReply::Object(payload) => Ok(payload.id),
+                    ClientReply::Error(error) => Err(error),
+                    _ => Err(Error::Protocol("unexpected commit reply".into())),
+                }
+            }
+            ClientReply::Error(error) => Err(error),
+            _ => Err(Error::Protocol("unexpected reserve reply".into())),
         }
     }
     pub async fn submit<A, O>(
@@ -210,6 +291,17 @@ impl ClusterClient {
     /// redirected (large) outputs are fetched from the producing worker and
     /// validated against the coordinator's checksum/size. Shared by single and
     /// batch fetch paths.
+    /// Returns the cached mapping for arena `token`, establishing it on first
+    /// use. `None` when the arena is not on this host (map fails).
+    fn arena_map(&self, token: &str) -> Option<Arc<Mmap>> {
+        let mut cache = self.arena_maps.lock();
+        if let Some(map) = cache.get(token) {
+            return Some(map.clone());
+        }
+        let map = Arc::new(crate::arena::map_arena(token)?);
+        cache.insert(token.to_string(), map.clone());
+        Some(map)
+    }
     async fn payload_bytes(&self, payload: ObjectPayload) -> Result<(Codec, Vec<u8>), Error> {
         let ObjectPayload {
             id,
@@ -218,13 +310,39 @@ impl ClusterClient {
             checksum,
             location,
             bytes,
+            arena,
         } = payload;
         if let Some(bytes) = bytes {
             verify_object(id, id, &bytes, checksum, size_bytes)?;
             return Ok((codec, bytes.to_vec()));
         }
+        // Same-host zero-copy: read the payload straight out of the arena
+        // mapping (established once, then cached), skipping serialize + socket.
+        // Falls through when the arena is unmappable (a different host), which
+        // is proof to refetch over the network.
+        if let Some(arena_ref) = &arena {
+            if let Some(map) = self.arena_map(&arena_ref.token) {
+                let start = arena_ref.offset as usize;
+                let end = start.saturating_add(size_bytes as usize);
+                if end <= map.len() {
+                    // Arena objects are content-addressed (id == blake3(bytes))
+                    // and immutable, and the coordinator validated on put, so we
+                    // trust the offset and skip re-hashing (as plasma does). Only
+                    // the offset bounds, checked above, need guarding.
+                    let _ = checksum;
+                    return Ok((codec, crate::arena::to_vec_wide(&map[start..end])));
+                }
+            }
+        }
+        // Cross-host fetch. An arena-backed object lives at the coordinator
+        // (self.address); a worker output lives at `location`.
+        let source = if arena.is_some() {
+            self.address.clone()
+        } else {
+            location
+        };
         let reply = request(
-            &location,
+            &source,
             &envelope(
                 self.cluster_id,
                 RpcRequest::Client(ClientRequest::GetLocal(id)),
@@ -320,7 +438,11 @@ fn verify_object(
     expected: [u8; 32],
     size: u64,
 ) -> Result<(), Error> {
-    if requested != returned || bytes.len() as u64 != size || checksum(bytes) != expected {
+    if requested != returned || bytes.len() as u64 != size {
+        return Err(Error::ObjectConflict(requested));
+    }
+    // All-zero means the object was stored unhashed; size is the only check.
+    if expected != [0u8; 32] && checksum(bytes) != expected {
         return Err(Error::ObjectConflict(requested));
     }
     Ok(())

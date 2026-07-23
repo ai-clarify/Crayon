@@ -58,6 +58,10 @@ pub struct CoordinatorServer {
     /// blocking `Get`) wake immediately instead of spinning on a timer.
     wakeup: Arc<Notify>,
     require_loopback: bool,
+    /// Same-host shared-memory arena: client-put payloads are published here so
+    /// a co-located `get` maps the arena once and reads them zero-copy instead
+    /// of pulling the bytes over TCP.
+    arena: Arc<crate::arena::ArenaStore>,
 }
 impl CoordinatorServer {
     pub fn new(cluster_id: ClusterId, lease_ms: u64) -> Self {
@@ -72,6 +76,9 @@ impl CoordinatorServer {
             replay: Arc::new(Mutex::new(HashMap::new())),
             wakeup: Arc::new(Notify::new()),
             require_loopback: true,
+            arena: Arc::new(
+                crate::arena::ArenaStore::new().expect("create shared-memory object arena"),
+            ),
         }
     }
     /// Allows the coordinator to bind to non-loopback addresses. Unauthenticated
@@ -123,12 +130,18 @@ impl CoordinatorServer {
         Ok(())
     }
     async fn handle(&self, mut stream: TcpStream) -> Result<(), Error> {
-        let envelope = timeout_io(read_frame::<Envelope>(&mut stream))
-            .await?
-            .ok_or_else(|| Error::Protocol("connection closed before request".into()))?;
-        envelope.validate(self.cluster_id, now_ms())?;
-        let reply = self.dispatch_blocking(&envelope).await?;
-        timeout_io(write_frame(&mut stream, &reply)).await
+        // Serve frames until the peer hangs up, so a client reuses one
+        // connection across RPCs instead of paying a TCP setup per call.
+        // An idle connection is closed by the read timeout; the client's
+        // retry reconnects.
+        loop {
+            let Some(envelope) = timeout_io(read_frame::<Envelope>(&mut stream)).await? else {
+                return Ok(());
+            };
+            envelope.validate(self.cluster_id, now_ms())?;
+            let reply = self.dispatch_blocking(&envelope).await?;
+            timeout_io(write_frame(&mut stream, &reply)).await?;
+        }
     }
     /// Parks long-poll variants (`Poll`, blocking `Get`/`GetBatch`) until ready or
     /// their wait elapses; everything else dispatches immediately.
@@ -357,6 +370,7 @@ impl CoordinatorServer {
             RpcRequest::Client(request) => RpcReply::Client(match request {
                 ClientRequest::Connect => ClientReply::Connected {
                     coordinator_epoch: self.epoch,
+                    arena_token: self.arena.token().to_string(),
                 },
                 ClientRequest::Put { codec, bytes } => {
                     if bytes.len() > MAX_OBJECT_BYTES {
@@ -365,6 +379,8 @@ impl CoordinatorServer {
                         match self.state.lock().put(codec.clone(), bytes.clone()) {
                             Ok(id) => {
                                 let checksum = checksum(&bytes);
+                                // Publish into the arena so a same-host get is zero-copy.
+                                self.arena.put(id, &bytes, codec.clone(), checksum);
                                 ClientReply::Object(ObjectPayload {
                                     id,
                                     codec,
@@ -372,6 +388,7 @@ impl CoordinatorServer {
                                     checksum,
                                     location: "coordinator".into(),
                                     bytes: Some(bytes.into()),
+                                    arena: None,
                                 })
                             }
                             Err(error) => ClientReply::Error(error),
@@ -423,7 +440,20 @@ impl CoordinatorServer {
                 },
                 ClientRequest::Get { object: id, .. } => {
                     match self.state.lock().resolve_object(id) {
-                        Ok(payload) => ClientReply::Object(payload),
+                        Ok(mut payload) => {
+                            // Same-host objects travel as an arena offset, not
+                            // bytes: the client reads them from its cached arena
+                            // mapping. A cross-host client cannot map the arena
+                            // and refetches bytes via GetLocal below.
+                            if let Some(meta) = self.arena.meta(id) {
+                                payload.bytes = None;
+                                payload.arena = Some(crate::arena::ArenaRef {
+                                    token: self.arena.token().to_string(),
+                                    offset: meta.offset,
+                                });
+                            }
+                            ClientReply::Object(payload)
+                        }
                         Err(error) => ClientReply::Error(error),
                     }
                 }
@@ -463,9 +493,84 @@ impl CoordinatorServer {
                     }
                     ClientReply::ObjectBatch(results)
                 }
-                ClientRequest::GetLocal(_) => ClientReply::Error(Error::Protocol(
-                    "coordinator has no worker-local object endpoint".into(),
-                )),
+                ClientRequest::GetLocal(id) => {
+                    // Explicit byte fetch: the cross-host fallback for an arena
+                    // object whose file the caller could not map. Always inlines.
+                    match self.state.lock().resolve_object(id) {
+                        Ok(mut payload) => match self.arena.read(id) {
+                            Some(bytes) if payload.bytes.is_none() => {
+                                if bytes.len() <= MAX_OBJECT_BYTES {
+                                    payload.bytes = Some(bytes.into());
+                                    ClientReply::Object(payload)
+                                } else {
+                                    // ponytail: >8MB arena objects are same-host
+                                    // only; stream in chunks if cross-host big
+                                    // objects ever matter.
+                                    ClientReply::Error(Error::Protocol(
+                                        "object too large for cross-host fetch".into(),
+                                    ))
+                                }
+                            }
+                            _ => ClientReply::Object(payload),
+                        },
+                        Err(error) => ClientReply::Error(error),
+                    }
+                }
+                ClientRequest::ArenaReserve {
+                    id,
+                    codec,
+                    size_bytes,
+                    checksum,
+                } => {
+                    // Content addressing: same checksum => same object, so a
+                    // repeat reserve of stored content resolves as a plain get.
+                    // (Unhashed large puts use random ids and never dedup.)
+                    if let Ok(mut payload) = self.state.lock().resolve_object(id) {
+                        if let Some(meta) = self.arena.meta(id) {
+                            payload.bytes = None;
+                            payload.arena = Some(crate::arena::ArenaRef {
+                                token: self.arena.token().to_string(),
+                                offset: meta.offset,
+                            });
+                        }
+                        ClientReply::Object(payload)
+                    } else {
+                        match self.arena.reserve(id, size_bytes, codec, checksum) {
+                            Some((offset, _)) => ClientReply::ArenaReserved { id, offset },
+                            None => ClientReply::Error(Error::CapacityExceeded(
+                                "arena exhausted".into(),
+                            )),
+                        }
+                    }
+                }
+                ClientRequest::ArenaCommit(id) => {
+                    self.arena.commit(id);
+                    match self.arena.meta(id) {
+                        Some(meta) => {
+                            match self.state.lock().put_meta(
+                                id,
+                                meta.codec.clone(),
+                                meta.size,
+                                meta.checksum,
+                            ) {
+                                Ok(id) => ClientReply::Object(ObjectPayload {
+                                    id,
+                                    codec: meta.codec,
+                                    size_bytes: meta.size,
+                                    checksum: meta.checksum,
+                                    location: "coordinator".into(),
+                                    bytes: None,
+                                    arena: Some(crate::arena::ArenaRef {
+                                        token: self.arena.token().to_string(),
+                                        offset: meta.offset,
+                                    }),
+                                }),
+                                Err(error) => ClientReply::Error(error),
+                            }
+                        }
+                        None => ClientReply::Error(Error::ObjectNotFound(id)),
+                    }
+                }
                 ClientRequest::Workers => {
                     let state = self.state.lock();
                     ClientReply::Workers(
@@ -490,7 +595,10 @@ impl CoordinatorServer {
                     Err(error) => ClientReply::Error(error),
                 },
                 ClientRequest::Release(id) => match self.state.lock().release_object(id) {
-                    Ok(()) => ClientReply::Released,
+                    Ok(()) => {
+                        self.arena.release(id);
+                        ClientReply::Released
+                    }
                     Err(error) => ClientReply::Error(error),
                 },
             }),
@@ -510,6 +618,8 @@ fn is_mutation(request: &RpcRequest) -> bool {
         RpcRequest::Client(client) => matches!(
             client,
             ClientRequest::Put { .. }
+                | ClientRequest::ArenaReserve { .. }
+                | ClientRequest::ArenaCommit(_)
                 | ClientRequest::Submit { .. }
                 | ClientRequest::SubmitBatch(_)
                 | ClientRequest::Cancel(_)
@@ -566,19 +676,52 @@ fn estimate_reply_bytes(reply: &RpcReply) -> usize {
         .unwrap_or(0)
 }
 
+/// Idle connections kept per address for reuse. Capped so a burst of clones
+/// doesn't hoard file descriptors.
+fn connection_pool() -> &'static std::sync::Mutex<HashMap<String, Vec<TcpStream>>> {
+    static POOL: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<TcpStream>>>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(Default::default)
+}
+const POOL_MAX_PER_ADDR: usize = 8;
+
 pub async fn request(address: &str, envelope: &Envelope) -> Result<RpcReply, Error> {
     for attempt_number in 0..2 {
         let remaining_ms = envelope.deadline_unix_ms.saturating_sub(now_ms());
         if remaining_ms == 0 {
             return Err(Error::DeadlineExceeded);
         }
+        // First attempt may reuse a pooled connection; a retry always dials
+        // fresh, since a pooled stream failing usually means the server closed
+        // it while idle (and its pool-mates are just as stale).
+        let pooled = if attempt_number == 0 {
+            connection_pool()
+                .lock()
+                .unwrap()
+                .get_mut(address)
+                .and_then(Vec::pop)
+        } else {
+            None
+        };
         let attempt = tokio::time::timeout(Duration::from_millis(remaining_ms), async {
-            let mut stream = TcpStream::connect(address).await?;
-            let _ = stream.set_nodelay(true);
+            let mut stream = match pooled {
+                Some(stream) => stream,
+                None => {
+                    let stream = TcpStream::connect(address).await?;
+                    let _ = stream.set_nodelay(true);
+                    stream
+                }
+            };
             write_frame(&mut stream, envelope).await?;
-            read_frame(&mut stream)
+            let reply = read_frame(&mut stream)
                 .await?
-                .ok_or_else(|| Error::Io("connection closed before reply".into()))
+                .ok_or_else(|| Error::Io("connection closed before reply".into()))?;
+            let mut pool = connection_pool().lock().unwrap();
+            let idle = pool.entry(address.to_string()).or_default();
+            if idle.len() < POOL_MAX_PER_ADDR {
+                idle.push(stream);
+            }
+            Ok(reply)
         })
         .await;
         match attempt {
@@ -645,7 +788,14 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 pub fn checksum(bytes: &[u8]) -> [u8; 32] {
-    *blake3::hash(bytes).as_bytes()
+    // A gigabyte-scale hash is a full memory pass; fan it out across cores.
+    if bytes.len() >= 1 << 20 {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update_rayon(bytes);
+        *hasher.finalize().as_bytes()
+    } else {
+        *blake3::hash(bytes).as_bytes()
+    }
 }
 /// Completes on the first shutdown signal: SIGTERM or SIGINT on Unix, Ctrl-C
 /// elsewhere. Drives the coordinator's graceful drain.

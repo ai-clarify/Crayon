@@ -267,6 +267,46 @@ impl CoordinatorState {
         self.changed();
         Ok(id)
     }
+    /// Registers a client-put object whose bytes live in the shared-memory
+    /// arena: the record carries metadata only, and readers are handed an
+    /// arena offset instead of inline bytes. Mirrors `put`'s dedup and caps.
+    pub fn put_meta(
+        &mut self,
+        id: ObjectId,
+        codec: Codec,
+        size_bytes: u64,
+        checksum: [u8; 32],
+    ) -> Result<ObjectId, Error> {
+        if let Some(existing) = self.objects.get(&id) {
+            if existing.state != ObjectState::Available
+                || existing.codec.as_ref() != Some(&codec)
+                || existing.size_bytes != Some(size_bytes)
+                || existing.checksum != Some(checksum)
+            {
+                return Err(Error::ObjectConflict(id));
+            }
+            return Ok(id);
+        }
+        if self.objects.len() >= MAX_OBJECTS {
+            return Err(Error::CapacityExceeded("object store limit reached".into()));
+        }
+        self.objects.insert(
+            id,
+            ObjectRecord {
+                id,
+                state: ObjectState::Available,
+                codec: Some(codec),
+                size_bytes: Some(size_bytes),
+                checksum: Some(checksum),
+                bytes: None,
+                location: Some("coordinator".into()),
+                owner: None,
+                ref_count: 1,
+            },
+        );
+        self.changed();
+        Ok(id)
+    }
     /// Resolves an object to its payload or the error it currently maps to.
     /// A reserved output of a still-running task is `ObjectPending` so a blocking
     /// `Get`/`GetBatch` parks; a `Lost` object is `ObjectLost`; anything else
@@ -281,6 +321,7 @@ impl CoordinatorState {
                     checksum: object.checksum.unwrap(),
                     location: object.location.clone().unwrap(),
                     bytes: object.bytes.clone(),
+                    arena: None,
                 })
             }
             Some(object) if object.state == ObjectState::Lost => Err(Error::ObjectLost(id)),

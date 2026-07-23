@@ -175,6 +175,18 @@ pub enum ClientRequest {
         wait_ms: u64,
     },
     GetLocal(ObjectId),
+    /// Reserve an arena slot for a client-side shared-memory put. The client
+    /// then writes its bytes at the returned offset and sends `ArenaCommit`.
+    /// Bypasses the RPC frame cap, so objects scale to gigabytes. An all-zero
+    /// checksum means the payload is unhashed (large objects skip the pass;
+    /// the id is then random, not content-derived).
+    ArenaReserve {
+        id: ObjectId,
+        codec: Codec,
+        size_bytes: u64,
+        checksum: [u8; 32],
+    },
+    ArenaCommit(ObjectId),
     Workers,
     Cancel(TaskId),
     Release(ObjectId),
@@ -203,6 +215,10 @@ pub struct ObjectPayload {
     pub checksum: [u8; 32],
     pub location: String,
     pub bytes: Option<Arc<[u8]>>,
+    /// Set when the payload lives in the host-local shared-memory arena: a
+    /// same-host reader maps the arena and reads it zero-copy at `arena.offset`
+    /// instead of receiving `bytes`.
+    pub arena: Option<crate::arena::ArenaRef>,
 }
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskStatus {
@@ -238,8 +254,18 @@ pub struct WorkerView {
 pub enum ClientReply {
     Connected {
         coordinator_epoch: CoordinatorEpoch,
+        /// Token of the coordinator's shared-memory arena. A client that can
+        /// map it is co-located and puts/gets payloads through the arena.
+        arena_token: String,
     },
     Object(ObjectPayload),
+    /// Slot granted for an `ArenaReserve`: write the bytes at `offset`, then
+    /// send `ArenaCommit(id)`. (A reserve of already-stored content returns
+    /// `Object` instead.)
+    ArenaReserved {
+        id: ObjectId,
+        offset: u64,
+    },
     Submitted {
         task_id: TaskId,
         output_id: ObjectId,

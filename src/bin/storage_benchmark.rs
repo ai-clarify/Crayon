@@ -102,9 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// separately. Latency is per-op; throughput is payload bytes over op time.
 async fn run_e2e(client: &ClusterClient, size: usize, args: &Args) -> Result<String, Error> {
     let mut payload = vec![0xA5u8; size];
-    // `put` serializes with bincode (an 8-byte length header), the same as
-    // `ray.put`; verify the round trip against that serialized length.
-    let expected = bincode::serialize(&payload).map_err(|_| Error::Protocol("ser".into()))?.len();
+    // Raw-bytes path, the same shape as `ray.put(bytes)`: no serialization
+    // envelope, the round trip returns exactly `size` bytes.
+    let expected = size;
     let mut put_us = Vec::with_capacity(args.samples);
     let mut get_us = Vec::with_capacity(args.samples);
 
@@ -114,9 +114,8 @@ async fn run_e2e(client: &ClusterClient, size: usize, args: &Args) -> Result<Str
         payload[..8.min(size)].copy_from_slice(&(iter as u64).to_le_bytes()[..8.min(size)]);
 
         let start = Instant::now();
-        let handle = client.put(&payload).await?;
+        let id: ObjectId = client.put_bytes(&payload).await?;
         let put_elapsed = start.elapsed();
-        let id: ObjectId = handle.id;
 
         let start = Instant::now();
         let (_codec, got) = client.get_bytes(id).await?;

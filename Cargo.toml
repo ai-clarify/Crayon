@@ -16,11 +16,12 @@ name = "crayon"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "signal"] }
 serde = { version = "1", features = ["derive", "rc"] }
 bincode = "1"
-blake3 = "1"
+blake3 = { version = "1", features = ["rayon"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 parking_lot = "0.12"
 futures = "0.3"
 serde_json = "1"
+memmap2 = "0.9.11"
 
 [[bin]]
 name = "crayon-cluster"
@@ -33,3 +34,7 @@ path = "src/bin/cluster_benchmark.rs"
 [[bin]]
 name = "storage-benchmark"
 path = "src/bin/storage_benchmark.rs"
+
+[[bin]]
+name = "rl-benchmark"
+path = "src/bin/rl_benchmark.rs"
