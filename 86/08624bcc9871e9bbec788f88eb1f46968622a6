@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_a63716336bc252::t_deced32496fc33 3-44
+Cargo.lock
+  s_a63716336bc252::t_3193fa37071ef2 91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8608624bcc9871e9bbec788f88eb1f46968622a6",
+  "prompts": {},
+  "sessions": {
+    "s_a63716336bc252": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-adbbe493c3096237b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
