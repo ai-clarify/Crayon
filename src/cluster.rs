@@ -354,6 +354,7 @@ impl CoordinatorServer {
             RpcRequest::Client(request) => RpcReply::Client(match request {
                 ClientRequest::Connect => ClientReply::Connected {
                     coordinator_epoch: self.epoch,
+                    arena_token: self.arena.token().to_string(),
                 },
                 ClientRequest::Put { codec, bytes } => {
                     if bytes.len() > MAX_OBJECT_BYTES {
@@ -363,7 +364,7 @@ impl CoordinatorServer {
                             Ok(id) => {
                                 let checksum = checksum(&bytes);
                                 // Publish into the arena so a same-host get is zero-copy.
-                                self.arena.put(id, &bytes);
+                                self.arena.put(id, &bytes, codec.clone(), checksum);
                                 ClientReply::Object(ObjectPayload {
                                     id,
                                     codec,
@@ -428,11 +429,11 @@ impl CoordinatorServer {
                             // bytes: the client reads them from its cached arena
                             // mapping. A cross-host client cannot map the arena
                             // and refetches bytes via GetLocal below.
-                            if let Some(offset) = self.arena.locate(id) {
+                            if let Some(meta) = self.arena.meta(id) {
                                 payload.bytes = None;
                                 payload.arena = Some(crate::arena::ArenaRef {
                                     token: self.arena.token().to_string(),
-                                    offset,
+                                    offset: meta.offset,
                                 });
                             }
                             ClientReply::Object(payload)
@@ -477,11 +478,79 @@ impl CoordinatorServer {
                     ClientReply::ObjectBatch(results)
                 }
                 ClientRequest::GetLocal(id) => {
-                    // Explicit byte fetch: the cross-host fallback for a shmem
+                    // Explicit byte fetch: the cross-host fallback for an arena
                     // object whose file the caller could not map. Always inlines.
                     match self.state.lock().resolve_object(id) {
-                        Ok(payload) => ClientReply::Object(payload),
+                        Ok(mut payload) => match self.arena.read(id) {
+                            Some(bytes) if payload.bytes.is_none() => {
+                                if bytes.len() <= MAX_OBJECT_BYTES {
+                                    payload.bytes = Some(bytes.into());
+                                    ClientReply::Object(payload)
+                                } else {
+                                    // ponytail: >8MB arena objects are same-host
+                                    // only; stream in chunks if cross-host big
+                                    // objects ever matter.
+                                    ClientReply::Error(Error::Protocol(
+                                        "object too large for cross-host fetch".into(),
+                                    ))
+                                }
+                            }
+                            _ => ClientReply::Object(payload),
+                        },
                         Err(error) => ClientReply::Error(error),
+                    }
+                }
+                ClientRequest::ArenaReserve {
+                    codec,
+                    size_bytes,
+                    checksum,
+                } => {
+                    let id = crate::ids::ObjectId::from_checksum(checksum);
+                    // Content addressing: same checksum => same object, so a
+                    // repeat reserve of stored content resolves as a plain get.
+                    if let Ok(mut payload) = self.state.lock().resolve_object(id) {
+                        if let Some(meta) = self.arena.meta(id) {
+                            payload.bytes = None;
+                            payload.arena = Some(crate::arena::ArenaRef {
+                                token: self.arena.token().to_string(),
+                                offset: meta.offset,
+                            });
+                        }
+                        ClientReply::Object(payload)
+                    } else {
+                        match self.arena.reserve(id, size_bytes, codec, checksum) {
+                            Some((offset, _)) => ClientReply::ArenaReserved { id, offset },
+                            None => ClientReply::Error(Error::CapacityExceeded(
+                                "arena exhausted".into(),
+                            )),
+                        }
+                    }
+                }
+                ClientRequest::ArenaCommit(id) => {
+                    self.arena.commit(id);
+                    match self.arena.meta(id) {
+                        Some(meta) => {
+                            match self.state.lock().put_meta(
+                                meta.codec.clone(),
+                                meta.size,
+                                meta.checksum,
+                            ) {
+                                Ok(id) => ClientReply::Object(ObjectPayload {
+                                    id,
+                                    codec: meta.codec,
+                                    size_bytes: meta.size,
+                                    checksum: meta.checksum,
+                                    location: "coordinator".into(),
+                                    bytes: None,
+                                    arena: Some(crate::arena::ArenaRef {
+                                        token: self.arena.token().to_string(),
+                                        offset: meta.offset,
+                                    }),
+                                }),
+                                Err(error) => ClientReply::Error(error),
+                            }
+                        }
+                        None => ClientReply::Error(Error::ObjectNotFound(id)),
                     }
                 }
                 ClientRequest::Workers => {
@@ -531,6 +600,8 @@ fn is_mutation(request: &RpcRequest) -> bool {
         RpcRequest::Client(client) => matches!(
             client,
             ClientRequest::Put { .. }
+                | ClientRequest::ArenaReserve { .. }
+                | ClientRequest::ArenaCommit(_)
                 | ClientRequest::Submit { .. }
                 | ClientRequest::SubmitBatch(_)
                 | ClientRequest::Cancel(_)

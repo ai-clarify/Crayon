@@ -1,30 +1,35 @@
 //! Plasma-style shared-memory object arena — Crayon's same-host fast path.
 //!
-//! One memory-mapped file holds every payload; objects live at byte offsets in
-//! it. A reader maps the arena **once** and then reads any object as a plain
-//! memory slice — there is no per-object `open`/`mmap`, which is what makes a
-//! file-per-object sidecar slow (each get pays a syscall + fresh mapping). This
-//! mirrors Ray's plasma store: map the arena, read at offsets, RAM speed.
+//! One memory-mapped file holds every same-host payload; objects live at byte
+//! offsets. A reader maps the arena **once** and reads any object as a memory
+//! slice — no per-object `open`/`mmap`. A writer (the client) writes its bytes
+//! straight into its reserved region, so a `put` never ships the payload over a
+//! socket and is not bounded by the RPC frame size: objects scale to gigabytes.
+//! This mirrors Ray's plasma store.
 //!
-//! Co-location needs no handshake: the arena file is host-local, so a reader
-//! that maps it is on the same host by construction; one that cannot falls back
-//! to the network. Objects are immutable and content-addressed, so a written
-//! region is never rewritten while readable.
+//! Protocol: the client `reserve`s a slot (the coordinator allocates an offset
+//! and records size/codec/checksum), writes its bytes into the mapping at that
+//! offset, then `commit`s. A `get` returns the offset; the reader maps the arena
+//! and reads the slice. Objects are immutable and content-addressed, so a
+//! committed region is never rewritten while readable.
+//!
+//! Same-host is proven structurally: the arena file is host-local, so a process
+//! that can map it is co-located. Cross-host peers cannot map it and fall back
+//! to the network (bounded by the frame size, hence to <= one frame).
 
 use std::{collections::HashMap, fs, io, path::PathBuf};
 
-use memmap2::{Mmap, MmapMut};
+use memmap2::MmapMut;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::ObjectId;
+use crate::{ids::ObjectId, operation::Codec};
 
-/// Sparse virtual size of the arena. mmap reserves the address range but pages
-/// are backed only when written, so this costs nothing until used.
-const ARENA_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const MIN_CLASS: u64 = 64;
+/// Sparse virtual size of the arena. mmap reserves the range; pages are backed
+/// only when written, so this is address space, not committed memory.
+const ARENA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
-/// Where a reader finds an object: which arena, and at what offset. Length and
+/// Where a reader finds an object: which arena, and at what offset. Size and
 /// checksum travel in the surrounding `ObjectPayload`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArenaRef {
@@ -32,16 +37,35 @@ pub struct ArenaRef {
     pub offset: u64,
 }
 
-struct Alloc {
-    top: u64,
-    /// size-class -> reusable offsets, so released slots are recycled instead of
-    /// growing the arena for a put/get/release loop.
-    free: HashMap<u64, Vec<u64>>,
-    /// live object -> (offset, class), so release knows which slot to recycle.
-    live: HashMap<ObjectId, (u64, u64)>,
+#[derive(Clone)]
+struct Entry {
+    offset: u64,
+    size: u64,
+    slot: u64,
+    codec: Codec,
+    checksum: [u8; 32],
+    committed: bool,
 }
 
-/// Writer side: owns the arena file, the read-write mapping, and the allocator.
+/// Metadata a get reply needs for a committed arena object.
+pub struct Meta {
+    pub offset: u64,
+    pub size: u64,
+    pub codec: Codec,
+    pub checksum: [u8; 32],
+}
+
+struct Alloc {
+    top: u64,
+    /// exact-size slot -> reusable offsets. Exact-fit avoids the up-to-2x waste
+    /// of power-of-two classes on gigabyte payloads; a churn of same-size puts
+    /// (the common case) recycles perfectly. Mixed sizes fragment — acceptable,
+    /// compact later if it ever matters.
+    free: HashMap<u64, Vec<u64>>,
+    live: HashMap<ObjectId, Entry>,
+}
+
+/// Writer/owner side: the arena file, its read-write mapping, and the allocator.
 pub struct ArenaStore {
     token: String,
     map: MmapMut,
@@ -60,9 +84,9 @@ impl ArenaStore {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        file.set_len(ARENA_BYTES)?; // sparse: no disk committed until written
-        // SAFETY: freshly created file sized to ARENA_BYTES; we hold the only
-        // writer mapping and only ever write disjoint, allocator-owned regions.
+        file.set_len(ARENA_BYTES)?;
+        // SAFETY: freshly created file sized to ARENA_BYTES; this is the only
+        // writer mapping and writes only disjoint, allocator-owned regions.
         let map = unsafe { MmapMut::map_mut(&file)? };
         Ok(Self {
             token,
@@ -80,50 +104,113 @@ impl ArenaStore {
         &self.token
     }
 
-    /// Copies `bytes` into the arena and records the object. Returns its offset,
-    /// or `None` if the arena is exhausted (caller keeps the network path).
-    pub fn put(&self, id: ObjectId, bytes: &[u8]) -> Option<u64> {
-        let class = class_of(bytes.len());
-        let offset = {
-            let mut a = self.alloc.lock();
-            if let Some((off, _)) = a.live.get(&id) {
-                return Some(*off); // content-addressed: already present, idempotent
-            }
-            let off = match a.free.get_mut(&class).and_then(Vec::pop) {
-                Some(off) => off,
-                None => {
-                    let off = a.top;
-                    let next = off.checked_add(class)?;
-                    if next > ARENA_BYTES {
-                        return None;
-                    }
-                    a.top = next;
-                    off
+    /// Allocates a slot for `id` and records its metadata as uncommitted. The
+    /// client then writes its bytes at the returned offset and calls `commit`.
+    /// Returns `(offset, already_committed)`; content addressing makes a repeat
+    /// reserve idempotent. `None` if the arena is exhausted.
+    pub fn reserve(
+        &self,
+        id: ObjectId,
+        size: u64,
+        codec: Codec,
+        checksum: [u8; 32],
+    ) -> Option<(u64, bool)> {
+        let slot = size.max(1).div_ceil(8) * 8; // 8-byte aligned exact size
+        let mut a = self.alloc.lock();
+        if let Some(entry) = a.live.get(&id) {
+            return Some((entry.offset, entry.committed));
+        }
+        let offset = match a.free.get_mut(&slot).and_then(Vec::pop) {
+            Some(off) => off,
+            None => {
+                let off = a.top;
+                let next = off.checked_add(slot)?;
+                if next > ARENA_BYTES {
+                    return None;
                 }
-            };
-            a.live.insert(id, (off, class));
-            off
+                a.top = next;
+                off
+            }
         };
-        // SAFETY: [offset, offset+len) is an allocator-owned region disjoint from
-        // every other live object, so concurrent writes never overlap. The base
-        // pointer is stable for the mapping's lifetime.
-        unsafe {
-            let dst = (self.map.as_ptr() as *mut u8).add(offset as usize);
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        a.live.insert(
+            id,
+            Entry {
+                offset,
+                size,
+                slot,
+                codec,
+                checksum,
+                committed: false,
+            },
+        );
+        Some((offset, false))
+    }
+
+    /// Marks a reserved object as fully written and readable.
+    pub fn commit(&self, id: ObjectId) {
+        if let Some(entry) = self.alloc.lock().live.get_mut(&id) {
+            entry.committed = true;
+        }
+    }
+
+    /// Coordinator-side write: reserve + copy `bytes` in + commit, for payloads
+    /// the coordinator already holds (e.g. a same-host object arriving inline).
+    pub fn put(&self, id: ObjectId, bytes: &[u8], codec: Codec, checksum: [u8; 32]) -> Option<u64> {
+        let (offset, already) = self.reserve(id, bytes.len() as u64, codec, checksum)?;
+        if !already {
+            self.write_at(offset, bytes);
+            self.commit(id);
         }
         Some(offset)
     }
 
-    /// Offset of a live object, for building a get reply. `None` if not here.
-    pub fn locate(&self, id: ObjectId) -> Option<u64> {
-        self.alloc.lock().live.get(&id).map(|(off, _)| *off)
+    /// Copies `bytes` into an allocator-owned region. Callers must only write a
+    /// range they reserved.
+    ///
+    /// SAFETY invariant: `offset..offset+len` is disjoint from every other live
+    /// object, so concurrent writes never overlap; the base pointer is stable
+    /// for the mapping's lifetime.
+    pub fn write_at(&self, offset: u64, bytes: &[u8]) {
+        unsafe {
+            let dst = (self.map.as_ptr() as *mut u8).add(offset as usize);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        }
     }
 
-    /// Recycles an object's slot back into its size-class free list.
+    /// Metadata for a committed object, for building a get reply.
+    pub fn meta(&self, id: ObjectId) -> Option<Meta> {
+        let a = self.alloc.lock();
+        let e = a.live.get(&id)?;
+        e.committed.then(|| Meta {
+            offset: e.offset,
+            size: e.size,
+            codec: e.codec.clone(),
+            checksum: e.checksum,
+        })
+    }
+
+    /// Copies a committed object out, for serving a cross-host `GetLocal` (which
+    /// cannot map the arena). Bounded by the RPC frame on the wire.
+    pub fn read(&self, id: ObjectId) -> Option<Vec<u8>> {
+        let (offset, size) = {
+            let a = self.alloc.lock();
+            let e = a.live.get(&id)?;
+            if !e.committed {
+                return None;
+            }
+            (e.offset as usize, e.size as usize)
+        };
+        // SAFETY: committed region, immutable until released; bounds from Entry.
+        let slice =
+            unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(offset), size) };
+        Some(slice.to_vec())
+    }
+
+    /// Recycles an object's slot back into its exact-size free list.
     pub fn release(&self, id: ObjectId) {
         let mut a = self.alloc.lock();
-        if let Some((off, class)) = a.live.remove(&id) {
-            a.free.entry(class).or_default().push(off);
+        if let Some(entry) = a.live.remove(&id) {
+            a.free.entry(entry.slot).or_default().push(entry.offset);
         }
     }
 }
@@ -134,19 +221,27 @@ impl Drop for ArenaStore {
     }
 }
 
-/// Reader side: map an arena by token. The caller caches the returned mapping
-/// and reads objects as slices, so this open+map happens once per arena, not
-/// once per object. `None` when the file is absent (a different host).
-pub fn map_arena(token: &str) -> Option<Mmap> {
-    let path = base_dir().join(format!("arena-{token}"));
-    let file = fs::File::open(path).ok()?;
-    // SAFETY: arena regions are written once (content-addressed, immutable) and
-    // slots are only recycled after release, so mapped pages stay valid.
-    unsafe { Mmap::map(&file).ok() }
+/// Reader side: map an arena by token, read-only. The caller caches the mapping
+/// and reads objects as slices, so this happens once per arena, not per object.
+/// `None` when the file is absent (a different host).
+pub fn map_arena(token: &str) -> Option<memmap2::Mmap> {
+    let file = fs::File::open(base_dir().join(format!("arena-{token}"))).ok()?;
+    // SAFETY: committed regions are immutable; slots are recycled only after the
+    // owner releases, so mapped pages stay valid for the mapping's lifetime.
+    unsafe { memmap2::Mmap::map(&file).ok() }
 }
 
-fn class_of(len: usize) -> u64 {
-    (len as u64).max(1).next_power_of_two().max(MIN_CLASS)
+/// Writer side for a client: map an arena read-write so the client writes its
+/// reserved regions directly. `None` when the arena is not on this host.
+pub fn map_arena_mut(token: &str) -> Option<MmapMut> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(base_dir().join(format!("arena-{token}")))
+        .ok()?;
+    // SAFETY: the client writes only offsets the coordinator reserved for it,
+    // which are disjoint from every other writer's regions.
+    unsafe { MmapMut::map_mut(&file).ok() }
 }
 
 fn base_dir() -> PathBuf {
@@ -163,22 +258,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arena_maps_once_and_recycles_slots() {
+    fn reserve_write_commit_get_and_recycle() {
         let store = ArenaStore::new().unwrap();
         let id = ObjectId::new();
-        let payload = vec![9u8; 4096];
-        let off = store.put(id, &payload).unwrap();
-        assert_eq!(store.locate(id), Some(off));
+        let payload = vec![9u8; 40_000];
+        let checksum = crate::cluster::checksum(&payload);
+        let (offset, already) = store
+            .reserve(id, payload.len() as u64, Codec::RawBytes, checksum)
+            .unwrap();
+        assert!(!already);
+        assert!(store.meta(id).is_none()); // not yet committed
+        store.write_at(offset, &payload);
+        store.commit(id);
 
-        let map = map_arena(store.token()).expect("same-host arena");
-        assert_eq!(&map[off as usize..off as usize + payload.len()], &payload[..]);
+        let meta = store.meta(id).expect("committed");
+        assert_eq!(meta.offset, offset);
+        assert_eq!(meta.size, payload.len() as u64);
+        let map = map_arena(store.token()).unwrap();
+        assert_eq!(&map[offset as usize..offset as usize + payload.len()], &payload[..]);
+        assert_eq!(store.read(id).unwrap(), payload);
 
-        // Release recycles the exact slot for a same-class object.
         store.release(id);
-        assert_eq!(store.locate(id), None);
+        assert!(store.meta(id).is_none());
         let id2 = ObjectId::new();
-        assert_eq!(store.put(id2, &vec![1u8; 4096]).unwrap(), off);
-
+        // Same exact size recycles the same slot.
+        assert_eq!(
+            store
+                .reserve(id2, payload.len() as u64, Codec::RawBytes, checksum)
+                .unwrap()
+                .0,
+            offset
+        );
         assert!(map_arena("deadbeef").is_none());
     }
 }

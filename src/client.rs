@@ -1,6 +1,6 @@
 use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Duration};
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 use parking_lot::Mutex;
 
 use serde::{de::DeserializeOwned, Serialize};
@@ -25,6 +25,11 @@ pub struct ClusterClient {
     /// Per-arena mappings, established once and shared across clones, so a
     /// same-host get reads the arena from RAM without remapping per object.
     arena_maps: Arc<Mutex<HashMap<String, Arc<Mmap>>>>,
+    /// Writable mapping of the coordinator's arena, established at connect when
+    /// the arena file is mappable (i.e. same host). Puts write payload bytes
+    /// straight into it, so a put ships no bytes over the socket and is not
+    /// bounded by the RPC frame size.
+    arena_writer: Arc<Mutex<Option<MmapMut>>>,
 }
 impl ClusterClient {
     /// Connects using the default all-zero cluster id used by `crayon-cluster`.
@@ -37,6 +42,7 @@ impl ClusterClient {
             cluster_id,
             coordinator_epoch: None,
             arena_maps: Arc::new(Mutex::new(HashMap::new())),
+            arena_writer: Arc::new(Mutex::new(None)),
         }
     }
     /// Discovers the current coordinator epoch. Mutation requests after this
@@ -44,8 +50,14 @@ impl ClusterClient {
     /// them with `Error::StaleEpoch`.
     pub async fn connect_epoch(&mut self) -> Result<CoordinatorEpoch, Error> {
         match self.rpc_raw(ClientRequest::Connect, None).await? {
-            ClientReply::Connected { coordinator_epoch } => {
+            ClientReply::Connected {
+                coordinator_epoch,
+                arena_token,
+            } => {
                 self.coordinator_epoch = Some(coordinator_epoch);
+                // Mappability of the arena file is the same-host proof: puts go
+                // through shared memory when it maps, over TCP when it doesn't.
+                *self.arena_writer.lock() = crate::arena::map_arena_mut(&arena_token);
                 Ok(coordinator_epoch)
             }
             ClientReply::Error(error) => Err(error),
@@ -71,6 +83,9 @@ impl ClusterClient {
     /// the cluster lifetime; distributed reference counting is intentionally unsupported.
     pub async fn put<T: Serialize>(&self, value: &T) -> Result<ObjectRef<T>, Error> {
         let bytes = bincode::serialize(value)?;
+        if self.arena_writer.lock().is_some() {
+            return self.put_arena(bytes).await;
+        }
         match self
             .rpc(ClientRequest::Put {
                 codec: Codec::BincodeV1,
@@ -81,6 +96,44 @@ impl ClusterClient {
             ClientReply::Object(payload) => Ok(ObjectRef::new(payload.id)),
             ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected put reply".into())),
+        }
+    }
+    /// Same-host put: reserve an arena slot, write the bytes into shared memory
+    /// at the granted offset, then commit. The payload never crosses a socket,
+    /// so object size is bounded by the arena, not the RPC frame — gigabytes work.
+    async fn put_arena<T>(&self, bytes: Vec<u8>) -> Result<ObjectRef<T>, Error> {
+        let checksum = checksum(&bytes);
+        let reply = self
+            .rpc(ClientRequest::ArenaReserve {
+                codec: Codec::BincodeV1,
+                size_bytes: bytes.len() as u64,
+                checksum,
+            })
+            .await?;
+        match reply {
+            // Content already stored: reserve resolved as a get.
+            ClientReply::Object(payload) => Ok(ObjectRef::new(payload.id)),
+            ClientReply::ArenaReserved { id, offset } => {
+                {
+                    let mut writer = self.arena_writer.lock();
+                    let map = writer.as_mut().ok_or_else(|| {
+                        Error::Protocol("arena writer lost after reserve".into())
+                    })?;
+                    let start = offset as usize;
+                    let end = start
+                        .checked_add(bytes.len())
+                        .filter(|&end| end <= map.len())
+                        .ok_or_else(|| Error::Protocol("arena offset out of bounds".into()))?;
+                    map[start..end].copy_from_slice(&bytes);
+                }
+                match self.rpc(ClientRequest::ArenaCommit(id)).await? {
+                    ClientReply::Object(payload) => Ok(ObjectRef::new(payload.id)),
+                    ClientReply::Error(error) => Err(error),
+                    _ => Err(Error::Protocol("unexpected commit reply".into())),
+                }
+            }
+            ClientReply::Error(error) => Err(error),
+            _ => Err(Error::Protocol("unexpected reserve reply".into())),
         }
     }
     pub async fn submit<A, O>(

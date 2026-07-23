@@ -172,6 +172,15 @@ pub enum ClientRequest {
         wait_ms: u64,
     },
     GetLocal(ObjectId),
+    /// Reserve an arena slot for a client-side shared-memory put. The client
+    /// then writes its bytes at the returned offset and sends `ArenaCommit`.
+    /// Bypasses the RPC frame cap, so objects scale to gigabytes.
+    ArenaReserve {
+        codec: Codec,
+        size_bytes: u64,
+        checksum: [u8; 32],
+    },
+    ArenaCommit(ObjectId),
     Workers,
     Cancel(TaskId),
     Release(ObjectId),
@@ -239,8 +248,18 @@ pub struct WorkerView {
 pub enum ClientReply {
     Connected {
         coordinator_epoch: CoordinatorEpoch,
+        /// Token of the coordinator's shared-memory arena. A client that can
+        /// map it is co-located and puts/gets payloads through the arena.
+        arena_token: String,
     },
     Object(ObjectPayload),
+    /// Slot granted for an `ArenaReserve`: write the bytes at `offset`, then
+    /// send `ArenaCommit(id)`. (A reserve of already-stored content returns
+    /// `Object` instead.)
+    ArenaReserved {
+        id: ObjectId,
+        offset: u64,
+    },
     Submitted {
         task_id: TaskId,
         output_id: ObjectId,
