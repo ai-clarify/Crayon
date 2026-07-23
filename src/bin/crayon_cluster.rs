@@ -145,15 +145,18 @@ async fn run_worker(
     let heartbeat_period = Duration::from_millis((registered.lease_timeout_ms / 3).max(10));
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(heartbeat_period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let reply = rpc(
+            match rpc(
                 &heartbeat_coordinator,
                 RpcRequest::Worker(WorkerRequest::Heartbeat(heartbeat_identity.clone())),
             )
-            .await;
-            if !matches!(reply, Ok(RpcReply::Worker(WorkerReply::Accepted))) {
-                break;
+            .await
+            {
+                Ok(RpcReply::Worker(WorkerReply::Accepted)) => {}
+                Err(Error::Io(_) | Error::DeadlineExceeded) => continue,
+                Ok(RpcReply::Worker(WorkerReply::Error(_))) | Ok(_) | Err(_) => break,
             }
         }
     });

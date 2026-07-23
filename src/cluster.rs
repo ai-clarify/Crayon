@@ -23,6 +23,14 @@ use crate::{
 };
 
 const MAX_CONNECTIONS: usize = 256;
+const RETRY_DELAY: Duration = Duration::from_millis(25);
+
+#[derive(Clone)]
+struct ReplayEntry {
+    body_hash: [u8; 32],
+    reply: RpcReply,
+    expires_at_ms: u64,
+}
 
 #[derive(Clone)]
 pub struct CoordinatorServer {
@@ -30,6 +38,7 @@ pub struct CoordinatorServer {
     pub state: Arc<Mutex<CoordinatorState>>,
     lease_ms: u64,
     connections: Arc<Semaphore>,
+    replay: Arc<Mutex<HashMap<RequestId, ReplayEntry>>>,
 }
 impl CoordinatorServer {
     pub fn new(cluster_id: ClusterId, lease_ms: u64) -> Self {
@@ -38,6 +47,7 @@ impl CoordinatorServer {
             state: Arc::new(Mutex::new(CoordinatorState::new(CoordinatorEpoch::new()))),
             lease_ms,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            replay: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     pub async fn serve(self, bind: &str) -> Result<(), Error> {
@@ -69,8 +79,33 @@ impl CoordinatorServer {
             .await?
             .ok_or_else(|| Error::Protocol("connection closed before request".into()))?;
         envelope.validate(self.cluster_id, now_ms())?;
-        let reply = self.dispatch(envelope.body);
+        let reply = self.dispatch_once(&envelope)?;
         timeout_io(write_frame(&mut stream, &reply)).await
+    }
+    fn dispatch_once(&self, envelope: &Envelope) -> Result<RpcReply, Error> {
+        let now = now_ms();
+        let body_hash = checksum(&bincode::serialize(&envelope.body)?);
+        let mut replay = self.replay.lock();
+        replay.retain(|_, entry| entry.expires_at_ms > now);
+        if let Some(entry) = replay.get(&envelope.request_id) {
+            if entry.body_hash != body_hash {
+                return Ok(request_error(
+                    &envelope.body,
+                    Error::Protocol("request id reused with different body".into()),
+                ));
+            }
+            return Ok(entry.reply.clone());
+        }
+        let reply = self.dispatch(envelope.body.clone());
+        replay.insert(
+            envelope.request_id,
+            ReplayEntry {
+                body_hash,
+                reply: reply.clone(),
+                expires_at_ms: envelope.deadline_unix_ms,
+            },
+        );
+        Ok(reply)
     }
     fn dispatch(&self, request: RpcRequest) -> RpcReply {
         match request {
@@ -232,20 +267,40 @@ impl CoordinatorServer {
     }
 }
 
-pub async fn request(address: &str, envelope: &Envelope) -> Result<RpcReply, Error> {
-    let deadline = envelope.deadline_unix_ms.saturating_sub(now_ms());
-    if deadline == 0 {
-        return Err(Error::DeadlineExceeded);
+fn request_error(request: &RpcRequest, error: Error) -> RpcReply {
+    match request {
+        RpcRequest::Client(_) => RpcReply::Client(ClientReply::Error(error)),
+        RpcRequest::Worker(_) => RpcReply::Worker(WorkerReply::Error(error)),
     }
-    tokio::time::timeout(Duration::from_millis(deadline), async {
-        let mut stream = TcpStream::connect(address).await?;
-        write_frame(&mut stream, envelope).await?;
-        read_frame(&mut stream)
-            .await?
-            .ok_or_else(|| Error::Protocol("connection closed before reply".into()))
-    })
-    .await
-    .map_err(|_| Error::DeadlineExceeded)?
+}
+
+pub async fn request(address: &str, envelope: &Envelope) -> Result<RpcReply, Error> {
+    for attempt_number in 0..2 {
+        let remaining_ms = envelope.deadline_unix_ms.saturating_sub(now_ms());
+        if remaining_ms == 0 {
+            return Err(Error::DeadlineExceeded);
+        }
+        let attempt = tokio::time::timeout(Duration::from_millis(remaining_ms), async {
+            let mut stream = TcpStream::connect(address).await?;
+            write_frame(&mut stream, envelope).await?;
+            read_frame(&mut stream)
+                .await?
+                .ok_or_else(|| Error::Io("connection closed before reply".into()))
+        })
+        .await;
+        match attempt {
+            Ok(Ok(reply)) => return Ok(reply),
+            Ok(Err(Error::Io(_))) if attempt_number == 0 => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(Error::DeadlineExceeded),
+        }
+        let remaining_ms = envelope.deadline_unix_ms.saturating_sub(now_ms());
+        if remaining_ms == 0 {
+            return Err(Error::DeadlineExceeded);
+        }
+        tokio::time::sleep(RETRY_DELAY.min(Duration::from_millis(remaining_ms))).await;
+    }
+    unreachable!()
 }
 
 pub fn envelope(cluster_id: ClusterId, body: RpcRequest) -> Envelope {
@@ -298,4 +353,179 @@ pub fn now_ms() -> u64 {
 }
 pub fn checksum(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ids::{NodeId, WorkerEpoch},
+        operation::{Codec, OperationDescriptor, OperationKey, TaskArg},
+        protocol::{RegisterWorker, TaskStatus},
+        resources::ResourceSet,
+    };
+
+    fn descriptor() -> OperationDescriptor {
+        OperationDescriptor {
+            key: OperationKey::new("test", "copy", 1),
+            input_codec: Codec::RawBytes,
+            output_codec: Codec::RawBytes,
+            max_inline_arg_bytes: 8,
+        }
+    }
+
+    fn future_envelope(cluster: ClusterId, body: RpcRequest) -> Envelope {
+        Envelope::new(cluster, body, now_ms().saturating_add(10_000))
+    }
+
+    fn registered_server() -> (CoordinatorServer, crate::protocol::WorkerIdentity) {
+        let cluster = ClusterId::new();
+        let server = CoordinatorServer::new(cluster, 5_000);
+        let reply = server
+            .dispatch_once(&future_envelope(
+                cluster,
+                RpcRequest::Worker(WorkerRequest::Register(RegisterWorker {
+                    node_id: NodeId::new(),
+                    worker_epoch: WorkerEpoch::new(),
+                    advertise_addr: "127.0.0.1:9001".into(),
+                    resources: ResourceSet::cpu_gpu(1.0, 0.0).unwrap(),
+                    slots: 1,
+                    operations: vec![descriptor()],
+                })),
+            ))
+            .unwrap();
+        let RpcReply::Worker(WorkerReply::Registered(registered)) = reply else {
+            panic!("registration failed")
+        };
+        (server, registered.identity)
+    }
+
+    #[test]
+    fn duplicate_submit_is_dispatched_once() {
+        let (server, _) = registered_server();
+        let request = future_envelope(
+            server.cluster_id,
+            RpcRequest::Client(ClientRequest::Submit {
+                operation: descriptor().key,
+                args: vec![TaskArg::Inline {
+                    codec: Codec::RawBytes,
+                    bytes: vec![1],
+                }],
+                resources: ResourceSet::default(),
+                max_attempts: 1,
+            }),
+        );
+        let first = server.dispatch_once(&request).unwrap();
+        let second = server.dispatch_once(&request).unwrap();
+        let submitted = |reply| match reply {
+            RpcReply::Client(ClientReply::Submitted { task_id, output_id }) => (task_id, output_id),
+            _ => panic!("submit failed"),
+        };
+        assert_eq!(submitted(first), submitted(second));
+        assert_eq!(server.state.lock().tasks.len(), 1);
+    }
+
+    #[test]
+    fn request_id_cannot_be_reused_with_another_body() {
+        let (server, _) = registered_server();
+        let first = future_envelope(
+            server.cluster_id,
+            RpcRequest::Client(ClientRequest::Workers),
+        );
+        server.dispatch_once(&first).unwrap();
+        let mut conflicting = future_envelope(
+            server.cluster_id,
+            RpcRequest::Client(ClientRequest::Status(crate::ids::TaskId::new())),
+        );
+        conflicting.request_id = first.request_id;
+        assert!(matches!(
+            server.dispatch_once(&conflicting),
+            Ok(RpcReply::Client(ClientReply::Error(Error::Protocol(_))))
+        ));
+    }
+
+    #[test]
+    fn completion_reply_is_replayed_without_releasing_twice() {
+        let (server, identity) = registered_server();
+        let submit = server
+            .dispatch_once(&future_envelope(
+                server.cluster_id,
+                RpcRequest::Client(ClientRequest::Submit {
+                    operation: descriptor().key,
+                    args: vec![],
+                    resources: ResourceSet::cpu_gpu(1.0, 0.0).unwrap(),
+                    max_attempts: 1,
+                }),
+            ))
+            .unwrap();
+        let RpcReply::Client(ClientReply::Submitted { task_id, output_id }) = submit else {
+            panic!("submit failed")
+        };
+        let assignment = server
+            .state
+            .lock()
+            .assign_next(identity.node_id)
+            .unwrap()
+            .unwrap();
+        server
+            .state
+            .lock()
+            .started(&identity, assignment.fence)
+            .unwrap();
+        let node_id = identity.node_id;
+        let completion = future_envelope(
+            server.cluster_id,
+            RpcRequest::Worker(WorkerRequest::Completed {
+                identity,
+                report: crate::protocol::TaskCompletion {
+                    fence: assignment.fence,
+                    output_id,
+                    codec: Codec::RawBytes,
+                    size_bytes: 1,
+                    checksum: checksum(&[7]),
+                    location: "127.0.0.1:9001".into(),
+                },
+            }),
+        );
+        assert!(matches!(
+            server.dispatch_once(&completion),
+            Ok(RpcReply::Worker(WorkerReply::Accepted))
+        ));
+        assert!(matches!(
+            server.dispatch_once(&completion),
+            Ok(RpcReply::Worker(WorkerReply::Accepted))
+        ));
+        let state = server.state.lock();
+        assert_eq!(
+            crate::protocol::TaskStatus::from(&state.tasks[&task_id].state),
+            TaskStatus::Succeeded
+        );
+        assert_eq!(state.workers[&node_id].free_slots, 1);
+    }
+
+    #[tokio::test]
+    async fn transport_retry_reuses_the_envelope() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cluster = ClusterId::new();
+        let envelope = future_envelope(cluster, RpcRequest::Client(ClientRequest::Workers));
+        let expected = envelope.request_id;
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let received = read_frame::<Envelope>(&mut stream).await.unwrap().unwrap();
+                assert_eq!(received.request_id, expected);
+                if attempt == 1 {
+                    write_frame(&mut stream, &RpcReply::Client(ClientReply::Workers(vec![])))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        assert!(matches!(
+            request(&address.to_string(), &envelope).await,
+            Ok(RpcReply::Client(ClientReply::Workers(_)))
+        ));
+        server.await.unwrap();
+    }
 }

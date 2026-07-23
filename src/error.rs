@@ -12,6 +12,8 @@ pub enum Error {
     IllegalTransition(String),
     StaleFence,
     TaskNotFound(TaskId),
+    TaskFailed(TaskId, String),
+    TaskCancelled(TaskId),
     ObjectNotFound(ObjectId),
     ObjectLost(ObjectId),
     ObjectConflict(ObjectId),

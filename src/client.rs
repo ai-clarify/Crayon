@@ -7,7 +7,9 @@ use crate::{
     error::Error,
     ids::{ClusterId, ObjectId, TaskId},
     operation::{Codec, Operation, TaskArg},
-    protocol::{ClientReply, ClientRequest, RpcReply, RpcRequest, TaskView, WorkerView},
+    protocol::{
+        ClientReply, ClientRequest, RpcReply, RpcRequest, TaskStatus, TaskView, WorkerView,
+    },
     resources::ResourceSet,
 };
 
@@ -199,22 +201,38 @@ impl<T: DeserializeOwned> TaskHandle<T> {
     pub async fn result(&self, timeout: Duration) -> Result<T, Error> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
                 return Err(Error::DeadlineExceeded);
             }
-            let remaining = deadline - now;
-            match tokio::time::timeout(remaining, self.client.get(&self.output)).await {
-                Ok(Ok(value)) => return Ok(value),
-                Ok(Err(Error::Protocol(message))) if message.contains("unavailable") => {
+            let status = tokio::time::timeout(remaining, self.client.status(self.task_id))
+                .await
+                .map_err(|_| Error::DeadlineExceeded)??;
+            match status.state {
+                TaskStatus::Succeeded => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(Error::DeadlineExceeded);
+                    }
+                    return tokio::time::timeout(remaining, self.client.get(&self.output))
+                        .await
+                        .map_err(|_| Error::DeadlineExceeded)?;
+                }
+                TaskStatus::Failed(message) => {
+                    return Err(Error::TaskFailed(self.task_id, message));
+                }
+                TaskStatus::Cancelled => return Err(Error::TaskCancelled(self.task_id)),
+                TaskStatus::Waiting
+                | TaskStatus::Runnable
+                | TaskStatus::Assigned
+                | TaskStatus::Running
+                | TaskStatus::CancelRequested => {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
                         return Err(Error::DeadlineExceeded);
                     }
                     tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
                 }
-                Ok(Err(error)) => return Err(error),
-                Err(_) => return Err(Error::DeadlineExceeded),
             }
         }
     }

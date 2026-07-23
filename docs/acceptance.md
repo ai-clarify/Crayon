@@ -28,6 +28,11 @@ These are the product acceptance gates. Unit tests remain focused checks for
 pure state transitions and arithmetic; they are not substitutes for feature
 acceptance.
 
+RPC retries reuse the original request ID. The coordinator replays the first
+response for that ID until its request deadline, so response loss cannot repeat a
+mutation within one live coordinator epoch. Coordinator restart clears this
+in-memory history, and task execution remains at-least-once across worker attempts.
+
 ## Manual smoke
 
 ```bash
