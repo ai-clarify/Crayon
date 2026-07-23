@@ -26,6 +26,9 @@ fn usage() -> ! {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("panic: {info}");
+    }));
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("coordinator") => {
@@ -100,6 +103,7 @@ async fn run_worker(
     cpu: f64,
     operations: &str,
 ) -> Result<(), Error> {
+    eprintln!("worker starting: coordinator={coordinator} advertise={advertise}");
     let objects = LocalObjectStore::default();
     let bind_addr = bind_addr_for_advertise(advertise);
     serve_objects(&bind_addr, objects.clone()).await?;
