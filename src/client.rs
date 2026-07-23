@@ -266,12 +266,11 @@ impl ClusterClient {
         let mut out = Vec::with_capacity(payloads.len());
         for (payload, handle) in payloads.into_iter().zip(handles) {
             out.push(match payload {
-                Ok(payload) => match self.payload_bytes(payload).await {
-                    Ok((codec, bytes)) => decode(codec, bytes),
-                    Err(error) => Err(error),
-                },
-                // Object resolved to a non-available terminal; get the precise
-                // failure/cancellation reason for this task.
+                Ok(payload) => self
+                    .payload_bytes(payload)
+                    .await
+                    .and_then(|(codec, bytes)| decode(codec, bytes)),
+                // non-available terminal: fetch the precise failure/cancel reason
                 Err(Error::Protocol(_)) => Err(handle.terminal_error().await),
                 Err(error) => Err(error),
             });

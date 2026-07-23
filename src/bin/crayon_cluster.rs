@@ -18,14 +18,10 @@ use tokio::sync::Semaphore;
 
 const CLUSTER_ID: ClusterId = ClusterId([0; 16]);
 const OBJECT_CONNECTIONS: usize = 128;
-/// How long an idle worker asks the coordinator to hold its poll. Kept under the
-/// coordinator's long-poll cap and the RPC transport deadline so the held request
-/// always answers cleanly. An assignment wakes the poll immediately; this only
-/// bounds the empty-poll turnaround.
+/// How long an idle worker asks the coordinator to hold its poll; an assignment
+/// wakes it sooner. Kept under the long-poll cap so the held request answers cleanly.
 const WORKER_POLL_WAIT_MS: u64 = 2_000;
-/// Outputs at or below this size ride inline with the completion report so the
-/// coordinator can serve them directly. Larger outputs stay worker-local and are
-/// fetched on demand, keeping the completion RPC and coordinator memory bounded.
+/// Outputs at or below this ride inline in the completion; larger stay worker-local.
 const INLINE_RESULT_MAX_BYTES: usize = 64 * 1024;
 
 fn usage() -> ! {
@@ -244,6 +240,14 @@ fn rand_jitter() -> u64 {
         .unwrap_or(0)
 }
 
+/// Aborts a background task when dropped, binding its lifetime to a scope.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn run_worker_session(
     coordinator: &str,
     advertise: &str,
@@ -286,7 +290,9 @@ async fn run_worker_session(
     let heartbeat_identity = identity.clone();
     let heartbeat_coordinator = coordinator.to_string();
     let heartbeat_period = Duration::from_millis((registered.lease_timeout_ms / 3).max(10));
-    tokio::spawn(async move {
+    // Bound to the session: aborted when run_worker_session returns on any path,
+    // so the heartbeat task does not leak across reconnects.
+    let _heartbeat = AbortOnDrop(tokio::spawn(async move {
         let mut interval = tokio::time::interval(heartbeat_period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -303,7 +309,7 @@ async fn run_worker_session(
                 Ok(RpcReply::Worker(WorkerReply::Error(_))) | Ok(_) | Err(_) => break,
             }
         }
-    });
+    }));
     loop {
         let poll_reply = match rpc(
             coordinator,
@@ -337,7 +343,15 @@ async fn run_worker_session(
                     objects.clone(),
                 )
                 .await
-                .map_err(WorkerSessionEnd::Fatal)?;
+                .map_err(|error| match error {
+                    // Fencing (lease lost mid-execution) and transient transport errors
+                    // should reconnect, not kill the worker; only genuine faults fatal.
+                    Error::StaleEpoch
+                    | Error::StaleFence
+                    | Error::Io(_)
+                    | Error::DeadlineExceeded => WorkerSessionEnd::Reconnect,
+                    other => WorkerSessionEnd::Fatal(other),
+                })?;
             }
             // The coordinator held the poll for its full wait and had no work.
             // Loop straight back into another long-poll; no client-side sleep.
@@ -433,8 +447,12 @@ async fn execute_assignment(
                 match rpc(coordinator, RpcRequest::Worker(WorkerRequest::Poll { identity: identity.clone(), wait_ms: 0 }), Some(epoch)).await {
                     Ok(RpcReply::Worker(WorkerReply::Cancel(fence))) if fence == assignment.fence => break None,
                     Ok(RpcReply::Worker(WorkerReply::Assignment(None))) => {}
-                    Ok(RpcReply::Worker(WorkerReply::Error(Error::StaleEpoch))) => return Ok(()),
+                    Ok(RpcReply::Worker(WorkerReply::Error(Error::StaleEpoch))) => return Err(Error::StaleEpoch),
                     Ok(RpcReply::Worker(WorkerReply::Error(error))) => return Err(error),
+                    // A client release() of a completed output owned by this worker is
+                    // served first by the coordinator's Poll handler, even to a busy
+                    // worker; honor it here rather than treating it as a stray assignment.
+                    Ok(RpcReply::Worker(WorkerReply::DeleteObject(id))) => objects.delete(id),
                     Ok(_) => return Err(Error::Protocol("worker received assignment while busy".into())),
                     Err(Error::Io(_) | Error::DeadlineExceeded) => {}
                     Err(error) => return Err(error),
@@ -443,6 +461,13 @@ async fn execute_assignment(
         }
     };
     let Some(result) = result else {
+        // Dropping the JoinHandle only detaches the task in tokio; abort and await
+        // so the operation is truly stopped before the coordinator frees the slot.
+        execution.abort();
+        let _ = (&mut execution).await;
+        // ponytail: cooperative abort — a fully CPU-bound op with no .await still runs
+        // to its next yield; hard process-kill of workers is out of scope for this
+        // in-process worker.
         report(
             coordinator,
             WorkerRequest::Cancelled {

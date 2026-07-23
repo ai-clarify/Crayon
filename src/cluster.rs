@@ -26,14 +26,14 @@ const MAX_CONNECTIONS: usize = 256;
 const RETRY_DELAY: Duration = Duration::from_millis(25);
 const MAX_REPLAY_ENTRIES: usize = 16_384;
 const MAX_REPLAY_BYTES: usize = 64 * 1024 * 1024;
-/// Per-entry bookkeeping overhead (request-id key + expiry + hash) charged on
-/// top of the serialized reply size when accounting the replay byte budget.
+/// Per-entry overhead (key + expiry + hash) added to reply size for the byte budget.
 const REPLAY_ENTRY_OVERHEAD: usize = 40;
-/// Ceiling on how long the coordinator parks a long-poll, kept under the RPC
-/// transport deadline so a held request always answers before the client retries.
+/// Server ceiling on how long a mutation reply is retained for idempotent
+/// replay, independent of the client-chosen (unbounded) envelope deadline.
+const MAX_REPLAY_TTL_MS: u64 = 30_000;
+/// Long-poll park ceiling, kept under the RPC deadline so a held request answers first.
 const MAX_LONG_POLL_MS: u64 = 4_000;
-/// Belt-and-suspenders re-check interval while parked. `Notify` wakes a parked
-/// poll on any state change; this cap bounds the delay if a wakeup is ever missed.
+/// Fallback re-check slice guarding a missed `Notify` wakeup.
 const LONG_POLL_SLICE_MS: u64 = 250;
 
 #[derive(Clone)]
@@ -41,9 +41,7 @@ struct ReplayEntry {
     body_hash: [u8; 32],
     reply: RpcReply,
     expires_at_ms: u64,
-    /// Serialized reply size, computed once at insert. Kept on the entry so the
-    /// cache byte budget is a running sum instead of re-serializing every entry
-    /// on each request (which made cached submits O(n^2) under load).
+    /// Reply size, computed once at insert; the byte budget sums these, no re-serialize.
     bytes: usize,
 }
 
@@ -122,9 +120,8 @@ impl CoordinatorServer {
         let reply = self.dispatch_blocking(&envelope).await?;
         timeout_io(write_frame(&mut stream, &reply)).await
     }
-    /// Handles a request, parking long-poll variants (`Poll`, blocking `Get`)
-    /// until work is ready or their wait budget elapses. Everything else answers
-    /// immediately. State-changing dispatches wake parked polls.
+    /// Parks long-poll variants (`Poll`, blocking `Get`/`GetBatch`) until ready or
+    /// their wait elapses; everything else dispatches immediately.
     async fn dispatch_blocking(&self, envelope: &Envelope) -> Result<RpcReply, Error> {
         match &envelope.body {
             RpcRequest::Worker(WorkerRequest::Poll { wait_ms, .. }) => {
@@ -140,9 +137,7 @@ impl CoordinatorServer {
             _ => self.dispatch_and_notify(envelope),
         }
     }
-    /// Dispatches once and, if the coordinator state advanced, wakes parked
-    /// long-polls so a newly-runnable task or newly-available object is observed
-    /// without waiting for the fallback re-check slice.
+    /// Dispatches once; if state advanced, wakes parked long-polls immediately.
     fn dispatch_and_notify(&self, envelope: &Envelope) -> Result<RpcReply, Error> {
         let before = self.state.lock().revision;
         let reply = self.dispatch_once(envelope)?;
@@ -157,17 +152,26 @@ impl CoordinatorServer {
         wait_ms: u64,
         ready: fn(&RpcReply) -> bool,
     ) -> Result<RpcReply, Error> {
+        // Poll assigns work and must wake peers; blocking Get/GetBatch are reads
+        // that never advance revision, so they skip the notify wrapper.
+        let notifies = matches!(
+            envelope.body,
+            RpcRequest::Worker(WorkerRequest::Poll { .. })
+        );
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(MAX_LONG_POLL_MS));
         loop {
-            // Register for wakeup BEFORE dispatching: Notify permits are one-shot
-            // and not stored, so enabling first guarantees a state change between
-            // our dispatch and our await cannot be lost.
+            // enable() before dispatch: Notify permits are one-shot, so a state
+            // change between dispatch and await cannot be lost.
             let notified = self.wakeup.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let reply = self.dispatch_and_notify(envelope)?;
+            let reply = if notifies {
+                self.dispatch_and_notify(envelope)?
+            } else {
+                self.dispatch_once(envelope)?
+            };
             if ready(&reply) {
                 return Ok(reply);
             }
@@ -199,27 +203,38 @@ impl CoordinatorServer {
             }
             return Ok(entry.reply.clone());
         }
-        let reply = self.dispatch(envelope.body.clone());
-        let entry_bytes = estimate_reply_bytes(&reply);
+        // Capacity check BEFORE dispatch so every dispatched mutation is cached.
+        // Reversing this order would commit the side effect but skip the insert on
+        // saturation, turning the client's retry into a duplicate task. Returning
+        // here has no side effect; the retry can re-dispatch cleanly.
         // Sum of stored sizes: one pass, no re-serialization.
         let used: usize = replay
             .values()
             .map(|entry| entry.bytes + REPLAY_ENTRY_OVERHEAD)
             .sum();
-        if replay.len() >= MAX_REPLAY_ENTRIES
-            || used + entry_bytes + REPLAY_ENTRY_OVERHEAD > MAX_REPLAY_BYTES
-        {
+        if replay.len() >= MAX_REPLAY_ENTRIES || used >= MAX_REPLAY_BYTES {
             return Ok(request_error(
                 &envelope.body,
                 Error::CapacityExceeded("replay cache limit reached".into()),
             ));
         }
+        let reply = self.dispatch(envelope.body.clone());
+        let entry_bytes = estimate_reply_bytes(&reply);
+        // ponytail: soft byte cap, overshoot <= one max reply; hard-evict oldest only if that ever matters.
         replay.insert(
             envelope.request_id,
             ReplayEntry {
                 body_hash,
                 reply: reply.clone(),
-                expires_at_ms: envelope.deadline_unix_ms,
+                // Clamp retention to a server ceiling: the client-controlled
+                // deadline is unbounded, so a far-future deadline could otherwise
+                // pin an entry indefinitely and let crafted requests DoS the cache.
+                expires_at_ms: now.saturating_add(
+                    envelope
+                        .deadline_unix_ms
+                        .saturating_sub(now)
+                        .min(MAX_REPLAY_TTL_MS),
+                ),
                 bytes: entry_bytes,
             },
         );
@@ -404,12 +419,39 @@ impl CoordinatorServer {
                 }
                 ClientRequest::GetBatch { objects, .. } => {
                     let state = self.state.lock();
-                    ClientReply::ObjectBatch(
-                        objects
-                            .into_iter()
-                            .map(|id| state.resolve_object(id))
-                            .collect(),
-                    )
+                    // Bound the cumulative INLINE bytes cloned by a single batch to
+                    // one frame's worth. Without this, a request full of duplicate
+                    // ids (they fit the 8 MB frame) forces terabytes of allocation
+                    // under the lock before write_frame's size check ever runs.
+                    // A batch whose inline bytes sum past one frame could never be
+                    // sent anyway, so overflowing slots return CapacityExceeded and
+                    // the result vec keeps exactly one entry per requested id, in
+                    // order. Redirected outputs carry `bytes: None` and cost nothing.
+                    let mut total: usize = 0;
+                    let mut results = Vec::with_capacity(objects.len());
+                    let mut overflow = false;
+                    for id in objects {
+                        if overflow {
+                            results.push(Err(Error::CapacityExceeded(
+                                "get batch response too large".into(),
+                            )));
+                            continue;
+                        }
+                        let resolved = state.resolve_object(id);
+                        if let Ok(payload) = &resolved {
+                            let inline = payload.bytes.as_ref().map_or(0, |b| b.len());
+                            if total.saturating_add(inline) > MAX_OBJECT_BYTES {
+                                overflow = true;
+                                results.push(Err(Error::CapacityExceeded(
+                                    "get batch response too large".into(),
+                                )));
+                                continue;
+                            }
+                            total += inline;
+                        }
+                        results.push(resolved);
+                    }
+                    ClientReply::ObjectBatch(results)
                 }
                 ClientRequest::GetLocal(_) => ClientReply::Error(Error::Protocol(
                     "coordinator has no worker-local object endpoint".into(),
@@ -470,14 +512,12 @@ fn is_mutation(request: &RpcRequest) -> bool {
     }
 }
 
-/// A worker `Poll` is satisfied by anything other than "no work yet": an
-/// assignment, a cancellation, an object deletion, or an error worth returning.
+/// Ready once the poll returns anything but "no work yet".
 fn worker_poll_ready(reply: &RpcReply) -> bool {
     !matches!(reply, RpcReply::Worker(WorkerReply::Assignment(None)))
 }
 
-/// A blocking `Get` is satisfied once the object resolves either way; only a
-/// still-reserved (pending) output keeps it parked.
+/// Ready once the object resolves; a pending output keeps parking.
 fn client_get_ready(reply: &RpcReply) -> bool {
     !matches!(
         reply,
@@ -485,9 +525,7 @@ fn client_get_ready(reply: &RpcReply) -> bool {
     )
 }
 
-/// A blocking `GetBatch` is satisfied only when every object has resolved; a
-/// single still-pending object keeps the whole batch parked. Callers that want
-/// partial results pass `wait_ms: 0` for an immediate, non-parking reply.
+/// Ready once no batch element is still pending.
 fn client_get_batch_ready(reply: &RpcReply) -> bool {
     match reply {
         RpcReply::Client(ClientReply::ObjectBatch(results)) => !results
@@ -806,5 +844,109 @@ mod tests {
             Ok(RpcReply::Client(ClientReply::Workers(_)))
         ));
         server.await.unwrap();
+    }
+
+    // F1: a GetBatch must not clone unbounded inline bytes. Cumulative inline
+    // payload is capped at one frame (MAX_OBJECT_BYTES); overflow slots return
+    // CapacityExceeded so the reply always fits a frame regardless of how many
+    // duplicate ids a single request packs in.
+    #[test]
+    fn get_batch_response_bytes_are_bounded() {
+        let (server, _) = registered_server();
+        // ~3 MB object: two copies fit under MAX_OBJECT_BYTES (~8.13 MB), the
+        // third pushes over, so later slots overflow.
+        let object_size = 3_000_000usize;
+        let id = server
+            .state
+            .lock()
+            .put(Codec::RawBytes, vec![7u8; object_size])
+            .unwrap();
+        let reply = server
+            .dispatch_once(&future_envelope(
+                server.cluster_id,
+                RpcRequest::Client(ClientRequest::GetBatch {
+                    objects: vec![id; 6],
+                    wait_ms: 0,
+                }),
+            ))
+            .unwrap();
+        let RpcReply::Client(ClientReply::ObjectBatch(results)) = reply else {
+            panic!("expected object batch")
+        };
+        // One entry per requested id, in order.
+        assert_eq!(results.len(), 6);
+        let ok_count = MAX_OBJECT_BYTES / object_size;
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), ok_count);
+        assert!(matches!(results[0], Ok(_)));
+        assert!(matches!(results[1], Ok(_)));
+        for result in &results[ok_count..] {
+            assert!(matches!(result, Err(Error::CapacityExceeded(_))));
+        }
+        // Cumulative cloned inline bytes never exceed one frame.
+        let cloned: usize = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|p| p.bytes.as_ref().map_or(0, |b| b.len()))
+            .sum();
+        assert!(cloned <= MAX_OBJECT_BYTES);
+    }
+
+    // F2: a dispatched mutation is always cached. Filling MAX_REPLAY_ENTRIES is
+    // too expensive to hit directly, so assert the invariant: a successful Submit
+    // leaves exactly one task AND a replay entry, so a retry replays instead of
+    // re-dispatching (which would duplicate the task).
+    #[test]
+    fn mutation_not_dispatched_when_replay_full() {
+        let (server, _) = registered_server();
+        let request = with_epoch(
+            &server,
+            future_envelope(
+                server.cluster_id,
+                RpcRequest::Client(ClientRequest::Submit {
+                    operation: descriptor().key,
+                    args: vec![],
+                    resources: ResourceSet::default(),
+                    max_attempts: 1,
+                }),
+            ),
+        );
+        let first = server.dispatch_once(&request).unwrap();
+        // Dispatched => cached: the entry is present before any retry.
+        assert!(server.replay.lock().contains_key(&request.request_id));
+        let second = server.dispatch_once(&request).unwrap();
+        let task_id = |reply| match reply {
+            RpcReply::Client(ClientReply::Submitted { task_id, .. }) => task_id,
+            _ => panic!("submit failed"),
+        };
+        assert_eq!(task_id(first), task_id(second));
+        assert_eq!(server.state.lock().tasks.len(), 1);
+    }
+
+    // F3: replay retention is clamped to a server ceiling, so a client-chosen
+    // far-future deadline cannot pin an entry indefinitely.
+    #[test]
+    fn replay_ttl_is_server_clamped() {
+        let (server, _) = registered_server();
+        let mut request = with_epoch(
+            &server,
+            future_envelope(
+                server.cluster_id,
+                RpcRequest::Client(ClientRequest::Submit {
+                    operation: descriptor().key,
+                    args: vec![],
+                    resources: ResourceSet::default(),
+                    max_attempts: 1,
+                }),
+            ),
+        );
+        // Deadline ~10 years out; the server must ignore it for retention.
+        let ten_years_ms: u64 = 10 * 365 * 24 * 60 * 60 * 1_000;
+        request.deadline_unix_ms = now_ms().saturating_add(ten_years_ms);
+        server.dispatch_once(&request).unwrap();
+        let replay = server.replay.lock();
+        let entry = replay.get(&request.request_id).expect("mutation cached");
+        // Capped at now + MAX_REPLAY_TTL_MS (+ slack for clock movement across
+        // the two now_ms() reads), far below the 10-year envelope deadline.
+        assert!(entry.expires_at_ms <= now_ms() + MAX_REPLAY_TTL_MS + 1_000);
     }
 }

@@ -14,7 +14,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 pub const MAX_TASKS: usize = 16_384;
 pub const MAX_OBJECTS: usize = 65_536;
-pub const MAX_INLINE_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum WorkerState {
@@ -106,8 +105,9 @@ pub struct CoordinatorState {
     /// Tasks in `Waiting` state, so dependency reconciliation visits only blocked
     /// tasks instead of the whole table.
     waiting: HashSet<TaskId>,
-    /// Tasks in `CancelRequested`; lets `cancellation_for` skip its scan at 0.
-    cancel_requested: usize,
+    /// Tasks in `CancelRequested`, so `cancellation_for` visits only tasks
+    /// awaiting a worker ack instead of scanning the whole table.
+    cancel_requested: HashSet<TaskId>,
 }
 impl CoordinatorState {
     pub fn new(epoch: CoordinatorEpoch) -> Self {
@@ -121,15 +121,14 @@ impl CoordinatorState {
             pending_deletes: HashMap::new(),
             runnable: VecDeque::new(),
             waiting: HashSet::new(),
-            cancel_requested: 0,
+            cancel_requested: HashSet::new(),
         }
     }
     fn changed(&mut self) {
         self.revision.0 += 1;
     }
-    /// Marks a task `Runnable` and enqueues it for scheduling. The queue may end
-    /// up with duplicate or stale ids; `assign_next` validates on pop, so the
-    /// only invariant is that every genuinely-runnable task is present at least once.
+    /// Sets `Runnable` and enqueues; the queue may hold stale ids, `assign_next`
+    /// skips them on pop.
     fn mark_runnable(&mut self, id: TaskId) {
         if let Some(task) = self.tasks.get_mut(&id) {
             task.state = TaskState::Runnable;
@@ -137,12 +136,12 @@ impl CoordinatorState {
         self.waiting.remove(&id);
         self.runnable.push_back(id);
     }
-    /// Marks a task `Waiting` on unresolved dependencies and indexes it.
-    fn mark_waiting(&mut self, id: TaskId) {
+    /// Sets `CancelRequested` and indexes it for `cancellation_for`.
+    fn mark_cancel_requested(&mut self, id: TaskId) {
         if let Some(task) = self.tasks.get_mut(&id) {
-            task.state = TaskState::Waiting;
+            task.state = TaskState::CancelRequested;
         }
-        self.waiting.insert(id);
+        self.cancel_requested.insert(id);
     }
     pub fn register_worker(
         &mut self,
@@ -295,6 +294,11 @@ impl CoordinatorState {
         if self.tasks.len() >= MAX_TASKS {
             return Err(Error::CapacityExceeded("task limit reached".into()));
         }
+        // Admission gate mirroring `put`: submitting reserves an output object, so
+        // it must respect the same object-store cap or the store can exceed it.
+        if self.objects.len() >= MAX_OBJECTS {
+            return Err(Error::CapacityExceeded("object store limit reached".into()));
+        }
         let descriptor = self
             .operations
             .get(&operation)
@@ -354,16 +358,18 @@ impl CoordinatorState {
                 resources,
                 max_attempts,
                 attempt: Attempt(0),
-                // Overwritten immediately by mark_runnable/mark_waiting below,
-                // under the same lock, before any observer can see it.
-                state: TaskState::Waiting,
+                state: if waiting {
+                    TaskState::Waiting
+                } else {
+                    TaskState::Runnable
+                },
                 assigned: None,
             },
         );
         if waiting {
-            self.mark_waiting(id);
+            self.waiting.insert(id);
         } else {
-            self.mark_runnable(id);
+            self.runnable.push_back(id);
         }
         self.changed();
         Ok((id, output))
@@ -373,27 +379,24 @@ impl CoordinatorState {
         if worker.state != WorkerState::Alive || worker.free_slots == 0 {
             return Ok(None);
         }
-        // Pop from the runnable queue, skipping stale entries (tasks no longer
-        // runnable) and re-queuing runnable tasks this worker cannot serve — for
-        // example a task needing an operation or resources it lacks. Bounded by
-        // the number of genuinely-runnable tasks, not the whole task table.
+        // Pop runnable ids, skipping stale entries and re-queuing tasks this
+        // worker can't serve. Bounded by the runnable count, not the task table.
+        let (workers, runnable, tasks) = (&self.workers, &mut self.runnable, &self.tasks);
+        let worker = &workers[&node_id];
         let mut requeue: Vec<TaskId> = Vec::new();
         let mut chosen = None;
-        while let Some(id) = self.runnable.pop_front() {
-            let Some(task) = self.tasks.get(&id) else {
-                continue; // task gone
-            };
+        while let Some(id) = runnable.pop_front() {
+            let Some(task) = tasks.get(&id) else { continue };
             if task.state != TaskState::Runnable {
-                continue; // stale entry (retried elsewhere, cancelled, ...)
+                continue;
             }
-            let worker = self.workers.get(&node_id).unwrap();
             if worker.operations.contains_key(&task.operation)
                 && worker.available.can_fit(&task.resources)
             {
                 chosen = Some(id);
                 break;
             }
-            requeue.push(id); // runnable but not for this worker; keep it
+            requeue.push(id);
         }
         for id in requeue {
             self.runnable.push_back(id);
@@ -430,8 +433,13 @@ impl CoordinatorState {
     }
     pub fn started(&mut self, identity: &WorkerIdentity, fence: TaskFence) -> Result<(), Error> {
         // Idempotent: a duplicate started report for an already-running task is
-        // accepted so workers can safely retry reports.
-        if self.tasks[&fence.task_id].state == TaskState::Running {
+        // accepted so workers can safely retry reports. Look up first so an
+        // unknown task_id yields TaskNotFound instead of panicking on index.
+        let task = self
+            .tasks
+            .get(&fence.task_id)
+            .ok_or(Error::TaskNotFound(fence.task_id))?;
+        if task.state == TaskState::Running {
             return Ok(());
         }
         self.check_fence(identity, fence)?;
@@ -448,18 +456,28 @@ impl CoordinatorState {
         identity: &WorkerIdentity,
         mut report: TaskCompletion,
     ) -> Result<(), Error> {
-        let task = &self.tasks[&report.fence.task_id];
+        // Look up first so an unknown task_id yields TaskNotFound instead of
+        // panicking on index.
+        let task = self
+            .tasks
+            .get(&report.fence.task_id)
+            .ok_or(Error::TaskNotFound(report.fence.task_id))?;
         // Idempotent: a duplicate completion for an already-succeeded task with
-        // a matching output is accepted so workers can safely retry reports.
+        // a matching output is accepted so workers can safely retry reports. The
+        // output may have been released (GC) after success, so a retried report
+        // must not panic when the object is gone.
         if task.state == TaskState::Succeeded {
-            let object = &self.objects[&task.output];
-            if object.state == ObjectState::Available
-                && object.checksum == Some(report.checksum)
-                && object.size_bytes == Some(report.size_bytes)
-            {
-                return Ok(());
-            }
-            return Err(Error::ObjectConflict(task.output));
+            return match self.objects.get(&task.output) {
+                Some(object)
+                    if object.state == ObjectState::Available
+                        && object.checksum == Some(report.checksum)
+                        && object.size_bytes == Some(report.size_bytes) =>
+                {
+                    Ok(())
+                }
+                None => Ok(()),
+                _ => Err(Error::ObjectConflict(task.output)),
+            };
         }
         self.check_fence(identity, report.fence)?;
         let task = &self.tasks[&report.fence.task_id];
@@ -516,9 +534,14 @@ impl CoordinatorState {
         retryable: bool,
     ) -> Result<(), Error> {
         // Idempotent: a duplicate failure report for an already-terminal task
-        // is accepted so workers can safely retry reports.
+        // is accepted so workers can safely retry reports. Look up first so an
+        // unknown task_id yields TaskNotFound instead of panicking on index.
+        let task = self
+            .tasks
+            .get(&fence.task_id)
+            .ok_or(Error::TaskNotFound(fence.task_id))?;
         if matches!(
-            self.tasks[&fence.task_id].state,
+            task.state,
             TaskState::Failed(_) | TaskState::Cancelled | TaskState::Succeeded
         ) {
             return Ok(());
@@ -570,7 +593,7 @@ impl CoordinatorState {
                 let output = task.output;
                 if task.state == TaskState::CancelRequested {
                     task.state = TaskState::Cancelled;
-                    self.cancel_requested = self.cancel_requested.saturating_sub(1);
+                    self.cancel_requested.remove(&id);
                     self.objects.get_mut(&output).unwrap().state = ObjectState::Cancelled;
                 } else if task.attempt.0 < task.max_attempts {
                     self.mark_runnable(id);
@@ -585,6 +608,12 @@ impl CoordinatorState {
                     object.location = None;
                 }
             }
+            // Ephemeral workers die on completion and never return, so drop the
+            // dead record and its pending deletes instead of leaking them forever.
+            // Fencing-safe: a late request from this node hits check_identity ->
+            // workers.get -> None -> StaleFence, exactly as when it was left Dead.
+            self.workers.remove(node);
+            self.pending_deletes.remove(node);
         }
         if !expired.is_empty() {
             self.reconcile_dependencies();
@@ -594,15 +623,12 @@ impl CoordinatorState {
     }
     pub fn cancellation_for(&self, identity: &WorkerIdentity) -> Result<Option<TaskFence>, Error> {
         self.check_identity(identity)?;
-        if self.cancel_requested == 0 {
-            return Ok(None);
-        }
-        Ok(self.tasks.values().find_map(|task| {
+        Ok(self.cancel_requested.iter().find_map(|id| {
+            let task = self.tasks.get(id)?;
             let (node, epoch, session, lease_id) = task.assigned?;
             (node == identity.node_id
                 && epoch == identity.worker_epoch
-                && session == identity.session_id
-                && task.state == TaskState::CancelRequested)
+                && session == identity.session_id)
                 .then_some(TaskFence {
                     task_id: task.id,
                     attempt: task.attempt,
@@ -616,8 +642,13 @@ impl CoordinatorState {
         fence: TaskFence,
     ) -> Result<(), Error> {
         // Idempotent: a duplicate cancel ack for an already-cancelled task is
-        // accepted so workers can safely retry reports.
-        if self.tasks[&fence.task_id].state == TaskState::Cancelled {
+        // accepted so workers can safely retry reports. Look up first so an
+        // unknown task_id yields TaskNotFound instead of panicking on index.
+        let task = self
+            .tasks
+            .get(&fence.task_id)
+            .ok_or(Error::TaskNotFound(fence.task_id))?;
+        if task.state == TaskState::Cancelled {
             return Ok(());
         }
         self.check_fence(identity, fence)?;
@@ -629,10 +660,10 @@ impl CoordinatorState {
         let resources = self.tasks[&fence.task_id].resources.clone();
         let output = self.tasks[&fence.task_id].output;
         self.release(identity.node_id, &resources)?;
+        self.cancel_requested.remove(&fence.task_id);
         let task = self.tasks.get_mut(&fence.task_id).unwrap();
         task.state = TaskState::Cancelled;
         task.assigned = None;
-        self.cancel_requested = self.cancel_requested.saturating_sub(1);
         self.objects.get_mut(&output).unwrap().state = ObjectState::Cancelled;
         self.reconcile_dependencies();
         self.changed();
@@ -649,11 +680,9 @@ impl CoordinatorState {
         }
         let output = task.output;
         if task.assigned.is_some() {
-            self.tasks.get_mut(&id).unwrap().state = TaskState::CancelRequested;
-            self.cancel_requested += 1;
+            self.mark_cancel_requested(id);
         } else {
             self.tasks.get_mut(&id).unwrap().state = TaskState::Cancelled;
-            // stale runnable-queue entry is skipped by assign_next on pop
             self.waiting.remove(&id);
             self.objects.get_mut(&output).unwrap().state = ObjectState::Cancelled;
             self.reconcile_dependencies();
@@ -666,13 +695,31 @@ impl CoordinatorState {
             Some(object) => object.clone(),
             None => return Ok(()),
         };
+        // A Reserved object is always the pending output of a still-live task;
+        // deleting it would make every terminal transition of that task panic on
+        // a missing object. Reject until the producer is terminal, at which point
+        // the output is Available/Failed/Cancelled/Lost and release proceeds.
+        if object.state == ObjectState::Reserved {
+            return Err(Error::ObjectInUse(id));
+        }
         if self.object_in_use(&id) {
             return Err(Error::ObjectInUse(id));
         }
+        // Only enqueue a delete for an owner that still exists, so a released
+        // object owned by an already-evicted worker does not re-leak.
         if let Some(owner) = object.owner {
-            self.pending_deletes.entry(owner).or_default().push(id);
+            if self.workers.contains_key(&owner) {
+                self.pending_deletes.entry(owner).or_default().push(id);
+            }
         }
         self.objects.remove(&id);
+        // A releasable (non-Reserved) output implies its producer is terminal, and
+        // object_in_use guarantees no live consumer references it, so drop the
+        // producing task too — otherwise the task table is never reclaimed and
+        // MAX_TASKS becomes a lifetime cap.
+        // ponytail: O(tasks) retain, release is client-driven cleanup not a hot
+        // path; add an output->task_id index only if release ever gets hot.
+        self.tasks.retain(|_, task| task.output != id);
         self.changed();
         Ok(())
     }
