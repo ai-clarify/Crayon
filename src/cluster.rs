@@ -24,7 +24,7 @@ use crate::{
 
 const MAX_CONNECTIONS: usize = 256;
 const RETRY_DELAY: Duration = Duration::from_millis(25);
-const MAX_REPLAY_ENTRIES: usize = 4_096;
+const MAX_REPLAY_ENTRIES: usize = 16_384;
 const MAX_REPLAY_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -359,20 +359,16 @@ fn is_mutation(request: &RpcRequest) -> bool {
     }
 }
 
-/// Put is idempotent and its reply carries the full payload, so it is not cached.
+/// Only client mutations are cached. Worker reports are idempotent at the
+/// coordinator state machine and Poll returns transient state, so caching them
+/// would only fill the cache under load without adding safety.
 fn should_cache(request: &RpcRequest) -> bool {
-    match request {
-        RpcRequest::Client(client) => {
-            matches!(
-                client,
-                ClientRequest::Submit { .. } | ClientRequest::Cancel(_) | ClientRequest::Release(_)
-            )
-        }
-        RpcRequest::Worker(worker) => !matches!(
-            worker,
-            WorkerRequest::Register(_) | WorkerRequest::Poll(_) | WorkerRequest::Heartbeat(_)
-        ),
-    }
+    matches!(
+        request,
+        RpcRequest::Client(
+            ClientRequest::Submit { .. } | ClientRequest::Cancel(_) | ClientRequest::Release(_)
+        )
+    )
 }
 
 fn estimate_reply_bytes(reply: &RpcReply) -> usize {

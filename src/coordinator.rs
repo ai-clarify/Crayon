@@ -360,6 +360,11 @@ impl CoordinatorState {
         Ok(Some(assignment))
     }
     pub fn started(&mut self, identity: &WorkerIdentity, fence: TaskFence) -> Result<(), Error> {
+        // Idempotent: a duplicate started report for an already-running task is
+        // accepted so workers can safely retry reports.
+        if self.tasks[&fence.task_id].state == TaskState::Running {
+            return Ok(());
+        }
         self.check_fence(identity, fence)?;
         let task = self.tasks.get_mut(&fence.task_id).unwrap();
         if task.state != TaskState::Assigned {
@@ -374,6 +379,19 @@ impl CoordinatorState {
         identity: &WorkerIdentity,
         report: TaskCompletion,
     ) -> Result<(), Error> {
+        let task = &self.tasks[&report.fence.task_id];
+        // Idempotent: a duplicate completion for an already-succeeded task with
+        // a matching output is accepted so workers can safely retry reports.
+        if task.state == TaskState::Succeeded {
+            let object = &self.objects[&task.output];
+            if object.state == ObjectState::Available
+                && object.checksum == Some(report.checksum)
+                && object.size_bytes == Some(report.size_bytes)
+            {
+                return Ok(());
+            }
+            return Err(Error::ObjectConflict(task.output));
+        }
         self.check_fence(identity, report.fence)?;
         let task = &self.tasks[&report.fence.task_id];
         if !matches!(task.state, TaskState::Assigned | TaskState::Running) {
@@ -418,6 +436,14 @@ impl CoordinatorState {
         message: String,
         retryable: bool,
     ) -> Result<(), Error> {
+        // Idempotent: a duplicate failure report for an already-terminal task
+        // is accepted so workers can safely retry reports.
+        if matches!(
+            self.tasks[&fence.task_id].state,
+            TaskState::Failed(_) | TaskState::Cancelled | TaskState::Succeeded
+        ) {
+            return Ok(());
+        }
         self.check_fence(identity, fence)?;
         if !matches!(
             self.tasks[&fence.task_id].state,
@@ -507,6 +533,11 @@ impl CoordinatorState {
         identity: &WorkerIdentity,
         fence: TaskFence,
     ) -> Result<(), Error> {
+        // Idempotent: a duplicate cancel ack for an already-cancelled task is
+        // accepted so workers can safely retry reports.
+        if self.tasks[&fence.task_id].state == TaskState::Cancelled {
+            return Ok(());
+        }
         self.check_fence(identity, fence)?;
         if self.tasks[&fence.task_id].state != TaskState::CancelRequested {
             return Err(Error::IllegalTransition(
