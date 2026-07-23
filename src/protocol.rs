@@ -8,10 +8,7 @@ use crate::{
     resources::ResourceSet,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    fmt,
-    net::{IpAddr, SocketAddr},
-};
+use std::fmt;
 
 impl fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -63,26 +60,32 @@ impl Envelope {
         Ok(())
     }
 }
-pub fn validate_advertise_addr(value: &str) -> Result<SocketAddr, Error> {
-    let addr: SocketAddr = value
+pub fn validate_advertise_addr(value: &str) -> Result<(), Error> {
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return Err(Error::InvalidAddress(value.into()));
+    };
+    let port: u16 = port
         .parse()
         .map_err(|_| Error::InvalidAddress(value.into()))?;
-    if addr.port() == 0
-        || matches!(addr.ip(), IpAddr::V4(ip) if ip.is_unspecified())
-        || matches!(addr.ip(), IpAddr::V6(ip) if ip.is_unspecified())
-    {
+    if port == 0 {
         return Err(Error::InvalidAddress(value.into()));
     }
-    Ok(addr)
+    if host.is_empty() {
+        return Err(Error::InvalidAddress(value.into()));
+    }
+    Ok(())
 }
-pub fn require_loopback_addr(value: &str) -> Result<SocketAddr, Error> {
-    let addr = validate_advertise_addr(value)?;
-    if !addr.ip().is_loopback() {
+pub fn require_loopback_addr(value: &str) -> Result<(), Error> {
+    validate_advertise_addr(value)?;
+    let Some((host, _)) = value.rsplit_once(':') else {
+        return Err(Error::InvalidAddress(value.into()));
+    };
+    if host != "127.0.0.1" && host != "::1" && host != "localhost" {
         return Err(Error::InvalidAddress(format!(
             "unauthenticated mode requires loopback address: {value}"
         )));
     }
-    Ok(addr)
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
