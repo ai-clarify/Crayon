@@ -1,0 +1,43 @@
+src/bin/crayon_cluster.rs
+  s_8541ad8b60dcd1::t_4a1e30dc5cf5dd 28,78,744-751
+src/cluster.rs
+  s_41c334c91b145e::t_aed11d073d9820 880-881
+src/coordinator.rs
+  s_2afa39eac5045a::t_f7b237917c2eb8 1045-1162
+tests/cluster_process.rs
+  s_2afa39eac5045a::t_6d4096f0be363a 297-359
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "66f10ecd2f5492e33e1b040b94d2c2df4459e4c2",
+  "prompts": {},
+  "sessions": {
+    "s_2afa39eac5045a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5cdd2e04-b710-4054-9fce-eb8e05e76006",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_41c334c91b145e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5b548f5-e223-437a-a200-0fc66030f3de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_8541ad8b60dcd1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a7d0e79099d546965",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
