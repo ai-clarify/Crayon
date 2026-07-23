@@ -34,3 +34,7 @@ path = "src/bin/cluster_benchmark.rs"
 [[bin]]
 name = "storage-benchmark"
 path = "src/bin/storage_benchmark.rs"
+
+[[bin]]
+name = "rl-benchmark"
+path = "src/bin/rl_benchmark.rs"
