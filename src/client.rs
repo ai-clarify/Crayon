@@ -116,7 +116,19 @@ impl ClusterClient {
         }
     }
     pub async fn get_bytes(&self, id: ObjectId) -> Result<(Codec, Vec<u8>), Error> {
-        match self.rpc(ClientRequest::Get(id)).await? {
+        self.fetch_object(id, 0).await
+    }
+    /// Fetches an object's bytes, blocking up to `wait_ms` for a reserved output
+    /// to become available. Small outputs arrive inline; large ones redirect to
+    /// the producing worker. `wait_ms: 0` returns immediately.
+    async fn fetch_object(&self, id: ObjectId, wait_ms: u64) -> Result<(Codec, Vec<u8>), Error> {
+        match self
+            .rpc(ClientRequest::Get {
+                object: id,
+                wait_ms,
+            })
+            .await?
+        {
             ClientReply::Object {
                 id: returned,
                 codec,
@@ -170,12 +182,7 @@ impl ClusterClient {
 
     pub async fn get<T: DeserializeOwned>(&self, reference: &ObjectRef<T>) -> Result<T, Error> {
         let (codec, bytes) = self.get_bytes(reference.id).await?;
-        match codec {
-            Codec::BincodeV1 => Ok(bincode::deserialize(&bytes)?),
-            _ => Err(Error::Protocol(format!(
-                "unsupported codec for get: {codec:?}"
-            ))),
-        }
+        decode(codec, bytes)
     }
     pub async fn cancel(&self, task_id: TaskId) -> Result<(), Error> {
         match self.rpc(ClientRequest::Cancel(task_id)).await? {
@@ -190,6 +197,15 @@ impl ClusterClient {
             ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected release reply".into())),
         }
+    }
+}
+
+fn decode<T: DeserializeOwned>(codec: Codec, bytes: Vec<u8>) -> Result<T, Error> {
+    match codec {
+        Codec::BincodeV1 => Ok(bincode::deserialize(&bytes)?),
+        _ => Err(Error::Protocol(format!(
+            "unsupported codec for get: {codec:?}"
+        ))),
     }
 }
 
@@ -226,6 +242,10 @@ pub struct TaskHandle<T> {
     client: ClusterClient,
 }
 impl<T: DeserializeOwned> TaskHandle<T> {
+    /// Waits for the task's output, blocking on the coordinator rather than
+    /// polling. Each request parks server-side until the reserved output resolves
+    /// or the wait slice elapses, then returns the result — inline for small
+    /// outputs, one hop to the producing worker for large ones.
     pub async fn result(&self, timeout: Duration) -> Result<T, Error> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -233,50 +253,29 @@ impl<T: DeserializeOwned> TaskHandle<T> {
             if remaining.is_zero() {
                 return Err(Error::DeadlineExceeded);
             }
-            let status = tokio::time::timeout(remaining, self.client.status(self.task_id))
-                .await
-                .map_err(|_| Error::DeadlineExceeded)??;
-            match status.state {
-                TaskStatus::Succeeded => {
-                    for _ in 0..5 {
-                        let remaining =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remaining.is_zero() {
-                            return Err(Error::DeadlineExceeded);
-                        }
-                        match tokio::time::timeout(remaining, self.client.get(&self.output)).await {
-                            Ok(Ok(value)) => return Ok(value),
-                            Ok(Err(Error::ObjectConflict(_) | Error::Protocol(_))) => {
-                                tokio::time::sleep(Duration::from_millis(20)).await;
-                            }
-                            Ok(Err(error)) => return Err(error),
-                            Err(_) => return Err(Error::DeadlineExceeded),
-                        }
-                    }
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        return Err(Error::DeadlineExceeded);
-                    }
-                    return tokio::time::timeout(remaining, self.client.get(&self.output))
-                        .await
-                        .map_err(|_| Error::DeadlineExceeded)?;
-                }
-                TaskStatus::Failed(message) => {
-                    return Err(Error::TaskFailed(self.task_id, message));
-                }
-                TaskStatus::Cancelled => return Err(Error::TaskCancelled(self.task_id)),
-                TaskStatus::Waiting
-                | TaskStatus::Runnable
-                | TaskStatus::Assigned
-                | TaskStatus::Running
-                | TaskStatus::CancelRequested => {
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        return Err(Error::DeadlineExceeded);
-                    }
-                    tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
-                }
+            let wait_ms = remaining.as_millis().min(u64::MAX as u128) as u64;
+            match self.client.fetch_object(self.output.id, wait_ms).await {
+                Ok((codec, bytes)) => return decode(codec, bytes),
+                // Held the full slice and the output is still reserved: re-issue
+                // until the outer deadline fires.
+                Err(Error::ObjectPending(_)) => continue,
+                // Output resolved to a non-available terminal (failed/cancelled).
+                // Consult task status once for the precise reason.
+                Err(Error::Protocol(_)) => return Err(self.terminal_error().await),
+                Err(error) => return Err(error),
             }
+        }
+    }
+    /// Resolves a failed/cancelled output to a precise error via a single status
+    /// lookup. Only taken on the rare failure path, so the extra hop is cheap.
+    async fn terminal_error(&self) -> Error {
+        match self.client.status(self.task_id).await {
+            Ok(view) => match view.state {
+                TaskStatus::Failed(message) => Error::TaskFailed(self.task_id, message),
+                TaskStatus::Cancelled => Error::TaskCancelled(self.task_id),
+                _ => Error::ObjectConflict(self.output.id),
+            },
+            Err(error) => error,
         }
     }
     /// Requests cooperative cancellation and waits only for coordinator acceptance.

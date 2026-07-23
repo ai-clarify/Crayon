@@ -151,7 +151,14 @@ pub enum ClientRequest {
         max_attempts: u32,
     },
     Status(TaskId),
-    Get(ObjectId),
+    /// Fetch an object, optionally blocking. The coordinator holds the request
+    /// until the object is available or `wait_ms` elapses (`wait_ms: 0` returns
+    /// immediately). Blocking replaces the client-side status-polling loop in
+    /// `TaskHandle::result` with an event-driven wait for the reserved output.
+    Get {
+        object: ObjectId,
+        wait_ms: u64,
+    },
     GetLocal(ObjectId),
     Workers,
     Cancel(TaskId),
@@ -214,7 +221,13 @@ pub enum ClientReply {
 pub enum WorkerRequest {
     Register(RegisterWorker),
     Heartbeat(WorkerIdentity),
-    Poll(WorkerIdentity),
+    /// Long-poll for work. The coordinator holds the request until an assignment,
+    /// cancellation, or object deletion is ready, or `wait_ms` elapses. A busy
+    /// worker polling only for cancellation passes `wait_ms: 0` for a prompt reply.
+    Poll {
+        identity: WorkerIdentity,
+        wait_ms: u64,
+    },
     Cancelled {
         identity: WorkerIdentity,
         fence: TaskFence,

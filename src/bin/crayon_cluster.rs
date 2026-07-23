@@ -18,6 +18,15 @@ use tokio::sync::Semaphore;
 
 const CLUSTER_ID: ClusterId = ClusterId([0; 16]);
 const OBJECT_CONNECTIONS: usize = 128;
+/// How long an idle worker asks the coordinator to hold its poll. Kept under the
+/// coordinator's long-poll cap and the RPC transport deadline so the held request
+/// always answers cleanly. An assignment wakes the poll immediately; this only
+/// bounds the empty-poll turnaround.
+const WORKER_POLL_WAIT_MS: u64 = 2_000;
+/// Outputs at or below this size ride inline with the completion report so the
+/// coordinator can serve them directly. Larger outputs stay worker-local and are
+/// fetched on demand, keeping the completion RPC and coordinator memory bounded.
+const INLINE_RESULT_MAX_BYTES: usize = 64 * 1024;
 
 fn usage() -> ! {
     eprintln!("usage: crayon-cluster coordinator <addr> [lease-ms] | worker <coordinator> <advertise> [node-id] [cpu] [operations] | submit <coordinator> <a> <b> | submit-detach <coordinator> <operation> <value> [object-id] [cpu] [max-attempts] | status <coordinator> <task-id> | workers <coordinator> | cancel <coordinator> <task-id> | get <coordinator> <object-id>");
@@ -298,7 +307,10 @@ async fn run_worker_session(
     loop {
         let poll_reply = match rpc(
             coordinator,
-            RpcRequest::Worker(WorkerRequest::Poll(identity.clone())),
+            RpcRequest::Worker(WorkerRequest::Poll {
+                identity: identity.clone(),
+                wait_ms: WORKER_POLL_WAIT_MS,
+            }),
             Some(identity.coordinator_epoch),
         )
         .await
@@ -327,9 +339,9 @@ async fn run_worker_session(
                 .await
                 .map_err(WorkerSessionEnd::Fatal)?;
             }
-            RpcReply::Worker(WorkerReply::Assignment(None)) => {
-                tokio::time::sleep(Duration::from_millis(50)).await
-            }
+            // The coordinator held the poll for its full wait and had no work.
+            // Loop straight back into another long-poll; no client-side sleep.
+            RpcReply::Worker(WorkerReply::Assignment(None)) => {}
             RpcReply::Worker(WorkerReply::Cancel(fence)) => {
                 report(
                     coordinator,
@@ -414,7 +426,9 @@ async fn execute_assignment(
                 Err(_) => Err(Error::Protocol("operation task aborted".into())),
             }),
             _ = poll.tick() => {
-                match rpc(coordinator, RpcRequest::Worker(WorkerRequest::Poll(identity.clone())), Some(epoch)).await {
+                // Busy worker: a non-blocking poll (wait_ms 0) purely to observe
+                // cancellation. The 50ms interval drives the cadence, not the server.
+                match rpc(coordinator, RpcRequest::Worker(WorkerRequest::Poll { identity: identity.clone(), wait_ms: 0 }), Some(epoch)).await {
                     Ok(RpcReply::Worker(WorkerReply::Cancel(fence))) if fence == assignment.fence => break None,
                     Ok(RpcReply::Worker(WorkerReply::Assignment(None))) => {}
                     Ok(RpcReply::Worker(WorkerReply::Error(Error::StaleEpoch))) => return Ok(()),
@@ -445,6 +459,10 @@ async fn execute_assignment(
                 .ok_or_else(|| Error::OperationUnavailable(assignment.operation.to_string()))?;
             let object =
                 objects.put(assignment.output_id, descriptor.output_codec.clone(), bytes)?;
+            // Ship small outputs inline so the coordinator answers Get in one hop;
+            // large outputs stay worker-local and are fetched from `location`.
+            let inline =
+                (object.bytes.len() <= INLINE_RESULT_MAX_BYTES).then(|| object.bytes.clone());
             report(
                 coordinator,
                 WorkerRequest::Completed {
@@ -456,7 +474,7 @@ async fn execute_assignment(
                         size_bytes: object.bytes.len() as u64,
                         checksum: object.checksum,
                         location: advertise.to_string(),
-                        bytes: Some(object.bytes.clone()),
+                        bytes: inline,
                     },
                 },
                 epoch,
@@ -527,6 +545,7 @@ async fn serve_objects(advertise: &str, objects: LocalObjectStore) -> Result<(),
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
+            let _ = stream.set_nodelay(true);
             let Ok(permit) = permits.clone().try_acquire_owned() else {
                 continue;
             };

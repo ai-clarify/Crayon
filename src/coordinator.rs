@@ -10,18 +10,19 @@ use crate::{
     },
     resources::ResourceSet,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub const MAX_TASKS: usize = 16_384;
 pub const MAX_OBJECTS: usize = 65_536;
 pub const MAX_INLINE_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkerState {
     Alive,
     Dead,
 }
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskState {
     Waiting,
     Runnable,
@@ -46,7 +47,7 @@ impl From<&TaskState> for TaskStatus {
         }
     }
 }
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ObjectState {
     Reserved,
     Available,
@@ -54,7 +55,7 @@ pub enum ObjectState {
     Cancelled,
     Lost,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub identity: WorkerIdentity,
     pub state: WorkerState,
@@ -66,7 +67,7 @@ pub struct WorkerRecord {
     pub operations: HashMap<OperationKey, OperationDescriptor>,
     pub lease_deadline_ms: u64,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub id: TaskId,
     pub operation: OperationKey,
@@ -78,7 +79,7 @@ pub struct TaskRecord {
     pub state: TaskState,
     pub assigned: Option<(NodeId, WorkerEpoch, WorkerSessionId, LeaseId)>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectRecord {
     pub id: ObjectId,
     pub state: ObjectState,
@@ -91,6 +92,7 @@ pub struct ObjectRecord {
     pub ref_count: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinatorState {
     pub epoch: CoordinatorEpoch,
     pub revision: Revision,

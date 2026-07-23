@@ -17,6 +17,7 @@ pub enum Error {
     TaskFailed(TaskId, String),
     TaskCancelled(TaskId),
     ObjectNotFound(ObjectId),
+    ObjectPending(ObjectId),
     ObjectInUse(ObjectId),
     ObjectLost(ObjectId),
     ObjectConflict(ObjectId),

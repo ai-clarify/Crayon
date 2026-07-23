@@ -8,11 +8,11 @@ use parking_lot::Mutex;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{Notify, Semaphore},
 };
 
 use crate::{
-    coordinator::CoordinatorState,
+    coordinator::{CoordinatorState, ObjectState},
     error::Error,
     ids::{ClusterId, CoordinatorEpoch, RequestId},
     protocol::{
@@ -26,6 +26,12 @@ const MAX_CONNECTIONS: usize = 256;
 const RETRY_DELAY: Duration = Duration::from_millis(25);
 const MAX_REPLAY_ENTRIES: usize = 16_384;
 const MAX_REPLAY_BYTES: usize = 64 * 1024 * 1024;
+/// Ceiling on how long the coordinator parks a long-poll, kept under the RPC
+/// transport deadline so a held request always answers before the client retries.
+const MAX_LONG_POLL_MS: u64 = 4_000;
+/// Belt-and-suspenders re-check interval while parked. `Notify` wakes a parked
+/// poll on any state change; this cap bounds the delay if a wakeup is ever missed.
+const LONG_POLL_SLICE_MS: u64 = 250;
 
 #[derive(Clone)]
 struct ReplayEntry {
@@ -41,6 +47,9 @@ pub struct CoordinatorServer {
     lease_ms: u64,
     connections: Arc<Semaphore>,
     replay: Arc<Mutex<HashMap<RequestId, ReplayEntry>>>,
+    /// Fires on every state change so parked long-polls (worker `Poll`, client
+    /// blocking `Get`) wake immediately instead of spinning on a timer.
+    wakeup: Arc<Notify>,
     require_loopback: bool,
 }
 impl CoordinatorServer {
@@ -51,6 +60,7 @@ impl CoordinatorServer {
             lease_ms,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             replay: Arc::new(Mutex::new(HashMap::new())),
+            wakeup: Arc::new(Notify::new()),
             require_loopback: true,
         }
     }
@@ -71,7 +81,11 @@ impl CoordinatorServer {
             let mut interval = tokio::time::interval(period);
             loop {
                 interval.tick().await;
-                let _ = reaper.state.lock().expire_workers(now_ms());
+                let expired = reaper.state.lock().expire_workers(now_ms());
+                if !matches!(expired, Ok(ref list) if list.is_empty()) {
+                    // Expiry retries or fails tasks; wake parked polls to react.
+                    reaper.wakeup.notify_waiters();
+                }
             }
         });
         loop {
@@ -83,6 +97,7 @@ impl CoordinatorServer {
             let server = self.clone();
             tokio::spawn(async move {
                 let _permit = permit;
+                let _ = stream.set_nodelay(true);
                 let _ = server.handle(stream).await;
             });
         }
@@ -92,8 +107,61 @@ impl CoordinatorServer {
             .await?
             .ok_or_else(|| Error::Protocol("connection closed before request".into()))?;
         envelope.validate(self.cluster_id, now_ms())?;
-        let reply = self.dispatch_once(&envelope)?;
+        let reply = self.dispatch_blocking(&envelope).await?;
         timeout_io(write_frame(&mut stream, &reply)).await
+    }
+    /// Handles a request, parking long-poll variants (`Poll`, blocking `Get`)
+    /// until work is ready or their wait budget elapses. Everything else answers
+    /// immediately. State-changing dispatches wake parked polls.
+    async fn dispatch_blocking(&self, envelope: &Envelope) -> Result<RpcReply, Error> {
+        match &envelope.body {
+            RpcRequest::Worker(WorkerRequest::Poll { wait_ms, .. }) => {
+                self.long_poll(envelope, *wait_ms, worker_poll_ready).await
+            }
+            RpcRequest::Client(ClientRequest::Get { wait_ms, .. }) if *wait_ms > 0 => {
+                self.long_poll(envelope, *wait_ms, client_get_ready).await
+            }
+            _ => self.dispatch_and_notify(envelope),
+        }
+    }
+    /// Dispatches once and, if the coordinator state advanced, wakes parked
+    /// long-polls so a newly-runnable task or newly-available object is observed
+    /// without waiting for the fallback re-check slice.
+    fn dispatch_and_notify(&self, envelope: &Envelope) -> Result<RpcReply, Error> {
+        let before = self.state.lock().revision;
+        let reply = self.dispatch_once(envelope)?;
+        if self.state.lock().revision != before {
+            self.wakeup.notify_waiters();
+        }
+        Ok(reply)
+    }
+    async fn long_poll(
+        &self,
+        envelope: &Envelope,
+        wait_ms: u64,
+        ready: fn(&RpcReply) -> bool,
+    ) -> Result<RpcReply, Error> {
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(MAX_LONG_POLL_MS));
+        loop {
+            // Register for wakeup BEFORE dispatching: Notify permits are one-shot
+            // and not stored, so enabling first guarantees a state change between
+            // our dispatch and our await cannot be lost.
+            let notified = self.wakeup.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let reply = self.dispatch_and_notify(envelope)?;
+            if ready(&reply) {
+                return Ok(reply);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(reply);
+            }
+            let slice = remaining.min(Duration::from_millis(LONG_POLL_SLICE_MS));
+            let _ = tokio::time::timeout(slice, notified).await;
+        }
     }
     fn dispatch_once(&self, envelope: &Envelope) -> Result<RpcReply, Error> {
         if is_mutation(&envelope.body) {
@@ -187,7 +255,7 @@ impl CoordinatorServer {
                         Err(error) => WorkerReply::Error(error),
                     }
                 }
-                WorkerRequest::Poll(identity) => {
+                WorkerRequest::Poll { identity, .. } => {
                     let mut state = self.state.lock();
                     let mut deletes = state.take_pending_deletes(identity.node_id);
                     if let Some(id) = deletes.first().copied() {
@@ -286,19 +354,22 @@ impl CoordinatorServer {
                     }),
                     None => ClientReply::Error(Error::TaskNotFound(id)),
                 },
-                ClientRequest::Get(id) => match self.state.lock().objects.get(&id) {
-                    Some(object) if object.state == crate::coordinator::ObjectState::Available => {
-                        ClientReply::Object {
-                            id,
-                            codec: object.codec.clone().unwrap(),
-                            size_bytes: object.size_bytes.unwrap(),
-                            checksum: object.checksum.unwrap(),
-                            location: object.location.clone().unwrap(),
-                            bytes: object.bytes.clone(),
-                        }
-                    }
-                    Some(object) if object.state == crate::coordinator::ObjectState::Lost => {
+                ClientRequest::Get { object: id, .. } => match self.state.lock().objects.get(&id) {
+                    Some(object) if object.state == ObjectState::Available => ClientReply::Object {
+                        id,
+                        codec: object.codec.clone().unwrap(),
+                        size_bytes: object.size_bytes.unwrap(),
+                        checksum: object.checksum.unwrap(),
+                        location: object.location.clone().unwrap(),
+                        bytes: object.bytes.clone(),
+                    },
+                    Some(object) if object.state == ObjectState::Lost => {
                         ClientReply::Error(Error::ObjectLost(id))
+                    }
+                    // Reserved output of a still-running task: report pending so a
+                    // blocking Get parks instead of erroring.
+                    Some(object) if object.state == ObjectState::Reserved => {
+                        ClientReply::Error(Error::ObjectPending(id))
                     }
                     _ => ClientReply::Error(Error::Protocol("object unavailable".into())),
                 },
@@ -353,10 +424,26 @@ fn is_mutation(request: &RpcRequest) -> bool {
                 | ClientRequest::Cancel(_)
                 | ClientRequest::Release(_)
         ),
-        RpcRequest::Worker(worker) => {
-            !matches!(worker, WorkerRequest::Register(_) | WorkerRequest::Poll(_))
-        }
+        RpcRequest::Worker(worker) => !matches!(
+            worker,
+            WorkerRequest::Register(_) | WorkerRequest::Poll { .. }
+        ),
     }
+}
+
+/// A worker `Poll` is satisfied by anything other than "no work yet": an
+/// assignment, a cancellation, an object deletion, or an error worth returning.
+fn worker_poll_ready(reply: &RpcReply) -> bool {
+    !matches!(reply, RpcReply::Worker(WorkerReply::Assignment(None)))
+}
+
+/// A blocking `Get` is satisfied once the object resolves either way; only a
+/// still-reserved (pending) output keeps it parked.
+fn client_get_ready(reply: &RpcReply) -> bool {
+    !matches!(
+        reply,
+        RpcReply::Client(ClientReply::Error(Error::ObjectPending(_)))
+    )
 }
 
 /// Only client mutations are cached. Worker reports are idempotent at the
@@ -393,6 +480,7 @@ pub async fn request(address: &str, envelope: &Envelope) -> Result<RpcReply, Err
         }
         let attempt = tokio::time::timeout(Duration::from_millis(remaining_ms), async {
             let mut stream = TcpStream::connect(address).await?;
+            let _ = stream.set_nodelay(true);
             write_frame(&mut stream, envelope).await?;
             read_frame(&mut stream)
                 .await?
