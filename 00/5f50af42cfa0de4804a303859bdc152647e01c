@@ -1,0 +1,21 @@
+docker-compose.yml
+  s_549c9bc8bea5f9::t_c8221b059418d7 25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "005f50af42cfa0de4804a303859bdc152647e01c",
+  "prompts": {},
+  "sessions": {
+    "s_549c9bc8bea5f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6970588b-ad57-4997-95fe-11a138746c2e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
