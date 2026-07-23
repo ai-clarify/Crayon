@@ -1,0 +1,21 @@
+Cargo.toml
+  s_41c334c91b145e::t_f831714215fbbe 37-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fbb3c0ce438a4bdc4a11e053bdbcecbb65250478",
+  "prompts": {},
+  "sessions": {
+    "s_41c334c91b145e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5b548f5-e223-437a-a200-0fc66030f3de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
