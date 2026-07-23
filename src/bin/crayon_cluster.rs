@@ -8,8 +8,8 @@ use crayon::{
     ids::{ClusterId, NodeId, ObjectId, TaskId, WorkerEpoch},
     operation::{Codec, OperationDescriptor, OperationKey, TaskArg},
     protocol::{
-        ClientReply, ClientRequest, Envelope, RegisterWorker, RpcReply, RpcRequest, TaskAssignment,
-        TaskCompletion, WorkerIdentity, WorkerReply, WorkerRequest,
+        ClientReply, ClientRequest, Envelope, ObjectPayload, RegisterWorker, RpcReply, RpcRequest,
+        TaskAssignment, TaskCompletion, WorkerIdentity, WorkerReply, WorkerRequest,
     },
     resources::ResourceSet,
     worker::OperationRegistry,
@@ -562,14 +562,16 @@ async fn serve_objects(advertise: &str, objects: LocalObjectStore) -> Result<(),
                         match envelope.body {
                             RpcRequest::Client(ClientRequest::GetLocal(id)) => {
                                 match objects.get(id) {
-                                    Ok(object) => RpcReply::Client(ClientReply::Object {
-                                        id,
-                                        codec: object.codec,
-                                        size_bytes: object.bytes.len() as u64,
-                                        checksum: object.checksum,
-                                        location: String::new(),
-                                        bytes: Some(object.bytes),
-                                    }),
+                                    Ok(object) => {
+                                        RpcReply::Client(ClientReply::Object(ObjectPayload {
+                                            id,
+                                            codec: object.codec,
+                                            size_bytes: object.bytes.len() as u64,
+                                            checksum: object.checksum,
+                                            location: String::new(),
+                                            bytes: Some(object.bytes),
+                                        }))
+                                    }
                                     Err(error) => RpcReply::Client(ClientReply::Error(error)),
                                 }
                             }

@@ -16,9 +16,9 @@ use crate::{
     error::Error,
     ids::{ClusterId, CoordinatorEpoch, RequestId},
     protocol::{
-        ClientReply, ClientRequest, Envelope, RegisteredWorker, RpcReply, RpcRequest, TaskView,
-        WorkerReply, WorkerRequest, WorkerView, DEFAULT_RPC_TIMEOUT_MS, MAX_FRAME_BYTES,
-        MAX_OBJECT_BYTES,
+        ClientReply, ClientRequest, Envelope, ObjectPayload, RegisteredWorker, RpcReply,
+        RpcRequest, TaskView, WorkerReply, WorkerRequest, WorkerView, DEFAULT_RPC_TIMEOUT_MS,
+        MAX_FRAME_BYTES, MAX_OBJECT_BYTES,
     },
 };
 
@@ -26,6 +26,9 @@ const MAX_CONNECTIONS: usize = 256;
 const RETRY_DELAY: Duration = Duration::from_millis(25);
 const MAX_REPLAY_ENTRIES: usize = 16_384;
 const MAX_REPLAY_BYTES: usize = 64 * 1024 * 1024;
+/// Per-entry bookkeeping overhead (request-id key + expiry + hash) charged on
+/// top of the serialized reply size when accounting the replay byte budget.
+const REPLAY_ENTRY_OVERHEAD: usize = 40;
 /// Ceiling on how long the coordinator parks a long-poll, kept under the RPC
 /// transport deadline so a held request always answers before the client retries.
 const MAX_LONG_POLL_MS: u64 = 4_000;
@@ -194,8 +197,13 @@ impl CoordinatorServer {
         let reply = self.dispatch(envelope.body.clone());
         let entry_bytes = estimate_reply_bytes(&reply);
         // Sum of stored sizes: one pass, no re-serialization.
-        let used: usize = replay.values().map(|entry| entry.bytes + 40).sum();
-        if replay.len() >= MAX_REPLAY_ENTRIES || used + entry_bytes + 40 > MAX_REPLAY_BYTES {
+        let used: usize = replay
+            .values()
+            .map(|entry| entry.bytes + REPLAY_ENTRY_OVERHEAD)
+            .sum();
+        if replay.len() >= MAX_REPLAY_ENTRIES
+            || used + entry_bytes + REPLAY_ENTRY_OVERHEAD > MAX_REPLAY_BYTES
+        {
             return Ok(request_error(
                 &envelope.body,
                 Error::CapacityExceeded("replay cache limit reached".into()),
@@ -327,14 +335,14 @@ impl CoordinatorServer {
                         match self.state.lock().put(codec.clone(), bytes.clone()) {
                             Ok(id) => {
                                 let checksum = checksum(&bytes);
-                                ClientReply::Object {
+                                ClientReply::Object(ObjectPayload {
                                     id,
                                     codec,
                                     size_bytes: bytes.len() as u64,
                                     checksum,
                                     location: "coordinator".into(),
                                     bytes: Some(bytes),
-                                }
+                                })
                             }
                             Err(error) => ClientReply::Error(error),
                         }
@@ -385,14 +393,7 @@ impl CoordinatorServer {
                 },
                 ClientRequest::Get { object: id, .. } => {
                     match self.state.lock().resolve_object(id) {
-                        Ok(payload) => ClientReply::Object {
-                            id: payload.id,
-                            codec: payload.codec,
-                            size_bytes: payload.size_bytes,
-                            checksum: payload.checksum,
-                            location: payload.location,
-                            bytes: payload.bytes,
-                        },
+                        Ok(payload) => ClientReply::Object(payload),
                         Err(error) => ClientReply::Error(error),
                     }
                 }

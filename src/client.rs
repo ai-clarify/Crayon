@@ -71,7 +71,7 @@ impl ClusterClient {
             })
             .await?
         {
-            ClientReply::Object { id, .. } => Ok(ObjectRef::new(id)),
+            ClientReply::Object(payload) => Ok(ObjectRef::new(payload.id)),
             ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected put reply".into())),
         }
@@ -148,11 +148,7 @@ impl ClusterClient {
     ) -> Result<Vec<Result<ObjectPayload, Error>>, Error> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::DeadlineExceeded);
-            }
-            let wait_ms = remaining.as_millis().min(u64::MAX as u128) as u64;
+            let wait_ms = remaining_wait_ms(deadline)?;
             match self
                 .rpc(ClientRequest::GetBatch {
                     objects: ids.to_vec(),
@@ -205,24 +201,7 @@ impl ClusterClient {
             })
             .await?
         {
-            ClientReply::Object {
-                id,
-                codec,
-                size_bytes,
-                checksum,
-                location,
-                bytes,
-            } => {
-                self.payload_bytes(ObjectPayload {
-                    id,
-                    codec,
-                    size_bytes,
-                    checksum,
-                    location,
-                    bytes,
-                })
-                .await
-            }
+            ClientReply::Object(payload) => self.payload_bytes(payload).await,
             ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected get reply".into())),
         }
@@ -253,14 +232,14 @@ impl ClusterClient {
         )
         .await?;
         match reply {
-            RpcReply::Client(ClientReply::Object {
+            RpcReply::Client(ClientReply::Object(ObjectPayload {
                 id: local_id,
                 codec: local_codec,
                 bytes: Some(bytes),
                 checksum: actual,
                 size_bytes: local_size,
                 ..
-            }) if local_codec == codec && actual == checksum && local_size == size_bytes => {
+            })) if local_codec == codec && actual == checksum && local_size == size_bytes => {
                 verify_object(id, local_id, &bytes, checksum, size_bytes)?;
                 Ok((codec, bytes))
             }
@@ -315,6 +294,17 @@ impl ClusterClient {
     }
 }
 
+/// Milliseconds left until `deadline` for a blocking long-poll RPC, floored at 1
+/// while any time remains so a sub-millisecond remainder still parks server-side
+/// instead of busy-spinning. `Err(DeadlineExceeded)` once the deadline passes.
+fn remaining_wait_ms(deadline: tokio::time::Instant) -> Result<u64, Error> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(Error::DeadlineExceeded);
+    }
+    Ok((remaining.as_millis().min(u64::MAX as u128) as u64).max(1))
+}
+
 fn decode<T: DeserializeOwned>(codec: Codec, bytes: Vec<u8>) -> Result<T, Error> {
     match codec {
         Codec::BincodeV1 => Ok(bincode::deserialize(&bytes)?),
@@ -364,11 +354,7 @@ impl<T: DeserializeOwned> TaskHandle<T> {
     pub async fn result(&self, timeout: Duration) -> Result<T, Error> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::DeadlineExceeded);
-            }
-            let wait_ms = remaining.as_millis().min(u64::MAX as u128) as u64;
+            let wait_ms = remaining_wait_ms(deadline)?;
             match self.client.fetch_object(self.output.id, wait_ms).await {
                 Ok((codec, bytes)) => return decode(codec, bytes),
                 // Held the full slice and the output is still reserved: re-issue

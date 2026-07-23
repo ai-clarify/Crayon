@@ -235,14 +235,7 @@ pub enum ClientReply {
     Connected {
         coordinator_epoch: CoordinatorEpoch,
     },
-    Object {
-        id: ObjectId,
-        codec: Codec,
-        size_bytes: u64,
-        checksum: [u8; 32],
-        location: String,
-        bytes: Option<Vec<u8>>,
-    },
+    Object(ObjectPayload),
     Submitted {
         task_id: TaskId,
         output_id: ObjectId,
