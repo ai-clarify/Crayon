@@ -76,9 +76,11 @@ def main():
         return p
 
     spawn([a.binary, "coordinator", coord, "5000"], "coordinator")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     actor_env = {
         "CRAYON_LLM_SIDECAR": os.path.abspath(a.sidecar),
         "CRAYON_LLM_MODEL": a.model,
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     }
     for i in range(a.actors):
         spawn(

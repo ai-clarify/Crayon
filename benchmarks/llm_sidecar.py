@@ -82,34 +82,41 @@ class Sidecar:
             ]
         }
 
-    def learn(self, items, out):
-        # REINFORCE with a mean-reward baseline over the batch.
+    def learn(self, items, out, micro=8):
+        # REINFORCE with a mean-reward baseline, backprop in micro-batches so
+        # the V100 (shared with the actor sidecars) never holds the full-batch
+        # activations + vocab logits at once.
         rewards = torch.tensor([i["reward"] for i in items], device="cuda")
         advantage = rewards - rewards.mean()
-        texts = [i["prompt"] + i["completion"] for i in items]
-        prompt_lens = [
-            len(self.tok(i["prompt"])["input_ids"]) for i in items
-        ]
-        enc = self.tok(texts, return_tensors="pt", padding=True).to("cuda")
-        logits = self.model(**enc).logits[:, :-1]
-        targets = enc.input_ids[:, 1:]
-        logprobs = torch.log_softmax(logits.float(), dim=-1)
-        token_lp = logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        # Score only completion tokens (padding is on the left, so the
-        # completion is the tail); normalize by length to keep scale stable.
-        seq_lp = []
-        for row, (ids, plen) in enumerate(zip(enc.input_ids, prompt_lens)):
-            pad = int((ids == self.tok.pad_token_id).sum())
-            start = pad + plen - 1
-            lp = token_lp[row, start:]
-            seq_lp.append(lp.sum() / max(len(lp), 1))
-        loss = -(advantage * torch.stack(seq_lp)).mean()
         self.optimizer.zero_grad()
-        loss.backward()
+        total_loss = 0.0
+        for start in range(0, len(items), micro):
+            chunk = items[start : start + micro]
+            adv = advantage[start : start + micro]
+            texts = [i["prompt"] + i["completion"] for i in chunk]
+            prompt_lens = [len(self.tok(i["prompt"])["input_ids"]) for i in chunk]
+            enc = self.tok(texts, return_tensors="pt", padding=True).to("cuda")
+            logits = self.model(**enc).logits[:, :-1]
+            targets = enc.input_ids[:, 1:]
+            token_lp = torch.log_softmax(logits.float(), dim=-1).gather(
+                -1, targets.unsqueeze(-1)
+            ).squeeze(-1)
+            # Score only completion tokens (padding is on the left, so the
+            # completion is the tail); normalize by length to keep scale stable.
+            seq_lp = []
+            for row, (ids, plen) in enumerate(zip(enc.input_ids, prompt_lens)):
+                pad = int((ids == self.tok.pad_token_id).sum())
+                lp = token_lp[row, pad + plen - 1 :]
+                seq_lp.append(lp.sum() / max(len(lp), 1))
+            loss = -(adv * torch.stack(seq_lp)).sum() / len(items)
+            loss.backward()
+            total_loss += float(loss.item())
+            del enc, logits, targets, token_lp, seq_lp, loss
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
+        torch.cuda.empty_cache()
         self.save(out)
-        return {"loss": float(loss.item()), "saved": out}
+        return {"loss": total_loss, "saved": out}
 
 
 def main():
