@@ -265,11 +265,11 @@ impl CoordinatorState {
     /// arena offset instead of inline bytes. Mirrors `put`'s dedup and caps.
     pub fn put_meta(
         &mut self,
+        id: ObjectId,
         codec: Codec,
         size_bytes: u64,
         checksum: [u8; 32],
     ) -> Result<ObjectId, Error> {
-        let id = ObjectId::from_checksum(checksum);
         if let Some(existing) = self.objects.get(&id) {
             if existing.state != ObjectState::Available
                 || existing.codec.as_ref() != Some(&codec)

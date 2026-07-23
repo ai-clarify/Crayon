@@ -507,13 +507,14 @@ impl CoordinatorServer {
                     }
                 }
                 ClientRequest::ArenaReserve {
+                    id,
                     codec,
                     size_bytes,
                     checksum,
                 } => {
-                    let id = crate::ids::ObjectId::from_checksum(checksum);
                     // Content addressing: same checksum => same object, so a
                     // repeat reserve of stored content resolves as a plain get.
+                    // (Unhashed large puts use random ids and never dedup.)
                     if let Ok(mut payload) = self.state.lock().resolve_object(id) {
                         if let Some(meta) = self.arena.meta(id) {
                             payload.bytes = None;
@@ -537,6 +538,7 @@ impl CoordinatorServer {
                     match self.arena.meta(id) {
                         Some(meta) => {
                             match self.state.lock().put_meta(
+                                id,
                                 meta.codec.clone(),
                                 meta.size,
                                 meta.checksum,

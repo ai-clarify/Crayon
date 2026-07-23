@@ -112,9 +112,20 @@ impl ClusterClient {
     /// at the granted offset, then commit. The payload never crosses a socket,
     /// so object size is bounded by the arena, not the RPC frame — gigabytes work.
     async fn put_arena(&self, codec: Codec, bytes: &[u8]) -> Result<ObjectId, Error> {
-        let checksum = checksum(bytes);
+        // Below 1MB the hash is cheap and buys content-addressed dedup; past it
+        // the pass costs real time (a full memory sweep), so large objects take
+        // a random id and an all-zero "unhashed" checksum. Same-host reads are
+        // straight out of shared memory either way — the payload never crosses
+        // a lossy boundary. ponytail: no dedup for >=1MB puts; hash if it matters.
+        let (id, checksum) = if bytes.len() < 1 << 20 {
+            let checksum = checksum(bytes);
+            (ObjectId::from_checksum(checksum), checksum)
+        } else {
+            (ObjectId::new(), [0u8; 32])
+        };
         let reply = self
             .rpc(ClientRequest::ArenaReserve {
+                id,
                 codec,
                 size_bytes: bytes.len() as u64,
                 checksum,
@@ -427,7 +438,11 @@ fn verify_object(
     expected: [u8; 32],
     size: u64,
 ) -> Result<(), Error> {
-    if requested != returned || bytes.len() as u64 != size || checksum(bytes) != expected {
+    if requested != returned || bytes.len() as u64 != size {
+        return Err(Error::ObjectConflict(requested));
+    }
+    // All-zero means the object was stored unhashed; size is the only check.
+    if expected != [0u8; 32] && checksum(bytes) != expected {
         return Err(Error::ObjectConflict(requested));
     }
     Ok(())

@@ -174,8 +174,11 @@ pub enum ClientRequest {
     GetLocal(ObjectId),
     /// Reserve an arena slot for a client-side shared-memory put. The client
     /// then writes its bytes at the returned offset and sends `ArenaCommit`.
-    /// Bypasses the RPC frame cap, so objects scale to gigabytes.
+    /// Bypasses the RPC frame cap, so objects scale to gigabytes. An all-zero
+    /// checksum means the payload is unhashed (large objects skip the pass;
+    /// the id is then random, not content-derived).
     ArenaReserve {
+        id: ObjectId,
         codec: Codec,
         size_bytes: u64,
         checksum: [u8; 32],
