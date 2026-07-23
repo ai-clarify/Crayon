@@ -1,13 +1,13 @@
 //! Storage-path benchmark: measures the object store's put/get latency,
 //! throughput, and read (memcpy) amplification. Two independent measurements:
 //!
-//!   * e2e   — a real coordinator process; client does put(payload)+get(id) over
-//!             TCP, the same boundary `ray.put`/`ray.get` cross. Reports p50/p99
-//!             latency and MB/s per payload size.
-//!   * amp   — in-process `LocalObjectStore`: store one object, GET it N times
-//!             under a counting allocator. Bytes allocated / logical bytes read
-//!             is the read amplification. Content-addressed immutability makes
-//!             this ~0 once payloads are `Arc<[u8]>` (a GET is a refcount bump).
+//! - `e2e` — a real coordinator process; client does put(payload)+get(id) over
+//!   TCP, the same boundary `ray.put`/`ray.get` cross. Reports p50/p99 latency
+//!   and MB/s per payload size.
+//! - `amp` — in-process `LocalObjectStore`: store one object, GET it N times
+//!   under a counting allocator. Bytes allocated / logical bytes read is the
+//!   read amplification. Content-addressed immutability makes this ~0 once
+//!   payloads are `Arc<[u8]>` (a GET is a refcount bump).
 //!
 //! Run both, emit one JSON summary. Compare across git revisions for before/after.
 

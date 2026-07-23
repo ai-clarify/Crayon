@@ -263,6 +263,7 @@ pub fn copy_wide(dst: &mut [u8], src: &[u8]) {
 
 /// `src.to_vec()` with the copy parallelized (and the redundant zero-fill of a
 /// `vec![0; n]` skipped) — the read half of the same bandwidth problem.
+#[allow(clippy::uninit_vec)] // copy_wide fully overwrites out before any read; u8 has no invalid bit pattern
 pub fn to_vec_wide(src: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(src.len());
     // SAFETY: `copy_wide` overwrites every byte before the Vec is used; u8 has
