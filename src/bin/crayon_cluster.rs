@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .transpose()?
                 .unwrap_or(5_000);
             CoordinatorServer::new(CLUSTER_ID, lease_ms)
+                .allow_remote_bind()
                 .serve(args.get(2).unwrap_or_else(|| usage()))
                 .await?
         }
