@@ -18,10 +18,11 @@ impl fmt::Display for TaskStatus {
 }
 
 pub const MAGIC: [u8; 4] = *b"CRYN";
-// Bumped to 3 in 0.4.0: `WorkerRequest::Failed` swapped its `retryable: bool`
-// for a `FailureClass` enum, a wire-incompatible change. Deploy all components
-// (coordinator, workers, clients) at the same major.
-pub const PROTOCOL_MAJOR: u16 = 3;
+// Bumped to 4 in 0.5.0: the shared-memory arena added `ArenaReserve`/`ArenaCommit`
+// (and connection pooling changed the transport), shifting request variant indices
+// — wire-incompatible with 3. Deploy all components at the same major.
+// (3 in 0.4.0: `Failed` swapped `retryable: bool` for a `FailureClass` enum.)
+pub const PROTOCOL_MAJOR: u16 = 4;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OBJECT_BYTES: usize = MAX_FRAME_BYTES - 64 * 1024;

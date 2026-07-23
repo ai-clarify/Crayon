@@ -65,9 +65,7 @@ class RolloutActor:
             out = self.model.generate(
                 **enc,
                 max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=1.0,
-                top_p=0.95,
+                do_sample=False,
                 pad_token_id=self.tok.pad_token_id,
             )
         return self.tok.batch_decode(
@@ -88,7 +86,7 @@ def main():
     ap.add_argument("--wave", type=int, default=20)
     ap.add_argument("--split", default="test")
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--max-new-tokens", type=int, default=256)
+    ap.add_argument("--max-new-tokens", type=int, default=640)
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", default="/tmp/ray_gsm8k.json")
     ap.add_argument("--workdir", default="/tmp/ray-gsm8k")

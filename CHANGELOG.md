@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.5.0
+
+Data-plane and RL-pipeline release: a shared-memory object arena lifts the object
+size cap and makes same-host transfer zero-copy, a Python client lands, and a
+real-LLM RL pipeline ships end to end. Wire protocol major 3 → 4 (arena request
+variants + connection pooling shift request encodings); deploy all components at
+the same major.
+
+### Features
+
+- **Shared-memory object arena.** A plasma-style host-local mmap arena: a client
+  reserves a slot, writes its bytes straight into the mapping, and commits, so a
+  same-host `put`/`get` never crosses the 8 MiB RPC frame cap — objects scale to
+  gigabytes. Readers map the arena once and read any object as a slice; cross-host
+  peers that cannot map it fall back to the frame-bounded network path. Large
+  transfers use parallel BLAKE3 and parallel memcpy, and content hashing is
+  skipped for large same-host puts.
+- **Python client (`crayon` on PyPI).** pyo3 bindings over `ClusterClient`.
+- **Real-LLM RL pipeline.** An `llm-actor` rollout op backed by a resident Python
+  LLM sidecar (policy weights synced from the arena once per version, not per
+  task), a Rust `llm-judge`, a Python driver, and a micro-batched REINFORCE
+  learner that fits on a shared V100.
+- **Connection pooling.** The coordinator serves multiple frames per TCP
+  connection and clients pool connections, cutting per-RPC connect cost.
+
+### Reliability
+
+- Orphaned `/dev/shm` arenas left by a SIGKILLed coordinator are reaped on the
+  next coordinator start (pid-tagged tokens; only ever removes a dead-process
+  file), so the arena backing does not leak across restarts.
+
+### Misc
+
+- Ray multi-actor multi-role RL e2e baseline and an `rl-benchmark` bin for
+  apples-to-apples comparison; agent contract (`AGENTS.md`).
+
 ## 0.4.0
 
 Reliability and scheduling release: hardens the control plane against the

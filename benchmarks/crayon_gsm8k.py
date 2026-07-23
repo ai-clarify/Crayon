@@ -55,7 +55,7 @@ def main():
     ap.add_argument("--wave", type=int, default=20, help="tasks per progress wave")
     ap.add_argument("--split", default="test")
     ap.add_argument("--limit", type=int, default=0, help="0 = full split")
-    ap.add_argument("--max-new-tokens", type=int, default=256)
+    ap.add_argument("--max-new-tokens", type=int, default=640)
     ap.add_argument("--model", required=True)
     ap.add_argument("--binary", default="target/release/crayon-cluster")
     ap.add_argument("--sidecar", default="benchmarks/llm_sidecar.py")
@@ -112,6 +112,7 @@ def main():
                     "version": 0,
                     "seeds": [base + j for j in range(len(chunk))],
                     "max_new_tokens": a.max_new_tokens,
+                    "temperature": 0.0,
                     "prompts": [prompt_of(c["question"]) for c in chunk],
                 }
                 specs.append([json.dumps(cfg).encode()])

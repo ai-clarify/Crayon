@@ -18,7 +18,7 @@ immutable object data plane.
 ## Install
 
 ```bash
-cargo install crayon-rs --version 0.4.0
+cargo install crayon-rs --version 0.5.0
 ```
 
 The package name is `crayon-rs`, the library import name is `crayon`, and the

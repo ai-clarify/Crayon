@@ -159,11 +159,18 @@ struct LlmRolloutCfg {
     weights: String,
     seeds: Vec<u64>,
     max_new_tokens: u32,
+    /// Sampling temperature; 0 means greedy decoding (evaluation).
+    #[serde(default = "default_temperature")]
+    temperature: f32,
     /// Explicit prompts (e.g. GSM8K questions), one per seed. Empty means the
     /// synthetic arithmetic prompts derived from the seeds.
     #[serde(default)]
     prompts: Vec<String>,
 }
+fn default_temperature() -> f32 {
+    1.0
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LlmRollout {
     seed: u64,
@@ -248,10 +255,11 @@ impl LlmSidecar {
         seeds: &[u64],
         prompts: &[String],
         max_new_tokens: u32,
+        temperature: f32,
     ) -> Result<Vec<String>, Error> {
         let reply = self.call(&serde_json::json!({
             "cmd": "rollout", "seeds": seeds, "prompts": prompts,
-            "max_new_tokens": max_new_tokens,
+            "max_new_tokens": max_new_tokens, "temperature": temperature,
         }))?;
         reply["rollouts"]
             .as_array()
@@ -355,7 +363,7 @@ async fn run_worker(
                         sidecar.load(cfg.version, &weights)?;
                     }
                     let completions =
-                        sidecar.rollout(&cfg.seeds, &cfg.prompts, cfg.max_new_tokens)?;
+                        sidecar.rollout(&cfg.seeds, &cfg.prompts, cfg.max_new_tokens, cfg.temperature)?;
                     let rollouts: Vec<LlmRollout> = cfg
                         .seeds
                         .iter()
