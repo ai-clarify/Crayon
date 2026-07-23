@@ -85,6 +85,14 @@ fn builtin_descriptor(name: &str) -> OperationDescriptor {
     }
 }
 
+fn bind_addr_for_advertise(advertise: &str) -> String {
+    if let Some(port) = advertise.rsplit(':').next() {
+        format!("0.0.0.0:{port}")
+    } else {
+        advertise.to_string()
+    }
+}
+
 async fn run_worker(
     coordinator: &str,
     advertise: &str,
@@ -93,7 +101,8 @@ async fn run_worker(
     operations: &str,
 ) -> Result<(), Error> {
     let objects = LocalObjectStore::default();
-    serve_objects(advertise, objects.clone()).await?;
+    let bind_addr = bind_addr_for_advertise(advertise);
+    serve_objects(&bind_addr, objects.clone()).await?;
     let mut registry = OperationRegistry::default();
     if matches!(operations, "all" | "add") {
         registry.register(builtin_descriptor("add"), |args| async move {
