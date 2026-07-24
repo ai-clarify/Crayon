@@ -56,16 +56,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // --- e2e latency / throughput against a real coordinator process ---
-    let binary = std::env::current_exe()?
-        .parent()
-        .unwrap()
-        .join("crayon-cluster");
-    let coordinator_addr = free_addr().await?;
-    let coordinator = spawn(
-        &binary,
-        &["coordinator", &coordinator_addr, "5000"],
-        &args.artifact_dir,
-    )?;
+    // With --coordinator <addr>, benchmark an EXTERNAL coordinator (e.g. on
+    // another host, exercising the real cross-host TCP path). Otherwise spawn a
+    // local one, as before.
+    let external = args.coordinator.clone();
+    let (coordinator_addr, coordinator) = match &external {
+        Some(addr) => (addr.clone(), None),
+        None => {
+            let binary = std::env::current_exe()?.parent().unwrap().join("crayon-cluster");
+            let addr = free_addr().await?;
+            let child = spawn(&binary, &["coordinator", &addr, "5000"], &args.artifact_dir)?;
+            (addr, Some(child))
+        }
+    };
     let mut client = ClusterClient::connect(&coordinator_addr);
     wait_coordinator(&mut client).await?;
     client.connect_epoch().await?;
@@ -81,18 +84,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     report.push_str("  ],\n");
-    kill(coordinator);
+    if let Some(child) = coordinator {
+        kill(child);
+    }
 
-    // --- in-process read amplification ---
+    // --- in-process read amplification (local store; skip for external coord) ---
     report.push_str("  \"read_amplification\": [\n");
-    for (i, &size) in args.sizes.iter().enumerate() {
-        let row = measure_read_amp(size, args.samples);
-        report.push_str(&format!("    {row}"));
-        report.push_str(if i + 1 < args.sizes.len() {
-            ",\n"
-        } else {
-            "\n"
-        });
+    if external.is_none() {
+        for (i, &size) in args.sizes.iter().enumerate() {
+            let row = measure_read_amp(size, args.samples);
+            report.push_str(&format!("    {row}"));
+            report.push_str(if i + 1 < args.sizes.len() {
+                ",\n"
+            } else {
+                "\n"
+            });
+        }
     }
     report.push_str("  ]\n}\n");
 
@@ -222,6 +229,8 @@ struct Args {
     warmups: usize,
     sizes: Vec<usize>,
     artifact_dir: PathBuf,
+    /// External coordinator address; if set, benchmark it instead of a local spawn.
+    coordinator: Option<String>,
 }
 fn parse_args() -> Args {
     let mut m = std::collections::HashMap::new();
@@ -249,6 +258,7 @@ fn parse_args() -> Args {
             .get("--artifact-dir")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("benchmark_artifacts/storage")),
+        coordinator: m.get("--coordinator").cloned(),
     }
 }
 async fn free_addr() -> Result<String, Error> {
