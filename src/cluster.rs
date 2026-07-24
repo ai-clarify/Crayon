@@ -45,6 +45,42 @@ struct ReplayEntry {
     bytes: usize,
 }
 
+/// Idempotency cache with an O(1) hot path: a running byte total replaces the
+/// per-call `values().sum()`, and expiry is lazy — the touched entry is checked
+/// on read, the full sweep runs only under capacity pressure.
+#[derive(Default)]
+struct ReplayCache {
+    entries: HashMap<RequestId, ReplayEntry>,
+    used_bytes: usize,
+}
+impl ReplayCache {
+    fn remove(&mut self, id: &RequestId) {
+        if let Some(entry) = self.entries.remove(id) {
+            self.used_bytes -= entry.bytes + REPLAY_ENTRY_OVERHEAD;
+        }
+    }
+    fn insert(&mut self, id: RequestId, entry: ReplayEntry) {
+        self.used_bytes += entry.bytes + REPLAY_ENTRY_OVERHEAD;
+        self.entries.insert(id, entry);
+    }
+    fn at_capacity(&self) -> bool {
+        self.entries.len() >= MAX_REPLAY_ENTRIES || self.used_bytes >= MAX_REPLAY_BYTES
+    }
+    /// Drop expired entries; called only when `at_capacity`, so the O(n) scan is
+    /// amortized away from the common dispatch path.
+    fn sweep(&mut self, now: u64) {
+        let mut freed = 0;
+        self.entries.retain(|_, entry| {
+            let keep = entry.expires_at_ms > now;
+            if !keep {
+                freed += entry.bytes + REPLAY_ENTRY_OVERHEAD;
+            }
+            keep
+        });
+        self.used_bytes -= freed;
+    }
+}
+
 #[derive(Clone)]
 pub struct CoordinatorServer {
     pub cluster_id: ClusterId,
@@ -53,7 +89,7 @@ pub struct CoordinatorServer {
     epoch: CoordinatorEpoch,
     lease_ms: u64,
     connections: Arc<Semaphore>,
-    replay: Arc<Mutex<HashMap<RequestId, ReplayEntry>>>,
+    replay: Arc<Mutex<ReplayCache>>,
     /// Fires on every state change so parked long-polls (worker `Poll`, client
     /// blocking `Get`) wake immediately instead of spinning on a timer.
     wakeup: Arc<Notify>,
@@ -73,7 +109,7 @@ impl CoordinatorServer {
             epoch,
             lease_ms,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
-            replay: Arc::new(Mutex::new(HashMap::new())),
+            replay: Arc::new(Mutex::new(ReplayCache::default())),
             wakeup: Arc::new(Notify::new()),
             require_loopback: true,
             arena: Arc::new(
@@ -236,26 +272,31 @@ impl CoordinatorServer {
         let now = now_ms();
         let body_hash = checksum(&bincode::serialize(&envelope.body)?);
         let mut replay = self.replay.lock();
-        replay.retain(|_, entry| entry.expires_at_ms > now);
-        if let Some(entry) = replay.get(&envelope.request_id) {
-            if entry.body_hash != body_hash {
+        // Lazy expiry: check only the entry we touch. A stale hit is dropped so
+        // the request re-dispatches; the full sweep is deferred to capacity pressure.
+        if let Some(entry) = replay.entries.get(&envelope.request_id) {
+            let (expires_at_ms, entry_hash, reply) =
+                (entry.expires_at_ms, entry.body_hash, entry.reply.clone());
+            if expires_at_ms <= now {
+                replay.remove(&envelope.request_id);
+            } else if entry_hash != body_hash {
                 return Ok(request_error(
                     &envelope.body,
                     Error::Protocol("request id reused with different body".into()),
                 ));
+            } else {
+                return Ok(reply);
             }
-            return Ok(entry.reply.clone());
         }
         // Capacity check BEFORE dispatch so every dispatched mutation is cached.
         // Reversing this order would commit the side effect but skip the insert on
         // saturation, turning the client's retry into a duplicate task. Returning
         // here has no side effect; the retry can re-dispatch cleanly.
-        // Sum of stored sizes: one pass, no re-serialization.
-        let used: usize = replay
-            .values()
-            .map(|entry| entry.bytes + REPLAY_ENTRY_OVERHEAD)
-            .sum();
-        if replay.len() >= MAX_REPLAY_ENTRIES || used >= MAX_REPLAY_BYTES {
+        if replay.at_capacity() {
+            // Only now pay the O(n) expiry sweep — reclaim before rejecting.
+            replay.sweep(now);
+        }
+        if replay.at_capacity() {
             return Ok(request_error(
                 &envelope.body,
                 Error::CapacityExceeded("replay cache limit reached".into()),
@@ -1109,7 +1150,7 @@ mod tests {
         );
         let first = server.dispatch_once(&request).unwrap();
         // Dispatched => cached: the entry is present before any retry.
-        assert!(server.replay.lock().contains_key(&request.request_id));
+        assert!(server.replay.lock().entries.contains_key(&request.request_id));
         let second = server.dispatch_once(&request).unwrap();
         let task_id = |reply| match reply {
             RpcReply::Client(ClientReply::Submitted { task_id, .. }) => task_id,
@@ -1141,9 +1182,38 @@ mod tests {
         request.deadline_unix_ms = now_ms().saturating_add(ten_years_ms);
         server.dispatch_once(&request).unwrap();
         let replay = server.replay.lock();
-        let entry = replay.get(&request.request_id).expect("mutation cached");
+        let entry = replay.entries.get(&request.request_id).expect("mutation cached");
         // Capped at now + MAX_REPLAY_TTL_MS (+ slack for clock movement across
         // the two now_ms() reads), far below the 10-year envelope deadline.
         assert!(entry.expires_at_ms <= now_ms() + MAX_REPLAY_TTL_MS + 1_000);
+    }
+
+    // F4: the running byte counter stays exact across insert / remove / sweep,
+    // so the O(1) capacity check never drifts from the true stored size.
+    #[test]
+    fn replay_used_bytes_tracks_entries() {
+        let entry = |expires_at_ms| ReplayEntry {
+            body_hash: [0u8; 32],
+            reply: RpcReply::Client(ClientReply::Released),
+            expires_at_ms,
+            bytes: 100,
+        };
+        let step = 100 + REPLAY_ENTRY_OVERHEAD;
+        let mut cache = ReplayCache::default();
+        let ids: Vec<RequestId> = (0..3).map(|_| RequestId::new()).collect();
+
+        cache.insert(ids[0], entry(50)); // expires early
+        cache.insert(ids[1], entry(200));
+        cache.insert(ids[2], entry(200));
+        assert_eq!(cache.used_bytes, 3 * step);
+
+        cache.remove(&ids[1]);
+        assert_eq!(cache.used_bytes, 2 * step);
+        cache.remove(&ids[1]); // idempotent: no double-subtract
+        assert_eq!(cache.used_bytes, 2 * step);
+
+        cache.sweep(100); // drops ids[0] (expires 50), keeps ids[2]
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.used_bytes, step);
     }
 }
