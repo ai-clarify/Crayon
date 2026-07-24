@@ -144,6 +144,40 @@ impl Client {
             .collect()
     }
 
+    /// `ray.wait`: blocks until at least `min_ready` of `ids` resolve or
+    /// `timeout_ms` elapses, then returns `(index, bytes)` for every ready slot
+    /// (index into `ids`). Lets a driver drain finished rollouts and re-`wait` on
+    /// the stragglers instead of blocking on the slowest. Order follows `ids`.
+    #[pyo3(signature = (ids, min_ready, timeout_ms = 0))]
+    fn wait<'py>(
+        &self,
+        py: Python<'py>,
+        ids: Vec<String>,
+        min_ready: usize,
+        timeout_ms: u64,
+    ) -> PyResult<Vec<(usize, Bound<'py, PyBytes>)>> {
+        let ids = ids
+            .iter()
+            .map(|id| parse_object_id(id))
+            .collect::<PyResult<Vec<_>>>()?;
+        let results = py
+            .allow_threads(|| {
+                self.runtime.block_on(self.inner.wait_bytes_many(
+                    &ids,
+                    min_ready,
+                    Duration::from_millis(timeout_ms),
+                ))
+            })
+            .map_err(runtime_err)?;
+        Ok(results
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, result)| {
+                result.ok().map(|(_codec, bytes)| (index, PyBytes::new(py, &bytes)))
+            })
+            .collect())
+    }
+
     /// Submits one task; returns `(task_id, output_id)` hex strings.
     #[pyo3(signature = (namespace, name, version, args, cpu = 1.0, max_attempts = 3, codec = "json"))]
     #[allow(clippy::too_many_arguments)]

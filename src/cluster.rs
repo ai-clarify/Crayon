@@ -209,9 +209,14 @@ impl CoordinatorServer {
             RpcRequest::Client(ClientRequest::Get { wait_ms, .. }) if *wait_ms > 0 => {
                 self.long_poll(envelope, *wait_ms, client_get_ready).await
             }
-            RpcRequest::Client(ClientRequest::GetBatch { wait_ms, .. }) if *wait_ms > 0 => {
-                self.long_poll(envelope, *wait_ms, client_get_batch_ready)
-                    .await
+            RpcRequest::Client(ClientRequest::GetBatch {
+                wait_ms, min_ready, ..
+            }) if *wait_ms > 0 => {
+                let min_ready = *min_ready;
+                self.long_poll(envelope, *wait_ms, move |reply| {
+                    client_get_batch_ready(reply, min_ready)
+                })
+                .await
             }
             _ => self.dispatch_and_notify(envelope),
         }
@@ -229,7 +234,7 @@ impl CoordinatorServer {
         &self,
         envelope: &Envelope,
         wait_ms: u64,
-        ready: fn(&RpcReply) -> bool,
+        ready: impl Fn(&RpcReply) -> bool,
     ) -> Result<RpcReply, Error> {
         // Poll assigns work and must wake peers; blocking Get/GetBatch are reads
         // that never advance revision, so they skip the notify wrapper.
@@ -699,12 +704,18 @@ fn client_get_ready(reply: &RpcReply) -> bool {
     )
 }
 
-/// Ready once no batch element is still pending.
-fn client_get_batch_ready(reply: &RpcReply) -> bool {
+/// Ready once at least `min_ready` batch slots have resolved (i.e. are no longer
+/// pending). `min_ready == objects.len()` waits for all (`ray.get`); a smaller
+/// value returns as soon as K finish (`ray.wait`).
+fn client_get_batch_ready(reply: &RpcReply, min_ready: u32) -> bool {
     match reply {
-        RpcReply::Client(ClientReply::ObjectBatch(results)) => !results
-            .iter()
-            .any(|result| matches!(result, Err(Error::ObjectPending(_)))),
+        RpcReply::Client(ClientReply::ObjectBatch(results)) => {
+            let ready = results
+                .iter()
+                .filter(|result| !matches!(result, Err(Error::ObjectPending(_))))
+                .count();
+            ready >= min_ready as usize
+        }
         _ => true,
     }
 }
@@ -880,7 +891,7 @@ pub async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::{
-        ids::{NodeId, WorkerEpoch},
+        ids::{NodeId, ObjectId, WorkerEpoch},
         operation::{Codec, OperationDescriptor, OperationKey, TaskArg},
         protocol::{RegisterWorker, TaskStatus},
         resources::ResourceSet,
@@ -1105,6 +1116,7 @@ mod tests {
                 RpcRequest::Client(ClientRequest::GetBatch {
                     objects: vec![id; 6],
                     wait_ms: 0,
+                    min_ready: 6,
                 }),
             ))
             .unwrap();
@@ -1215,5 +1227,30 @@ mod tests {
         cache.sweep(100); // drops ids[0] (expires 50), keeps ids[2]
         assert_eq!(cache.entries.len(), 1);
         assert_eq!(cache.used_bytes, step);
+    }
+
+    // F5: first-K-ready (ray.wait) — the batch is ready once `min_ready` slots
+    // resolve, even while others are still pending; min_ready==len is ray.get.
+    #[test]
+    fn get_batch_ready_honors_min_ready() {
+        let pending = || Err(Error::ObjectPending(ObjectId::new()));
+        let done = || Err(Error::ObjectLost(ObjectId::new())); // any non-pending slot
+        let reply = |slots: Vec<Result<ObjectPayload, Error>>| {
+            RpcReply::Client(ClientReply::ObjectBatch(slots))
+        };
+
+        // 1 of 3 resolved.
+        let one_ready = reply(vec![done(), pending(), pending()]);
+        assert!(client_get_batch_ready(&one_ready, 1));
+        assert!(!client_get_batch_ready(&one_ready, 2));
+
+        // all pending: never ready unless min_ready is 0.
+        let none_ready = reply(vec![pending(), pending()]);
+        assert!(!client_get_batch_ready(&none_ready, 1));
+        assert!(client_get_batch_ready(&none_ready, 0));
+
+        // all resolved: ray.get case.
+        let all_ready = reply(vec![done(), done()]);
+        assert!(client_get_batch_ready(&all_ready, 2));
     }
 }

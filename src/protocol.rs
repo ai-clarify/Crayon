@@ -22,7 +22,7 @@ pub const MAGIC: [u8; 4] = *b"CRYN";
 // (and connection pooling changed the transport), shifting request variant indices
 // — wire-incompatible with 3. Deploy all components at the same major.
 // (3 in 0.4.0: `Failed` swapped `retryable: bool` for a `FailureClass` enum.)
-pub const PROTOCOL_MAJOR: u16 = 5;
+pub const PROTOCOL_MAJOR: u16 = 6;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OBJECT_BYTES: usize = MAX_FRAME_BYTES - 64 * 1024;
@@ -168,12 +168,15 @@ pub enum ClientRequest {
         object: ObjectId,
         wait_ms: u64,
     },
-    /// Fetch many objects in one RPC, blocking until every requested object has
-    /// resolved (available or terminal) or `wait_ms` elapses. Collapses N result
-    /// round-trips into one; mirrors `ray.get([refs])`.
+    /// Fetch many objects in one RPC. Blocks until at least `min_ready` of them
+    /// have resolved (available or terminal) or `wait_ms` elapses; still-pending
+    /// slots return `ObjectPending`. `min_ready == objects.len()` is the
+    /// all-or-nothing `ray.get([refs])`; a smaller value is the first-K-ready
+    /// `ray.wait`, letting a caller drain finished work before slow slots land.
     GetBatch {
         objects: Vec<ObjectId>,
         wait_ms: u64,
+        min_ready: u32,
     },
     GetLocal(ObjectId),
     /// Reserve an arena slot for a client-side shared-memory put. The client

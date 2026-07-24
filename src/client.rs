@@ -219,12 +219,15 @@ impl ClusterClient {
             _ => Err(Error::Protocol("unexpected submit batch reply".into())),
         }
     }
-    /// Fetches many objects in a single blocking RPC, waiting up to `timeout` for
-    /// all of them to resolve — the batch analogue of `TaskHandle::result` and a
-    /// direct parallel to `ray.get([refs])`. Results are in request order.
+    /// Fetches many objects in one blocking RPC, waiting up to `timeout` for at
+    /// least `min_ready` of them to resolve. `min_ready == ids.len()` is the
+    /// all-or-nothing `ray.get([refs])`; a smaller value is `ray.wait`, returning
+    /// as soon as K finish so the caller drains fast rollouts without blocking on
+    /// the slowest. Results are in request order; unfinished slots are `ObjectPending`.
     async fn fetch_batch(
         &self,
         ids: &[ObjectId],
+        min_ready: usize,
         timeout: Duration,
     ) -> Result<Vec<Result<ObjectPayload, Error>>, Error> {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -234,17 +237,19 @@ impl ClusterClient {
                 .rpc(ClientRequest::GetBatch {
                     objects: ids.to_vec(),
                     wait_ms,
+                    min_ready: min_ready as u32,
                 })
                 .await?
             {
                 ClientReply::ObjectBatch(results) => {
-                    // The server parks until every object resolves or the wait
-                    // slice elapses; a still-pending slot means the slice expired,
-                    // so retry until the outer deadline fires.
-                    if results
+                    // The server parks until `min_ready` slots resolve or the wait
+                    // slice elapses; fewer ready means the slice expired, so retry
+                    // until the outer deadline fires.
+                    let ready = results
                         .iter()
-                        .any(|result| matches!(result, Err(Error::ObjectPending(_))))
-                    {
+                        .filter(|result| !matches!(result, Err(Error::ObjectPending(_))))
+                        .count();
+                    if ready < min_ready {
                         continue;
                     }
                     return Ok(results);
@@ -287,7 +292,17 @@ impl ClusterClient {
         ids: &[ObjectId],
         timeout: Duration,
     ) -> Result<Vec<Result<(Codec, Vec<u8>), Error>>, Error> {
-        let payloads = self.fetch_batch(ids, timeout).await?;
+        self.wait_bytes_many(ids, ids.len(), timeout).await
+    }
+    /// Raw-bytes `ray.wait`: returns once `min_ready` of `ids` resolve, one slot
+    /// per id in order. Ready slots carry bytes; unfinished ones are `ObjectPending`.
+    pub async fn wait_bytes_many(
+        &self,
+        ids: &[ObjectId],
+        min_ready: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Result<(Codec, Vec<u8>), Error>>, Error> {
+        let payloads = self.fetch_batch(ids, min_ready.min(ids.len()), timeout).await?;
         let mut out = Vec::with_capacity(payloads.len());
         for payload in payloads {
             out.push(match payload {
@@ -406,7 +421,7 @@ impl ClusterClient {
         timeout: Duration,
     ) -> Result<Vec<Result<T, Error>>, Error> {
         let ids: Vec<ObjectId> = handles.iter().map(|handle| handle.output.id).collect();
-        let payloads = self.fetch_batch(&ids, timeout).await?;
+        let payloads = self.fetch_batch(&ids, ids.len(), timeout).await?;
         let mut out = Vec::with_capacity(payloads.len());
         for (payload, handle) in payloads.into_iter().zip(handles) {
             out.push(match payload {
@@ -417,6 +432,37 @@ impl ClusterClient {
                 // non-available terminal: fetch the precise failure/cancel reason
                 Err(Error::Protocol(_)) => Err(handle.terminal_error().await),
                 Err(error) => Err(error),
+            });
+        }
+        Ok(out)
+    }
+    /// Awaits *at least* `min_ready` of `handles` to finish (`ray.wait`), returning
+    /// one entry per handle in order: `Ready::Done(i, result)` for resolved slots,
+    /// `Ready::Pending(i)` for the rest. An RL driver loops — `wait` for K, train on
+    /// the ready trajectories, then `wait` again on the stragglers — instead of
+    /// blocking the whole step on the slowest rollout.
+    pub async fn wait<T: DeserializeOwned>(
+        &self,
+        handles: &[TaskHandle<T>],
+        min_ready: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Ready<T>>, Error> {
+        let ids: Vec<ObjectId> = handles.iter().map(|handle| handle.output.id).collect();
+        let min_ready = min_ready.min(ids.len());
+        let payloads = self.fetch_batch(&ids, min_ready, timeout).await?;
+        let mut out = Vec::with_capacity(payloads.len());
+        for (index, (payload, handle)) in payloads.into_iter().zip(handles).enumerate() {
+            out.push(match payload {
+                Ok(payload) => Ready::Done(
+                    index,
+                    self.payload_bytes(payload)
+                        .await
+                        .and_then(|(codec, bytes)| decode(codec, bytes)),
+                ),
+                Err(Error::ObjectPending(_)) => Ready::Pending(index),
+                // non-available terminal: fetch the precise failure/cancel reason
+                Err(Error::Protocol(_)) => Ready::Done(index, Err(handle.terminal_error().await)),
+                Err(error) => Ready::Done(index, Err(error)),
             });
         }
         Ok(out)
@@ -472,6 +518,14 @@ fn verify_object(
         return Err(Error::ObjectConflict(requested));
     }
     Ok(())
+}
+
+/// One slot of a `ClusterClient::wait` result, tagged with its position in the
+/// input `handles`. `Done` carries the decoded result (or that task's error);
+/// `Pending` marks a rollout that had not finished when `min_ready` was met.
+pub enum Ready<T> {
+    Done(usize, Result<T, Error>),
+    Pending(usize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

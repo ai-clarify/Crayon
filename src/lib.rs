@@ -15,7 +15,7 @@ pub mod protocol;
 pub mod resources;
 pub mod worker;
 
-pub use client::{ClusterClient, ObjectRef, TaskHandle};
+pub use client::{ClusterClient, ObjectRef, Ready, TaskHandle};
 pub use error::Error;
 pub use operation::{Codec, Operation, OperationDescriptor, OperationKey, TaskArg};
 pub use resources::{ResourceQuantity, ResourceSet};
