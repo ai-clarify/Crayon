@@ -1,0 +1,21 @@
+src/client.rs
+  s_e890dd8d201767::t_c10c387a0356b2 305-307
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "35d238ebc5b73d52ab756d50b2ecb39f5d1a9089",
+  "prompts": {},
+  "sessions": {
+    "s_e890dd8d201767": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b6378e88-c250-4e84-b580-b2956007a909",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
