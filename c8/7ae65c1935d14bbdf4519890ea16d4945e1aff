@@ -1,0 +1,21 @@
+docs/evolution-plan-legacy-0.3.0.md
+  s_32c5c6f13e5737::t_63efe869bb25bc 1-440
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c87ae65c1935d14bbdf4519890ea16d4945e1aff",
+  "prompts": {},
+  "sessions": {
+    "s_32c5c6f13e5737": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f15dc6c9-5ed2-41dd-a9de-ed0d45494760",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
