@@ -1,0 +1,37 @@
+crayon-py/src/lib.rs
+  s_e5fe4a420b3cd8::t_01633bc4a7aa3d 147-180
+src/client.rs
+  s_e5fe4a420b3cd8::t_b023156ddecab3 222-226,230,240,245-248,250-252,295-305,424,439-469,523-530
+src/cluster.rs
+  s_e5fe4a420b3cd8::t_2aad43967e4399 212-219,237,707-710,712-718,894,1119,1231-1255
+src/lib.rs
+  s_e5fe4a420b3cd8::t_ca01f804366e1e 18
+src/protocol.rs
+  s_507424d4acc3b0::t_1fdcc0a05202dc 25,171-175,179
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b4d588a7002d6879c2b32c750299afbc14a7e41b",
+  "prompts": {},
+  "sessions": {
+    "s_507424d4acc3b0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a99b7c8bf90d11c70",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_e5fe4a420b3cd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b7526072-49d4-4cf6-958c-965b8c6edfd9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
