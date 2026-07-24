@@ -1,0 +1,45 @@
+src/arena.rs
+  s_41c334c91b145e::t_1f05c15dd7f123 212,262-264,344-347
+src/bin/crayon_cluster.rs
+  s_41c334c91b145e::t_3e27716467448d 27-31,196-204,213-216,253-254,362-363,377-382,402-404,425,436-466,476,481-485,507-514,538,571,596-599,700-702,709,727-733
+src/bin/durability_spike.rs
+  s_41c334c91b145e::t_49953070acd875 16,62,65,99-101,123-126,137-138,148-150
+src/bin/storage_benchmark.rs
+  s_41c334c91b145e::t_0481abf609584f 23,77-81,91-95,222-229
+src/client.rs
+  s_41c334c91b145e::t_2bdc91f838fab4 140-142
+src/cluster.rs
+  s_41c334c91b145e::t_6cb93032820e88 381-384
+src/coordinator.rs
+  s_41c334c91b145e::t_b088cda178ee58 24-26,122-127,142-144,193-195,432-437,487-506,684,729-734,899-901,1039-1044,1080-1085,1167-1232,1263-1266,1412-1415
+src/error.rs
+  s_41c334c91b145e::t_202dc4d995a314 29-48,65-102
+src/lib.rs
+  s_41c334c91b145e::t_20f4e02bbdbfb9 6
+src/protocol.rs
+  s_41c334c91b145e::t_d85a4ef90767c6 12,25,324-327
+tests/cluster_process.rs
+  s_41c334c91b145e::t_56a1181d3930b7 392-395,398-435
+.gitignore
+  s_41c334c91b145e::t_97ca81400a0845 9
+docs/evolution-plan.md
+  s_41c334c91b145e::t_f22cb56a3e2cbc 192-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3075c4cbb0505e0ca2823f943e0a3affec387421",
+  "prompts": {},
+  "sessions": {
+    "s_41c334c91b145e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5b548f5-e223-437a-a200-0fc66030f3de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
