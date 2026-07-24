@@ -63,7 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (coordinator_addr, coordinator) = match &external {
         Some(addr) => (addr.clone(), None),
         None => {
-            let binary = std::env::current_exe()?.parent().unwrap().join("crayon-cluster");
+            let binary = std::env::current_exe()?
+                .parent()
+                .unwrap()
+                .join("crayon-cluster");
             let addr = free_addr().await?;
             let child = spawn(&binary, &["coordinator", &addr, "5000"], &args.artifact_dir)?;
             (addr, Some(child))
