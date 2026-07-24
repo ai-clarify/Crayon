@@ -1,0 +1,29 @@
+src/bin/storage_benchmark.rs
+  s_e5fe4a420b3cd8::t_ad11c13d695998 66-69
+src/cluster.rs
+  s_e5fe4a420b3cd8::t_72ed82a49160c0 1-27,994-995
+src/cluster_tests.rs
+  s_e5fe4a420b3cd8::t_74bf8166ed2c3b 1-375
+src/coordinator.rs
+  s_e5fe4a420b3cd8::t_7a881f0f6b34a3 1-27,1174-1175
+src/coordinator_tests.rs
+  s_e5fe4a420b3cd8::t_783f12f801f70f 1-634
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a97d10ef32f62cc771392a977fd7ce1bca0962be",
+  "prompts": {},
+  "sessions": {
+    "s_e5fe4a420b3cd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b7526072-49d4-4cf6-958c-965b8c6edfd9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
