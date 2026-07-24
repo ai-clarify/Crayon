@@ -1,15 +1,22 @@
-# Crayon Roadmap — Post-P0 Hardening
+# Crayon Roadmap — Historical (M1–M5 all shipped)
 
-This document tracks the remaining work after the single-session runtime hardening
+> **Superseded.** Every milestone below (M1–M5) shipped in 0.4.0–0.5.0; see
+> `CHANGELOG.md`. This file is kept only as the design record for those
+> milestones. For current gaps and the next implementation pass, read
+> `evolution-plan.md` — that is the live source of truth, not this file.
+
+This document tracked the work after the single-session runtime hardening
 (epoch fencing, immutable operation catalog, capacity budgets, panic isolation,
-loopback enforcement). It is the source of truth for the next implementation
-pass.
+loopback enforcement).
 
 ## Status
 
 - P0 hardening: **done** (commit `b232aef`).
-- This pass: explicit `Release`, worker reconnect state machine.
-- Deferred: coordinator durability, mTLS, lineage GC, streaming objects, actors.
+- M1 explicit `Release` + M2 worker reconnect: **done** (0.4.0).
+- M3 retry classification, M4 graceful drain, M5 object locality: **done**
+  (0.4.0; see `CHANGELOG.md`).
+- Still deferred: coordinator durability, mTLS, lineage GC, streaming objects,
+  actors — assessed in `feature-prescreen.md`.
 
 ## Milestone 1 — Explicit Object Release
 

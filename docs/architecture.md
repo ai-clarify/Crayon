@@ -41,6 +41,17 @@ size, BLAKE3 digest, owner, and location.
 A requester obtains metadata from the coordinator and then fetches worker-local
 bytes directly. It verifies ID, length, and digest before deserialization.
 
+## Shared-memory arena (same-host fast path)
+
+The coordinator owns a single mmap'd arena file. A client that can mmap that
+file is proven co-located and reserves/commits payloads of any size into it,
+bypassing the 8 MiB RPC frame; workers on the same host read them as slices
+with no copy. This is the large-payload lever, and it is same-host only — a
+client that cannot map the arena falls back to framed TCP and is bounded by
+`MAX_FRAME_BYTES`. Large data therefore flows client → arena → worker; worker
+outputs stay frame-sized and are served worker-local, never streamed back to
+the client.
+
 ## Resources
 
 Resources are fixed-point values where 1000 milli-units equal one unit. The

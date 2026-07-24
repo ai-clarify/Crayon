@@ -17,6 +17,13 @@ dispatch latency and payload movement are everything. Crayon optimizes exactly
 that path and measures itself against Ray on every claim below (V100 host,
 8-core Xeon, Linux, release builds; Ray 2.56).
 
+**The win is co-location.** The large-payload lever is the shared-memory arena,
+which only fires when client, coordinator, and worker share a host (proof =
+the client can mmap the arena file). Across hosts, transfers fall back to the
+8 MiB RPC frame and the arena advantage is gone. Crayon is a same-host RL
+accelerator first; it runs distributed as a correctness fallback, not as its
+fast path.
+
 **Storage** (`storage-benchmark` vs `ray_storage_benchmark.py`, p50):
 
 | Payload | put Crayon / Ray | get Crayon / Ray | Round trip |

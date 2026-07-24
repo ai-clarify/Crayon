@@ -97,7 +97,6 @@ pub struct ObjectRecord {
     pub checksum: Option<[u8; 32]>,
     pub location: Option<String>,
     pub owner: Option<NodeId>,
-    pub ref_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,7 +302,6 @@ impl CoordinatorState {
                 bytes,
                 location: Some("coordinator".into()),
                 owner: None,
-                ref_count: 1,
             },
         );
         self.changed();
@@ -397,7 +395,6 @@ impl CoordinatorState {
                 checksum: None,
                 location: None,
                 owner: None,
-                ref_count: 1,
             },
         );
         self.tasks.insert(
