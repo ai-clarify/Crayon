@@ -373,3 +373,60 @@ fn get_batch_ready_honors_min_ready() {
     let all_ready = reply(vec![done(), done()]);
     assert!(client_get_batch_ready(&all_ready, 2));
 }
+
+// A client Put over the TCP path returns metadata only (no echoed payload), and
+// the object still round-trips through a Get. Guards the copy-cut: the put reply
+// must carry bytes: None, yet the stored object must be intact and fetchable.
+#[test]
+fn tcp_put_reply_is_metadata_only_and_round_trips() {
+    let (server, _) = registered_server();
+    let payload = b"hello crayon tcp put".to_vec();
+    let expected_id = ObjectId::from_checksum(checksum(&payload));
+
+    let put = server
+        .dispatch_once(&with_epoch(
+            &server,
+            future_envelope(
+                server.cluster_id,
+                RpcRequest::Client(ClientRequest::Put {
+                    codec: Codec::RawBytes,
+                    bytes: payload.clone(),
+                }),
+            ),
+        ))
+        .unwrap();
+    let RpcReply::Client(ClientReply::Object(meta)) = put else {
+        panic!("expected object reply from put")
+    };
+    // Metadata-only reply: no payload echoed back, but id/size/checksum are set.
+    assert!(meta.bytes.is_none(), "put reply must not echo the payload");
+    assert_eq!(meta.id, expected_id);
+    assert_eq!(meta.size_bytes, payload.len() as u64);
+    assert_eq!(meta.checksum, checksum(&payload));
+
+    // The object is intact and fetchable. In this single-process server the
+    // coordinator's arena holds the payload, so Get resolves to the same-host
+    // zero-copy form (bytes dropped, arena offset set) rather than inline bytes;
+    // either way the object round-trips with matching id/size/checksum.
+    let get = server
+        .dispatch_once(&future_envelope(
+            server.cluster_id,
+            RpcRequest::Client(ClientRequest::Get {
+                object: meta.id,
+                wait_ms: 0,
+            }),
+        ))
+        .unwrap();
+    let RpcReply::Client(ClientReply::Object(fetched)) = get else {
+        panic!("expected object reply from get")
+    };
+    assert_eq!(fetched.id, expected_id);
+    assert_eq!(fetched.size_bytes, payload.len() as u64);
+    assert_eq!(fetched.checksum, checksum(&payload));
+    // Resolvable: inline bytes match, or an arena ref locates the payload.
+    match (fetched.bytes.as_deref(), &fetched.arena) {
+        (Some(bytes), _) => assert_eq!(bytes, payload.as_slice()),
+        (None, Some(_)) => {} // same-host arena ref; bytes read zero-copy client-side
+        (None, None) => panic!("get reply resolved to neither bytes nor an arena ref"),
+    }
+}
