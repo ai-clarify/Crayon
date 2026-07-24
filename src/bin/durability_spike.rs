@@ -64,7 +64,7 @@ fn main() {
     let (runnable, _) = state
         .submit(op().key, vec![], ResourceSet::cpu_gpu(1.0, 0.0).unwrap(), 2)
         .unwrap();
-    let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
+    let assignment = state.assign_next(identity.node_id, 0).unwrap().unwrap();
     state.started(&identity, assignment.fence).unwrap();
     let epoch = state.epoch;
     let revision = state.revision;
@@ -110,7 +110,9 @@ fn main() {
     //    expired, the retryable in-flight attempt returns to Runnable.
     let mut recovered_b = restore(&bytes);
     let expired = recovered_b.expire_workers(1_000_000).unwrap();
-    assert_eq!(expired, vec![identity.node_id]);
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].node, identity.node_id);
+    assert_eq!(expired[0].retried, 1);
     assert_eq!(recovered_b.tasks[&in_flight].state, TaskState::Runnable);
     assert!(recovered_b.tasks[&in_flight].assigned.is_none());
 

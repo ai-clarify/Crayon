@@ -18,6 +18,23 @@ use std::sync::Arc;
 pub const MAX_TASKS: usize = 16_384;
 pub const MAX_OBJECTS: usize = 65_536;
 
+/// Exponential retry backoff bounds. A retried task waits `base * 2^(attempt-1)`
+/// ms (capped) before it may be re-dispatched, so a transient fault outlasting
+/// the instant retry burst does not exhaust `max_attempts`. Cap 30s ≈ 6× the
+/// default 5s lease — a backed-off task can intentionally outlive several lease
+/// windows.
+const RETRY_BACKOFF_BASE_MS: u64 = 100;
+const RETRY_BACKOFF_CAP_MS: u64 = 30_000;
+
+/// Backoff for the `attempt`-th failure (attempts already made): 1→100ms,
+/// 2→200ms, 3→400ms, … capped. The shift is guarded so a runaway attempt count
+/// cannot overflow.
+fn retry_backoff_ms(attempt: u32) -> u64 {
+    RETRY_BACKOFF_BASE_MS
+        .saturating_mul(1u64 << attempt.saturating_sub(1).min(20))
+        .min(RETRY_BACKOFF_CAP_MS)
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkerState {
     Alive,
@@ -51,6 +68,46 @@ impl From<&TaskState> for TaskStatus {
         }
     }
 }
+
+/// What `fail()` did with a worker's failure report, so the IO-capable caller
+/// can log it without re-inspecting state.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum FailOutcome {
+    /// Transient failure with attempts left: re-queued with backoff.
+    Retried,
+    /// Permanent, or attempts exhausted: terminal Failed.
+    Failed,
+    /// Duplicate report for an already-terminal task; nothing changed.
+    Duplicate,
+}
+
+/// Per-worker tally from a lease-expiry sweep, so the reaper can log a
+/// `crayon.worker_dead` line without re-scanning the task/object tables.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct WorkerExpiry {
+    pub node: NodeId,
+    pub retried: u32,
+    pub failed: u32,
+    pub cancelled: u32,
+    pub objects_lost: u32,
+}
+
+/// Aggregate cluster counts for the periodic `crayon.health` log line.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HealthCounts {
+    pub tasks: usize,
+    pub runnable: usize,
+    pub running: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub objects: usize,
+    pub available: usize,
+    pub reserved: usize,
+    pub lost: usize,
+    pub workers: usize,
+    pub retries_total: u64,
+    pub failures_total: u64,
+}
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ObjectState {
     Reserved,
@@ -82,6 +139,11 @@ pub struct TaskRecord {
     pub attempt: Attempt,
     pub state: TaskState,
     pub assigned: Option<(NodeId, WorkerEpoch, WorkerSessionId, LeaseId)>,
+    /// Earliest wall-clock (ms since epoch) this task may be re-dispatched;
+    /// set to `now + backoff` on retry so a transient fault is not hammered.
+    /// 0 = immediately runnable. Real state (a retried task keeps its deadline
+    /// across a durability snapshot), so not `#[serde(skip)]`.
+    pub not_before_ms: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectRecord {
@@ -128,6 +190,12 @@ pub struct CoordinatorState {
     pub sched_owned_input: u64,
     #[serde(skip)]
     pub sched_local_hits: u64,
+    /// Cumulative retries and permanent failures, for the periodic health log.
+    /// Transient (log-line metrics), same as `sched_*`.
+    #[serde(skip)]
+    pub retries_total: u64,
+    #[serde(skip)]
+    pub failures_total: u64,
 }
 impl CoordinatorState {
     pub fn new(epoch: CoordinatorEpoch) -> Self {
@@ -145,6 +213,8 @@ impl CoordinatorState {
             sched_assigns: 0,
             sched_owned_input: 0,
             sched_local_hits: 0,
+            retries_total: 0,
+            failures_total: 0,
         }
     }
     fn changed(&mut self) {
@@ -413,6 +483,7 @@ impl CoordinatorState {
                     TaskState::Runnable
                 },
                 assigned: None,
+                not_before_ms: 0,
             },
         );
         if waiting {
@@ -423,7 +494,11 @@ impl CoordinatorState {
         self.changed();
         Ok((id, output))
     }
-    pub fn assign_next(&mut self, node_id: NodeId) -> Result<Option<TaskAssignment>, Error> {
+    pub fn assign_next(
+        &mut self,
+        node_id: NodeId,
+        now: u64,
+    ) -> Result<Option<TaskAssignment>, Error> {
         let worker = self.workers.get(&node_id).ok_or(Error::StaleFence)?;
         if worker.state != WorkerState::Alive || worker.free_slots == 0 {
             return Ok(None);
@@ -449,6 +524,13 @@ impl CoordinatorState {
         while let Some(id) = runnable.pop_front() {
             let Some(task) = tasks.get(&id) else { continue };
             if task.state != TaskState::Runnable {
+                continue;
+            }
+            // Retried task not yet due: keep it queued (back) and skip. Pickup is
+            // bounded by the worker Poll long-poll's 250ms re-dispatch slice.
+            // ponytail: no dedicated backoff timer; 250ms slice bounds the wait.
+            if task.not_before_ms > now {
+                requeue.push(id);
                 continue;
             }
             if !(worker.operations.contains_key(&task.operation)
@@ -627,7 +709,8 @@ impl CoordinatorState {
         fence: TaskFence,
         message: String,
         class: FailureClass,
-    ) -> Result<(), Error> {
+        now: u64,
+    ) -> Result<FailOutcome, Error> {
         // Idempotent: a duplicate failure report for an already-terminal task
         // is accepted so workers can safely retry reports. Look up first so an
         // unknown task_id yields TaskNotFound instead of panicking on index.
@@ -639,7 +722,7 @@ impl CoordinatorState {
             task.state,
             TaskState::Failed(_) | TaskState::Cancelled | TaskState::Succeeded
         ) {
-            return Ok(());
+            return Ok(FailOutcome::Duplicate);
         }
         self.check_fence(identity, fence)?;
         if !matches!(
@@ -654,31 +737,45 @@ impl CoordinatorState {
         // Coordinator-owned retry policy: only Transient failures retry, and only
         // while attempts remain. A Permanent failure (e.g. an operation panic) is
         // terminal even if attempts are left, so a crashing op is not retried.
+        let attempt = self.tasks[&fence.task_id].attempt.0;
         let retry = matches!(class, FailureClass::Transient)
-            && self.tasks[&fence.task_id].attempt.0 < self.tasks[&fence.task_id].max_attempts;
+            && attempt < self.tasks[&fence.task_id].max_attempts;
         let output = self.tasks[&fence.task_id].output;
         self.release(identity.node_id, &resources)?;
-        let task = self.tasks.get_mut(&fence.task_id).unwrap();
-        task.assigned = None;
-        if retry {
+        self.tasks.get_mut(&fence.task_id).unwrap().assigned = None;
+        let outcome = if retry {
             self.mark_runnable(fence.task_id);
+            self.tasks.get_mut(&fence.task_id).unwrap().not_before_ms =
+                now.saturating_add(retry_backoff_ms(attempt));
+            self.retries_total += 1;
+            FailOutcome::Retried
         } else {
-            task.state = TaskState::Failed(message);
+            self.tasks.get_mut(&fence.task_id).unwrap().state = TaskState::Failed(message);
             self.objects.get_mut(&output).unwrap().state = ObjectState::Failed;
             self.reconcile_dependencies();
-        }
+            self.failures_total += 1;
+            FailOutcome::Failed
+        };
         self.changed();
-        Ok(())
+        Ok(outcome)
     }
-    pub fn expire_workers(&mut self, now: u64) -> Result<Vec<NodeId>, Error> {
+    pub fn expire_workers(&mut self, now: u64) -> Result<Vec<WorkerExpiry>, Error> {
         let expired: Vec<_> = self
             .workers
             .values()
             .filter(|worker| worker.state != WorkerState::Dead && worker.lease_deadline_ms <= now)
             .map(|worker| worker.identity.node_id)
             .collect();
+        let mut report = Vec::with_capacity(expired.len());
         for node in &expired {
             self.workers.get_mut(node).unwrap().state = WorkerState::Dead;
+            let mut tally = WorkerExpiry {
+                node: *node,
+                retried: 0,
+                failed: 0,
+                cancelled: 0,
+                objects_lost: 0,
+            };
             let tasks: Vec<_> = self
                 .tasks
                 .values()
@@ -693,17 +790,31 @@ impl CoordinatorState {
                     task.state = TaskState::Cancelled;
                     self.cancel_requested.remove(&id);
                     self.objects.get_mut(&output).unwrap().state = ObjectState::Cancelled;
+                    tally.cancelled += 1;
                 } else if task.attempt.0 < task.max_attempts {
+                    let attempt = task.attempt.0;
                     self.mark_runnable(id);
+                    self.tasks.get_mut(&id).unwrap().not_before_ms =
+                        now.saturating_add(retry_backoff_ms(attempt));
+                    self.retries_total += 1;
+                    tally.retried += 1;
                 } else {
                     task.state = TaskState::Failed("worker lease expired".into());
                     self.objects.get_mut(&output).unwrap().state = ObjectState::Failed;
+                    // A lease-expiry permanent failure is reported as part of this
+                    // worker-death event (crayon.worker_dead failed=N), not a
+                    // separate per-task crayon.task_failed line.
+                    // ponytail: rollup, not per-task; expire_workers returns a batch,
+                    // threading a per-task outcome out of it would be higher-entropy.
+                    self.failures_total += 1;
+                    tally.failed += 1;
                 }
             }
             for object in self.objects.values_mut() {
                 if object.owner == Some(*node) && object.state == ObjectState::Available {
                     object.state = ObjectState::Lost;
                     object.location = None;
+                    tally.objects_lost += 1;
                 }
             }
             // Ephemeral workers die on completion and never return, so drop the
@@ -712,12 +823,44 @@ impl CoordinatorState {
             // workers.get -> None -> StaleFence, exactly as when it was left Dead.
             self.workers.remove(node);
             self.pending_deletes.remove(node);
+            report.push(tally);
         }
         if !expired.is_empty() {
             self.reconcile_dependencies();
             self.changed();
         }
-        Ok(expired)
+        Ok(report)
+    }
+    /// One pass over the task/object tables for the periodic health log. Bounded
+    /// by MAX_TASKS/MAX_OBJECTS; called at the reaper's ~30s cadence, not a hot
+    /// path — cheaper than maintaining per-state live counters.
+    pub fn health_counts(&self) -> HealthCounts {
+        let mut h = HealthCounts {
+            tasks: self.tasks.len(),
+            objects: self.objects.len(),
+            workers: self.workers.len(),
+            retries_total: self.retries_total,
+            failures_total: self.failures_total,
+            ..Default::default()
+        };
+        for task in self.tasks.values() {
+            match task.state {
+                TaskState::Runnable => h.runnable += 1,
+                TaskState::Running | TaskState::Assigned => h.running += 1,
+                TaskState::Succeeded => h.succeeded += 1,
+                TaskState::Failed(_) => h.failed += 1,
+                _ => {}
+            }
+        }
+        for object in self.objects.values() {
+            match object.state {
+                ObjectState::Available => h.available += 1,
+                ObjectState::Reserved => h.reserved += 1,
+                ObjectState::Lost => h.lost += 1,
+                _ => {}
+            }
+        }
+        h
     }
     pub fn drain(&mut self, identity: &WorkerIdentity) -> Result<(), Error> {
         self.check_identity(identity)?;
@@ -1027,13 +1170,14 @@ mod tests {
                 1,
             )
             .unwrap();
-        let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
+        let assignment = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         state
             .fail(
                 &identity,
                 assignment.fence,
                 "boom".into(),
                 FailureClass::Permanent,
+                0,
             )
             .unwrap();
         assert!(matches!(state.tasks[&second].state, TaskState::Failed(_)));
@@ -1052,7 +1196,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
+        let assignment = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         state.cancel(task).unwrap();
         assert_eq!(state.workers[&identity.node_id].free_slots, 0);
         state
@@ -1068,16 +1212,18 @@ mod tests {
         state
             .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 2)
             .unwrap();
-        let first = state.assign_next(identity.node_id).unwrap().unwrap();
+        let first = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         state
             .fail(
                 &identity,
                 first.fence,
                 "retry".into(),
                 FailureClass::Transient,
+                0,
             )
             .unwrap();
-        let second = state.assign_next(identity.node_id).unwrap().unwrap();
+        // Transient retry backs off ~100ms; dispatch with now past the deadline.
+        let second = state.assign_next(identity.node_id, 1_000).unwrap().unwrap();
         assert_ne!(first.fence.attempt, second.fence.attempt);
         assert_eq!(
             state.started(&identity, first.fence),
@@ -1110,7 +1256,7 @@ mod tests {
                 .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
                 .unwrap();
             let assignment = state
-                .assign_next(identity.node_id)
+                .assign_next(identity.node_id, 0)
                 .unwrap()
                 .expect("a freshly submitted task must be assignable");
             state.started(&identity, assignment.fence).unwrap();
@@ -1131,7 +1277,7 @@ mod tests {
         }
         assert!(state.runnable.is_empty(), "runnable queue leaked entries");
         assert!(state.waiting.is_empty(), "waiting index leaked entries");
-        assert!(state.assign_next(identity.node_id).unwrap().is_none());
+        assert!(state.assign_next(identity.node_id, 0).unwrap().is_none());
     }
 
     #[test]
@@ -1164,7 +1310,7 @@ mod tests {
         let (_, first_output) = state
             .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
             .unwrap();
-        let first = state.assign_next(identity.node_id).unwrap().unwrap();
+        let first = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         state
             .complete(&identity, completion(first.fence, first_output))
             .unwrap();
@@ -1176,7 +1322,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        state.assign_next(identity.node_id).unwrap().unwrap();
+        state.assign_next(identity.node_id, 0).unwrap().unwrap();
         assert_eq!(state.sched_assigns, 2);
         assert_eq!(state.sched_owned_input, 1);
         assert_eq!(state.sched_local_hits, 1);
@@ -1190,7 +1336,7 @@ mod tests {
             .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
             .unwrap();
         state.drain(&identity).unwrap();
-        assert!(state.assign_next(identity.node_id).unwrap().is_none());
+        assert!(state.assign_next(identity.node_id, 0).unwrap().is_none());
     }
 
     #[test]
@@ -1200,7 +1346,7 @@ mod tests {
         let (task, output) = state
             .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
             .unwrap();
-        let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
+        let assignment = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         state.drain(&identity).unwrap();
         state
             .complete(&identity, completion(assignment.fence, output))
@@ -1215,11 +1361,13 @@ mod tests {
         let (task, _) = state
             .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 2)
             .unwrap();
-        state.assign_next(identity.node_id).unwrap().unwrap();
+        state.assign_next(identity.node_id, 0).unwrap().unwrap();
         state.drain(&identity).unwrap();
         // Draining worker exits without reporting; the reaper re-queues.
         let expired = state.expire_workers(1_000).unwrap();
-        assert_eq!(expired, vec![identity.node_id]);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].node, identity.node_id);
+        assert_eq!(expired[0].retried, 1);
         assert_eq!(state.tasks[&task].state, TaskState::Runnable);
     }
 
@@ -1244,7 +1392,7 @@ mod tests {
         let (_, output) = state
             .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
             .unwrap();
-        let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
+        let assignment = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         assert_eq!(
             state.release_object(output),
             Err(Error::ObjectInUse(output))
@@ -1268,7 +1416,7 @@ mod tests {
         let (task, output) = state
             .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
             .unwrap();
-        let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
+        let assignment = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         state.started(&identity, assignment.fence).unwrap();
         state
             .complete(&identity, completion(assignment.fence, output))
@@ -1286,7 +1434,8 @@ mod tests {
         let node = NodeId::new();
         let _ = register(&mut state, node); // lease_deadline_ms = 0 + 100
         let expired = state.expire_workers(200).unwrap();
-        assert_eq!(expired, vec![node]);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].node, node);
         assert!(!state.workers.contains_key(&node));
         assert!(!state.pending_deletes.contains_key(&node));
     }
@@ -1305,7 +1454,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        state.assign_next(identity.node_id).unwrap().unwrap();
+        state.assign_next(identity.node_id, 0).unwrap().unwrap();
         state.cancel(task).unwrap();
         assert!(state.cancel_requested.contains(&task));
         let fence = state.cancellation_for(&identity).unwrap().unwrap();
@@ -1331,7 +1480,7 @@ mod tests {
             Err(Error::TaskNotFound(_))
         ));
         assert!(matches!(
-            state.fail(&identity, bogus, "x".into(), FailureClass::Transient),
+            state.fail(&identity, bogus, "x".into(), FailureClass::Transient, 0),
             Err(Error::TaskNotFound(_))
         ));
         assert!(matches!(
@@ -1353,20 +1502,114 @@ mod tests {
         let (task, _) = state
             .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 3)
             .unwrap();
-        let a = state.assign_next(identity.node_id).unwrap().unwrap();
+        let a = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         state
-            .fail(&identity, a.fence, "boom".into(), FailureClass::Permanent)
+            .fail(
+                &identity,
+                a.fence,
+                "boom".into(),
+                FailureClass::Permanent,
+                0,
+            )
             .unwrap();
         assert!(matches!(state.tasks[&task].state, TaskState::Failed(_)));
         // A Transient failure with attempts left retries instead.
         let (task2, _) = state
             .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 3)
             .unwrap();
-        let b = state.assign_next(identity.node_id).unwrap().unwrap();
+        let b = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         state
-            .fail(&identity, b.fence, "flaky".into(), FailureClass::Transient)
+            .fail(
+                &identity,
+                b.fence,
+                "flaky".into(),
+                FailureClass::Transient,
+                0,
+            )
             .unwrap();
         assert_eq!(state.tasks[&task2].state, TaskState::Runnable);
+    }
+
+    #[test]
+    fn transient_retry_defers_dispatch_until_backoff_elapses() {
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        let (task, _) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 3)
+            .unwrap();
+        let a = state.assign_next(identity.node_id, 0).unwrap().unwrap();
+        let outcome = state
+            .fail(
+                &identity,
+                a.fence,
+                "flaky".into(),
+                FailureClass::Transient,
+                1_000,
+            )
+            .unwrap();
+        // First retry (attempt 1) backs off base = 100ms → due at 1100.
+        assert_eq!(outcome, FailOutcome::Retried);
+        assert_eq!(state.tasks[&task].state, TaskState::Runnable);
+        assert_eq!(state.tasks[&task].not_before_ms, 1_100);
+        // Not yet due: assign_next skips it and returns nothing.
+        assert!(state
+            .assign_next(identity.node_id, 1_050)
+            .unwrap()
+            .is_none());
+        assert_eq!(state.tasks[&task].state, TaskState::Runnable);
+        // Due: dispatched.
+        assert!(state
+            .assign_next(identity.node_id, 1_100)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_across_attempts() {
+        assert_eq!(retry_backoff_ms(1), 100);
+        assert_eq!(retry_backoff_ms(2), 200);
+        assert_eq!(retry_backoff_ms(3), 400);
+        // Capped at RETRY_BACKOFF_CAP_MS, and a huge attempt cannot overflow.
+        assert_eq!(retry_backoff_ms(30), RETRY_BACKOFF_CAP_MS);
+        assert_eq!(retry_backoff_ms(u32::MAX), RETRY_BACKOFF_CAP_MS);
+    }
+
+    #[test]
+    fn lease_expiry_retry_also_applies_backoff() {
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        // Worker lease deadline = now(0) + 100.
+        let identity = register(&mut state, NodeId::new());
+        let (task, _) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 3)
+            .unwrap();
+        state.assign_next(identity.node_id, 0).unwrap().unwrap();
+        // Expire the lease at now = 200; attempt-1 retry → due at 300.
+        let expired = state.expire_workers(200).unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].retried, 1);
+        assert_eq!(state.tasks[&task].state, TaskState::Runnable);
+        assert_eq!(state.tasks[&task].not_before_ms, 300);
+    }
+
+    #[test]
+    fn permanent_failure_leaves_no_backoff_deadline() {
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        let (task, _) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 3)
+            .unwrap();
+        let a = state.assign_next(identity.node_id, 0).unwrap().unwrap();
+        let outcome = state
+            .fail(
+                &identity,
+                a.fence,
+                "boom".into(),
+                FailureClass::Permanent,
+                500,
+            )
+            .unwrap();
+        assert_eq!(outcome, FailOutcome::Failed);
+        assert_eq!(state.tasks[&task].not_before_ms, 0);
     }
 
     #[test]
@@ -1379,7 +1622,7 @@ mod tests {
         let (_, output) = state
             .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
             .unwrap();
-        let a = state.assign_next(identity.node_id).unwrap().unwrap();
+        let a = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         state.started(&identity, a.fence).unwrap();
         state
             .complete(&identity, completion(a.fence, output))
@@ -1396,7 +1639,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        let picked = state.assign_next(identity.node_id).unwrap().unwrap();
+        let picked = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         assert_eq!(picked.fence.task_id, local);
         assert_ne!(picked.fence.task_id, non_local);
         // The non-local task keeps its place and is served next.
@@ -1407,7 +1650,7 @@ mod tests {
                 completion(picked.fence, state.tasks[&local].output),
             )
             .unwrap();
-        let next = state.assign_next(identity.node_id).unwrap().unwrap();
+        let next = state.assign_next(identity.node_id, 0).unwrap().unwrap();
         assert_eq!(next.fence.task_id, non_local);
     }
 }

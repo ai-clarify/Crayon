@@ -426,3 +426,56 @@ fn worker_drains_on_sigterm() {
     // max_attempts = 1: Succeeded proves the first attempt survived the signal.
     assert!(cluster.status(&task).contains("Succeeded"));
 }
+
+#[test]
+fn coordinator_logs_start_and_health_to_stderr() {
+    // The soak harness greps these exact lines; this is their contract. Lease is
+    // short so the reaper's first tick (which always emits health — health_logged
+    // starts at 0 vs a ms-since-epoch `now`) lands within a second.
+    use std::io::{BufRead, BufReader};
+
+    let binary = env!("CARGO_BIN_EXE_crayon-cluster");
+    let coordinator = format!("127.0.0.1:{}", free_port());
+    let mut child = Command::new(binary)
+        .args(["coordinator", &coordinator, "300"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Drain stderr on a thread so a full pipe buffer can never wedge the child.
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut saw_start, mut saw_health) = (false, false);
+    while Instant::now() < deadline && !(saw_start && saw_health) {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) => {
+                if line.starts_with("crayon.start ") {
+                    assert!(line.contains(&format!("bind={coordinator}")));
+                    assert!(line.contains("arena_token="));
+                    assert!(line.contains("lease_ms=300"));
+                    saw_start = true;
+                } else if line.starts_with("crayon.health ") {
+                    // Fields the soak parses must be present.
+                    for key in ["tasks=", "workers=", "arena_bytes=", "failures_total="] {
+                        assert!(line.contains(key), "health line missing {key}: {line}");
+                    }
+                    saw_health = true;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(saw_start, "no crayon.start line on coordinator stderr");
+    assert!(saw_health, "no crayon.health line on coordinator stderr");
+}

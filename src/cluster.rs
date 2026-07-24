@@ -128,16 +128,28 @@ impl CoordinatorServer {
             crate::protocol::require_loopback_addr(bind)?;
         }
         let listener = TcpListener::bind(bind).await?;
+        eprintln!(
+            "crayon.start bind={bind} cluster_id={} arena_token={} arena_path={} lease_ms={}",
+            self.cluster_id,
+            self.arena.token(),
+            self.arena.path().display(),
+            self.lease_ms
+        );
         let reaper = self.clone();
         tokio::spawn(async move {
             let period = Duration::from_millis((reaper.lease_ms / 3).max(10));
             let mut interval = tokio::time::interval(period);
             let mut locality_logged = 0;
+            // Health snapshot throttled to ~30s of wall time, independent of the
+            // (lease-derived) tick period, so the soak grep gets a steady cadence.
+            let health_period_ms = 30_000u64;
+            let mut health_logged_ms = 0u64;
             loop {
                 interval.tick().await;
-                let (expired, (assigns, owned, hits)) = {
+                let now = now_ms();
+                let (expired, (assigns, owned, hits), health) = {
                     let mut state = reaper.state.lock();
-                    let expired = state.expire_workers(now_ms());
+                    let expired = state.expire_workers(now);
                     (
                         expired,
                         (
@@ -145,6 +157,7 @@ impl CoordinatorServer {
                             state.sched_owned_input,
                             state.sched_local_hits,
                         ),
+                        state.health_counts(),
                     )
                 };
                 // Locality measurement (evolution-plan gap 3), logged here so the
@@ -155,9 +168,28 @@ impl CoordinatorServer {
                         "scheduler locality: {hits}/{owned} owned-input tasks placed locally ({assigns} assigns)"
                     );
                 }
-                if !matches!(expired, Ok(ref list) if list.is_empty()) {
-                    // Expiry retries or fails tasks; wake parked polls to react.
-                    reaper.wakeup.notify_waiters();
+                if now.saturating_sub(health_logged_ms) >= health_period_ms {
+                    health_logged_ms = now;
+                    eprintln!(
+                        "crayon.health tasks={} runnable={} running={} succeeded={} failed={} objects={} available={} reserved={} lost={} workers={} arena_bytes={} retries_total={} failures_total={}",
+                        health.tasks, health.runnable, health.running, health.succeeded,
+                        health.failed, health.objects, health.available, health.reserved,
+                        health.lost, health.workers, reaper.arena.used_bytes(),
+                        health.retries_total, health.failures_total
+                    );
+                }
+                match expired {
+                    Ok(list) if !list.is_empty() => {
+                        for e in &list {
+                            eprintln!(
+                                "crayon.worker_dead node={} retried={} failed={} cancelled={} objects_lost={}",
+                                e.node, e.retried, e.failed, e.cancelled, e.objects_lost
+                            );
+                        }
+                        // Expiry retries or fails tasks; wake parked polls to react.
+                        reaper.wakeup.notify_waiters();
+                    }
+                    _ => {}
                 }
             }
         });
@@ -409,7 +441,7 @@ impl CoordinatorServer {
                     } else {
                         match state.cancellation_for(&identity) {
                             Ok(Some(fence)) => WorkerReply::Cancel(fence),
-                            Ok(None) => match state.assign_next(identity.node_id) {
+                            Ok(None) => match state.assign_next(identity.node_id, now_ms()) {
                                 Ok(value) => WorkerReply::Assignment(value),
                                 Err(error) => WorkerReply::Error(error),
                             },
@@ -440,10 +472,26 @@ impl CoordinatorServer {
                     fence,
                     message,
                     class,
-                } => match self.state.lock().fail(&identity, fence, message, class) {
-                    Ok(()) => WorkerReply::Accepted,
-                    Err(error) => WorkerReply::Error(error),
-                },
+                } => {
+                    let task_id = fence.task_id;
+                    let reason = message.clone();
+                    match self
+                        .state
+                        .lock()
+                        .fail(&identity, fence, message, class, now_ms())
+                    {
+                        Ok(outcome) => {
+                            if let crate::coordinator::FailOutcome::Failed = outcome {
+                                eprintln!(
+                                    "crayon.task_failed task={task_id} attempt={} class={class:?} reason={reason:?}",
+                                    fence.attempt.0
+                                );
+                            }
+                            WorkerReply::Accepted
+                        }
+                        Err(error) => WorkerReply::Error(error),
+                    }
+                }
                 WorkerRequest::Drain(identity) => match self.state.lock().drain(&identity) {
                     Ok(()) => WorkerReply::Accepted,
                     Err(error) => WorkerReply::Error(error),
@@ -1026,7 +1074,7 @@ mod tests {
         let assignment = server
             .state
             .lock()
-            .assign_next(identity.node_id)
+            .assign_next(identity.node_id, 0)
             .unwrap()
             .unwrap();
         server
@@ -1162,7 +1210,11 @@ mod tests {
         );
         let first = server.dispatch_once(&request).unwrap();
         // Dispatched => cached: the entry is present before any retry.
-        assert!(server.replay.lock().entries.contains_key(&request.request_id));
+        assert!(server
+            .replay
+            .lock()
+            .entries
+            .contains_key(&request.request_id));
         let second = server.dispatch_once(&request).unwrap();
         let task_id = |reply| match reply {
             RpcReply::Client(ClientReply::Submitted { task_id, .. }) => task_id,
@@ -1194,7 +1246,10 @@ mod tests {
         request.deadline_unix_ms = now_ms().saturating_add(ten_years_ms);
         server.dispatch_once(&request).unwrap();
         let replay = server.replay.lock();
-        let entry = replay.entries.get(&request.request_id).expect("mutation cached");
+        let entry = replay
+            .entries
+            .get(&request.request_id)
+            .expect("mutation cached");
         // Capped at now + MAX_REPLAY_TTL_MS (+ slack for clock movement across
         // the two now_ms() reads), far below the 10-year envelope deadline.
         assert!(entry.expires_at_ms <= now_ms() + MAX_REPLAY_TTL_MS + 1_000);

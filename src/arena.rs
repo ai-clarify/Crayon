@@ -161,6 +161,19 @@ impl ArenaStore {
         &self.token
     }
 
+    /// Filesystem path of the arena backing file, for the startup log.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// High-water mark of arena bytes handed out (allocator `top`). The number
+    /// that matters for the leak check: it only grows when a new slot is cut, so
+    /// healthy churn recycles slots and it plateaus. A live-bytes sum would hide
+    /// the reservation-leak / quarantine regression we hunt.
+    pub fn used_bytes(&self) -> u64 {
+        self.alloc.lock().top
+    }
+
     /// Allocates a slot for `id` and records its metadata as uncommitted. The
     /// client then writes its bytes at the returned offset and calls `commit`.
     /// Returns `(offset, already_committed)`; content addressing makes a repeat
