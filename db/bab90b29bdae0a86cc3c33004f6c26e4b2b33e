@@ -1,0 +1,21 @@
+tests/cluster_process.rs
+  s_e5fe4a420b3cd8::t_96cc2903c7e576 8-13,50,76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dbbab90b29bdae0a86cc3c33004f6c26e4b2b33e",
+  "prompts": {},
+  "sessions": {
+    "s_e5fe4a420b3cd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b7526072-49d4-4cf6-958c-965b8c6edfd9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
