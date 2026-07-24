@@ -5,6 +5,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Process/worker readiness budget. Generous on purpose: the whole suite spawns
+/// a dozen coordinators + workers in parallel, so on a loaded CI/bench host a
+/// fresh process can take well over the per-op norm to register. Startup is not
+/// what these tests measure, so give it slack rather than race a tight bound.
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -41,7 +47,7 @@ impl Cluster {
             coordinator_child: child,
             workers: Vec::new(),
         };
-        cluster.eventually(Duration::from_secs(10), || {
+        cluster.eventually(READY_TIMEOUT, || {
             cluster
                 .run(["workers", &cluster.coordinator])
                 .status
@@ -67,7 +73,7 @@ impl Cluster {
             .spawn()
             .unwrap();
         self.workers.push(WorkerProcess { node_id, child });
-        self.eventually(Duration::from_secs(10), || {
+        self.eventually(READY_TIMEOUT, || {
             stdout(self.run(["workers", &self.coordinator])).contains(&address)
         });
         address
