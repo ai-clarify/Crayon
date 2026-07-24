@@ -51,6 +51,20 @@ semantic smoke run (`--warmups 1 --samples 3`) must pass on supported platforms
 before a release. Full results are generated on the target machine and attached
 to the GitHub Release; raw samples are not committed.
 
+## Soak
+
+`benchmarks/soak.sh` is the long-run stability gate, not a PR gate. It starts a
+coordinator + workers, drives sustained scheduler load, churns ≥1 MiB arena
+objects through the Python client (put/release), periodically `kill -9`s a
+worker and restarts it, and samples coordinator RSS, arena high-water bytes,
+`/dev/shm` free, and the `crayon.health` counts to a CSV every 30s, failing
+loudly on a breached threshold. `--smoke` runs a ~60s self-check; a release
+soak runs a day or two on the Linux target (v100), where `/dev/shm` and `/proc`
+make the leak and chaos signal load-bearing. Pass = coordinator RSS and arena
+bytes plateau, `/dev/shm` free stays above the floor, and the task table stays
+bounded. Arena churn needs the current `crayon-py` wheel (the script builds a
+local venv if the installed one lacks the `Client` API).
+
 ## Not yet claimed
 
 Coordinator restart persistence, stale-report replay injection, chunked objects,
