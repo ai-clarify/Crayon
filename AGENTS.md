@@ -56,6 +56,11 @@ host, never asserted.
 
 ## Workflow
 
+- **Simplify before every commit.** Before staging changes, do a simplification pass:
+  delete dead code, replace custom logic with stdlib/native equivalents, collapse
+  duplication, drop unused abstractions. A commit that adds functionality must
+  also remove anything it makes obsolete. "It works" is not sufficient — it must
+  also be minimal. This is mandatory, not optional.
 - `cargo test` green before every commit; `cargo build --release` for anything
   benchmarked (debug numbers are noise).
 - Python client: `cd crayon-py && maturin build --release`, then
