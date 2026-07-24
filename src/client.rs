@@ -302,7 +302,9 @@ impl ClusterClient {
         min_ready: usize,
         timeout: Duration,
     ) -> Result<Vec<Result<(Codec, Vec<u8>), Error>>, Error> {
-        let payloads = self.fetch_batch(ids, min_ready.min(ids.len()), timeout).await?;
+        let payloads = self
+            .fetch_batch(ids, min_ready.min(ids.len()), timeout)
+            .await?;
         let mut out = Vec::with_capacity(payloads.len());
         for payload in payloads {
             out.push(match payload {
