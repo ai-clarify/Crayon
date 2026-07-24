@@ -1,67 +1,102 @@
-# Crayon
+<p align="center">
+  <img src="logo.svg" width="140" alt="Crayon"/>
+</p>
 
-Crayon is a small distributed task runtime for Rust workloads.
+<h1 align="center">Crayon</h1>
 
-It uses one authoritative coordinator, worker processes, registered versioned
-operations, fixed-point resources, fenced task attempts, and a worker-local
-immutable object data plane.
+<p align="center">
+A distributed task runtime for RL workloads, in Rust.<br/>
+One coordinator, disposable workers, a plasma-style shared-memory object store —
+built to beat Ray where RL actually hurts: dispatch latency and data movement.
+</p>
 
-## Guarantees
+## Why
 
-- Tasks execute in worker processes; clients never execute them locally.
-- Operations use `(namespace, name, version)`; closures are not shipped.
-- Worker sessions and task attempts reject stale results.
-- Execution is at-least-once; only one fenced result publication is accepted.
-- Objects are verified by exact `ObjectId`, size, and BLAKE3 digest.
-- Coordinator restart ends the current in-memory cluster session.
+RL rollouts run on ephemeral per-task workers: durability is worthless,
+dispatch latency and payload movement are everything. Crayon optimizes exactly
+that path and measures itself against Ray on every claim below (V100 host,
+8-core Xeon, Linux, release builds; Ray 2.56).
+
+**Storage** (`storage-benchmark` vs `ray_storage_benchmark.py`, p50):
+
+| Payload | put Crayon / Ray | get Crayon / Ray | Round trip |
+|---|---|---|---|
+| 1 KB | **96 µs** / 297 µs | **48 µs** / 70 µs | 2.5× |
+| 1 MB | **169 µs** / 519 µs | **122 µs** / 160 µs | 2.3× |
+| 16 MB | **940 µs** / 1.6 ms | **981 µs** / 3.3 ms | 2.6× |
+| 1 GB | **51 ms** / 66 ms | **131 ms** / 622 ms | 3.8× |
+
+Write/read amplification is 0.0 at every size (counting allocator). The
+shared-memory arena carries same-host payloads of any size — the 8 MiB RPC
+frame cap applies only across hosts.
+
+**Scheduling** (`rl-benchmark` vs `ray_rl_benchmark.py`, identical bandit
+workload, 6 workers × 16 parallel rollouts × 300 iterations):
+**11 984 episodes/s vs 1 593 — 7.5× faster.**
+
+**Real LLM RL** (Qwen3.5-0.8B on one V100, 2 rollout actors + judge + REINFORCE
+learner): the 2 GB policy broadcasts through the arena in **381 ms**; 30
+training iterations lift arithmetic accuracy 0.24 → 0.55. On the full GSM8K
+test split (1 319 problems, greedy), Crayon and Ray produce **bit-identical
+scores** (305 correct) at identical GPU-bound throughput — the pipeline adds
+no data loss and no overhead where the model dominates.
+
+## Design
+
+- One authoritative coordinator; workers register versioned operations
+  (`namespace.name.vN`) — closures are never shipped.
+- Plasma-style arena: a single mmap'd file per coordinator; same-host clients
+  reserve/commit and read objects as slices. Puts < 1 MiB are
+  content-addressed (blake3, dedup); larger puts skip hashing for speed.
+- Fenced at-least-once execution: stale sessions and stale attempts cannot
+  publish results; mutations are idempotent by request id.
+- Event-driven control plane: blocking gets, long-poll workers, batched
+  submit — no polling loops; pooled client connections.
 
 ## Install
 
 ```bash
-cargo install crayon-rs --version 0.5.0
+cargo install crayon-rs --version 0.5.0   # library `crayon`, binary `crayon-cluster`
 ```
 
-The package name is `crayon-rs`, the library import name is `crayon`, and the
-binary is `crayon-cluster`.
+Python client (pyo3, arena-aware — gigabyte puts from Python):
+
+```bash
+cd crayon-py && maturin build --release
+pip install target/wheels/crayon-*.whl
+```
+
+```python
+import crayon
+c = crayon.Client("127.0.0.1:7000")
+oid = c.put(b"\x00" * (1 << 30))              # 1 GB, via shared memory
+task, out = c.submit("llm", "rollout", 1, [b'{"seeds":[1],"max_new_tokens":48}'])
+print(c.get(out, timeout_ms=120_000))
+c.release(oid)
+```
 
 ## Run
 
 ```bash
-cargo build --bin crayon-cluster
+cargo build --release --bin crayon-cluster
 
 # terminal 1
-target/debug/crayon-cluster coordinator 127.0.0.1:7000
+target/release/crayon-cluster coordinator 127.0.0.1:7000
 
 # terminal 2
-target/debug/crayon-cluster worker 127.0.0.1:7000 127.0.0.1:7001
+target/release/crayon-cluster worker 127.0.0.1:7000 127.0.0.1:7001
 
 # terminal 3
-target/debug/crayon-cluster submit 127.0.0.1:7000 20 22
+target/release/crayon-cluster submit 127.0.0.1:7000 20 22
 # 42
 ```
 
-## Benchmark
+End-to-end LLM RL / GSM8K (real model, three roles, Python-driven):
 
-`cluster-benchmark` measures the current coordinator/worker runtime with real
-processes on loopback. See [benchmark methodology](docs/benchmark.md).
-
-V100 host (8 logical CPUs, Intel Xeon Platinum 8260, Linux, loopback), release
-binaries, 3 warmups + 30 measured samples, 4 KiB DAG payload:
-
-| Scenario | Workers | Concurrency | Median latency | Throughput |
-|---|---:|---:|---:|---:|
-| Task (`add`) | 1 | 1 | 0.5 ms | 2115 ops/s |
-| DAG/object (`copy`) | 1 | 1 | 23.2 ms | 43 ops/s |
-| Task (`add`) | 2 | 2 | 0.5 ms | 1791 ops/s |
-| DAG/object (`copy`) | 2 | 2 | 23.5 ms | 43 ops/s |
-| Task (`add`) | 8 | 8 | 1.3 ms | 684 ops/s |
-| DAG/object (`copy`) | 8 | 8 | 24.5 ms | 41 ops/s |
-
-Absolute control-plane measurements for the 0.4 event-driven runtime — ~100×
-lower task latency than the 0.2 polling runtime (53 ms). Throughput is
-single-stream (`1 / mean` latency); the DAG scenario is two sequential tasks
-plus a worker-local object fetch. The removed 0.1.x Python/V100 RL benchmark
-tested a different architecture and is not evidence for this release.
+```bash
+python3 benchmarks/crayon_llm_rl.py --model <hf-model-dir> --iterations 30
+python3 benchmarks/crayon_gsm8k.py  --model <hf-model-dir>            # full test split
+```
 
 ## Verify
 
@@ -71,10 +106,11 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-See [architecture](docs/architecture.md) and [acceptance](docs/acceptance.md).
+Benchmark methodology: [docs/benchmark.md](docs/benchmark.md). Architecture:
+[docs/architecture.md](docs/architecture.md).
 
 ## Non-goals
 
-The current release does not provide coordinator HA, actors, arbitrary code
-shipping, distributed reference counting, lineage replay, hard preemption,
-autoscaling, or exactly-once external side effects.
+Coordinator HA, actors, arbitrary code shipping, distributed reference
+counting, lineage replay, hard preemption, autoscaling, exactly-once external
+side effects.

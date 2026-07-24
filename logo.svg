@@ -1,12 +1,44 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none">
-  <rect width="120" height="120" rx="24" fill="#0f1117"/>
-  <!-- crayon body -->
-  <rect x="44" y="28" width="32" height="64" rx="6" fill="#ff6b6b"/>
-  <rect x="44" y="28" width="32" height="14" rx="6" fill="#ff8787"/>
-  <!-- crayon tip -->
-  <path d="M44 92 L60 108 L76 92 Z" fill="#ffd93d"/>
-  <path d="M52 92 L60 100 L68 92 Z" fill="#f4a261"/>
-  <!-- wrapper lines -->
-  <rect x="44" y="50" width="32" height="3" fill="#e63946"/>
-  <rect x="44" y="58" width="32" height="3" fill="#e63946"/>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="120" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0b0b10"/>
+      <stop offset="1" stop-color="#1a0f14"/>
+    </linearGradient>
+    <linearGradient id="blade" x1="60" y1="10" x2="60" y2="104" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffd166"/>
+      <stop offset="0.35" stop-color="#ff7b45"/>
+      <stop offset="0.75" stop-color="#e5383b"/>
+      <stop offset="1" stop-color="#a4161a"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="46" y1="14" x2="46" y2="100" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff3b0"/>
+      <stop offset="1" stop-color="#ff9e5e"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="60" cy="64" r="52" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff4d2e" stop-opacity="0.55"/>
+      <stop offset="0.6" stop-color="#ff4d2e" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#ff4d2e" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="120" height="120" rx="24" fill="url(#bg)"/>
+  <circle cx="60" cy="62" r="50" fill="url(#glow)"/>
+
+  <!-- speed strokes -->
+  <path d="M18 30 L42 30 L36 38 L14 38 Z" fill="#e5383b" opacity="0.5"/>
+  <path d="M10 48 L34 48 L28 56 L8 56 Z" fill="#e5383b" opacity="0.32"/>
+  <path d="M84 24 L106 24 L100 32 L80 32 Z" fill="#ffb703" opacity="0.45"/>
+
+  <!-- crayon blade: angular, downward strike -->
+  <path d="M60 8 L78 22 L74 78 L60 112 L46 78 L42 22 Z" fill="url(#blade)"/>
+  <!-- highlight edge -->
+  <path d="M60 8 L46 78 L60 112 L52 78 L50 24 Z" fill="url(#edge)" opacity="0.55"/>
+  <!-- grip band -->
+  <path d="M43.5 34 L76.5 34 L75.8 46 L44.2 46 Z" fill="#0b0b10" opacity="0.85"/>
+  <path d="M44.2 50 L75.8 50 L75.3 58 L44.7 58 Z" fill="#0b0b10" opacity="0.55"/>
+  <!-- molten tip -->
+  <path d="M60 112 L52 84 L60 92 L68 84 Z" fill="#fff3b0"/>
+
+  <!-- bolt fracture -->
+  <path d="M66 26 L57 48 L64 48 L52 72 L59 52 L52 52 L60 26 Z" fill="#fff8e7" opacity="0.9"/>
 </svg>
