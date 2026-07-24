@@ -147,12 +147,24 @@ impl CoordinatorServer {
             loop {
                 interval.tick().await;
                 let now = now_ms();
+                // expire_workers runs every tick (lease enforcement needs the fast
+                // cadence); the terminal-task reclaim and the full-table health
+                // scan only run on the ~30s report cadence — no point scanning the
+                // whole table ~19×/report just to discard 18 of the results.
+                let report = now.saturating_sub(health_logged_ms) >= health_period_ms;
                 let (expired, reclaimed, (assigns, owned, hits), health) = {
                     let mut state = reaper.state.lock();
                     let expired = state.expire_workers(now);
-                    // Backstop for terminal tasks a client never Released; keeps
-                    // the task table from growing to MAX_TASKS under fire-and-forget.
-                    let reclaimed = state.reap_terminal_tasks(now);
+                    let reclaimed = if report {
+                        state.reap_terminal_tasks(now)
+                    } else {
+                        0
+                    };
+                    let health = if report {
+                        Some(state.health_counts())
+                    } else {
+                        None
+                    };
                     (
                         expired,
                         reclaimed,
@@ -161,7 +173,7 @@ impl CoordinatorServer {
                             state.sched_owned_input,
                             state.sched_local_hits,
                         ),
-                        state.health_counts(),
+                        health,
                     )
                 };
                 if reclaimed > 0 {
@@ -175,7 +187,7 @@ impl CoordinatorServer {
                         "scheduler locality: {hits}/{owned} owned-input tasks placed locally ({assigns} assigns)"
                     );
                 }
-                if now.saturating_sub(health_logged_ms) >= health_period_ms {
+                if let Some(health) = health {
                     health_logged_ms = now;
                     eprintln!(
                         "crayon.health tasks={} runnable={} running={} succeeded={} failed={} objects={} available={} reserved={} lost={} workers={} arena_bytes={} retries_total={} failures_total={}",
@@ -487,8 +499,8 @@ impl CoordinatorServer {
                         .lock()
                         .fail(&identity, fence, message, class, now_ms())
                     {
-                        Ok(outcome) => {
-                            if let crate::coordinator::FailOutcome::Failed = outcome {
+                        Ok(permanently_failed) => {
+                            if permanently_failed {
                                 eprintln!(
                                     "crayon.task_failed task={task_id} attempt={} class={class:?} reason={reason:?}",
                                     fence.attempt.0
@@ -513,18 +525,27 @@ impl CoordinatorServer {
                     if bytes.len() > MAX_OBJECT_BYTES {
                         ClientReply::Error(Error::Protocol("object too large".into()))
                     } else {
-                        match self.state.lock().put(codec.clone(), bytes.clone()) {
-                            Ok(id) => {
-                                let checksum = checksum(&bytes);
-                                // Publish into the arena so a same-host get is zero-copy.
-                                self.arena.put(id, &bytes, codec.clone(), checksum);
+                        match self.state.lock().put(codec.clone(), bytes) {
+                            Ok(crate::coordinator::PutOutcome {
+                                id,
+                                checksum,
+                                stored,
+                            }) => {
+                                // Publish into the arena so a same-host get is
+                                // zero-copy. Reuse the stored Arc + checksum from
+                                // put(); no re-hash, no re-clone of the payload.
+                                self.arena.put(id, &stored, codec.clone(), checksum);
+                                // The put reply is metadata only: every caller
+                                // keeps just payload.id (client.rs:106), so
+                                // echoing the payload back was a full round-trip
+                                // of wasted bytes on the wire.
                                 ClientReply::Object(ObjectPayload {
                                     id,
                                     codec,
-                                    size_bytes: bytes.len() as u64,
+                                    size_bytes: stored.len() as u64,
                                     checksum,
                                     location: "coordinator".into(),
-                                    bytes: Some(bytes.into()),
+                                    bytes: None,
                                     arena: None,
                                 })
                             }
@@ -1164,7 +1185,8 @@ mod tests {
             .state
             .lock()
             .put(Codec::RawBytes, vec![7u8; object_size])
-            .unwrap();
+            .unwrap()
+            .id;
         let reply = server
             .dispatch_once(&future_envelope(
                 server.cluster_id,

@@ -36,7 +36,7 @@ FAIL_FAST="${FAIL_FAST:-0}"
 CHAOS_EVERY_SEC="${CHAOS_EVERY_SEC:-60}"
 if [ "$SMOKE" = 1 ]; then
   DURATION_SEC="${DURATION_SEC:-60}"
-  SAMPLE_SEC="${SAMPLE_SEC:-10}"
+  SAMPLE_SEC=10   # override the 30s default above so smoke samples fast
   CHAOS_EVERY_SEC=20
 else
   DURATION_SEC="${DURATION_SEC:-$((36 * 3600))}"

@@ -32,7 +32,7 @@ const RETRY_BACKOFF_CAP_MS: u64 = 30_000;
 /// cannot grow the task table to MAX_TASKS and wedge new submits. Well above any
 /// reasonable result-fetch window — a client that wants its output must Get it
 /// within this window. NOT distributed refcounting (a non-goal): a single-node
-/// retention timer, same shape as the lease / replay / arena reservation TTLs.
+/// retention timer, tick-driven like the lease reaper.
 const TERMINAL_TASK_TTL_MS: u64 = 600_000; // 10 min
 
 /// Backoff for the `attempt`-th failure (attempts already made): 1→100ms,
@@ -85,18 +85,6 @@ impl TaskState {
     }
 }
 
-/// What `fail()` did with a worker's failure report, so the IO-capable caller
-/// can log it without re-inspecting state.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum FailOutcome {
-    /// Transient failure with attempts left: re-queued with backoff.
-    Retried,
-    /// Permanent, or attempts exhausted: terminal Failed.
-    Failed,
-    /// Duplicate report for an already-terminal task; nothing changed.
-    Duplicate,
-}
-
 /// Per-worker tally from a lease-expiry sweep, so the reaper can log a
 /// `crayon.worker_dead` line without re-scanning the task/object tables.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -106,6 +94,14 @@ pub struct WorkerExpiry {
     pub failed: u32,
     pub cancelled: u32,
     pub objects_lost: u32,
+}
+
+/// Result of admitting a client-put inline object. Carries the stored `Arc` and
+/// content checksum so the caller reuses them instead of re-hashing/re-cloning.
+pub struct PutOutcome {
+    pub id: ObjectId,
+    pub checksum: [u8; 32],
+    pub stored: Arc<[u8]>,
 }
 
 /// Aggregate cluster counts for the periodic `crayon.health` log line.
@@ -339,11 +335,20 @@ impl CoordinatorState {
             .lease_deadline_ms = now.saturating_add(lease_ms);
         Ok(())
     }
-    pub fn put(&mut self, codec: Codec, bytes: Vec<u8>) -> Result<ObjectId, Error> {
+    /// Admits a client-put inline object, returning its id, content checksum,
+    /// and the stored `Arc` so the caller can reuse both without re-hashing or
+    /// re-cloning the payload.
+    pub fn put(&mut self, codec: Codec, bytes: Vec<u8>) -> Result<PutOutcome, Error> {
         let checksum = crate::cluster::checksum(&bytes);
         let id = ObjectId::from_checksum(checksum);
         let size_bytes = bytes.len() as u64;
-        self.admit_object(id, codec, size_bytes, checksum, Some(bytes.into()))
+        let stored: Arc<[u8]> = bytes.into();
+        self.admit_object(id, codec, size_bytes, checksum, Some(stored.clone()))?;
+        Ok(PutOutcome {
+            id,
+            checksum,
+            stored,
+        })
     }
     /// Registers a client-put object whose bytes live in the shared-memory
     /// arena: the record carries metadata only, and readers are handed an
@@ -724,6 +729,9 @@ impl CoordinatorState {
         self.changed();
         Ok(())
     }
+    /// Records a worker's failure report. Returns `true` if this made the task
+    /// permanently `Failed` (the caller logs a `crayon.task_failed`); `false` if
+    /// it was retried, or was a duplicate report for an already-terminal task.
     pub fn fail(
         &mut self,
         identity: &WorkerIdentity,
@@ -731,7 +739,7 @@ impl CoordinatorState {
         message: String,
         class: FailureClass,
         now: u64,
-    ) -> Result<FailOutcome, Error> {
+    ) -> Result<bool, Error> {
         // Idempotent: a duplicate failure report for an already-terminal task
         // is accepted so workers can safely retry reports. Look up first so an
         // unknown task_id yields TaskNotFound instead of panicking on index.
@@ -739,11 +747,8 @@ impl CoordinatorState {
             .tasks
             .get(&fence.task_id)
             .ok_or(Error::TaskNotFound(fence.task_id))?;
-        if matches!(
-            task.state,
-            TaskState::Failed(_) | TaskState::Cancelled | TaskState::Succeeded
-        ) {
-            return Ok(FailOutcome::Duplicate);
+        if task.state.is_terminal() {
+            return Ok(false);
         }
         self.check_fence(identity, fence)?;
         if !matches!(
@@ -764,21 +769,21 @@ impl CoordinatorState {
         let output = self.tasks[&fence.task_id].output;
         self.release(identity.node_id, &resources)?;
         self.tasks.get_mut(&fence.task_id).unwrap().assigned = None;
-        let outcome = if retry {
+        let permanently_failed = if retry {
             self.mark_runnable(fence.task_id);
             self.tasks.get_mut(&fence.task_id).unwrap().not_before_ms =
                 now.saturating_add(retry_backoff_ms(attempt));
             self.retries_total += 1;
-            FailOutcome::Retried
+            false
         } else {
             self.tasks.get_mut(&fence.task_id).unwrap().state = TaskState::Failed(message);
             self.objects.get_mut(&output).unwrap().state = ObjectState::Failed;
             self.reconcile_dependencies();
             self.failures_total += 1;
-            FailOutcome::Failed
+            true
         };
         self.changed();
-        Ok(outcome)
+        Ok(permanently_failed)
     }
     pub fn expire_workers(&mut self, now: u64) -> Result<Vec<WorkerExpiry>, Error> {
         let expired: Vec<_> = self
@@ -857,38 +862,40 @@ impl CoordinatorState {
     /// `release_object` path a client Release uses) once it has been terminal for
     /// `TERMINAL_TASK_TTL_MS` and its output is no longer referenced by a live
     /// task. Returns how many records were reclaimed. Driven from the reaper tick;
-    /// bounded by the task table size.
-    /// ponytail: the due-scan calls object_in_use (O(tasks)) per terminal task,
-    /// so worst case is O(tasks²) at the reaper cadence — fine because the reclaim
-    /// keeps the table small; add an output→consumers index if a deep DAG ever
-    /// makes it hot.
+    /// O(tasks) — one pass to stamp, one to collect the still-referenced outputs,
+    /// one to collect the due ones.
     pub fn reap_terminal_tasks(&mut self, now: u64) -> usize {
-        // Stamp newly-terminal tasks; collect those past the TTL whose output is
-        // free to release. A dependent still holding the output blocks reclaim
-        // until it too goes terminal — exactly the client-Release precondition.
-        let mut due: Vec<ObjectId> = Vec::new();
+        // Stamp newly-terminal tasks and, in the same pass, gather the outputs any
+        // live (non-terminal) task still depends on — a referenced output blocks
+        // reclaim of its producer, exactly the client-Release precondition.
+        let mut referenced: HashSet<ObjectId> = HashSet::new();
         for task in self.tasks.values_mut() {
             if task.state.is_terminal() {
                 if task.terminal_since_ms == 0 {
                     task.terminal_since_ms = now;
                 }
             } else {
-                task.terminal_since_ms = 0; // defensive: a re-queued task is not terminal
+                for arg in &task.args {
+                    if let TaskArg::Object(oid) = arg {
+                        referenced.insert(*oid);
+                    }
+                }
             }
         }
-        for task in self.tasks.values() {
-            if task.state.is_terminal()
-                && now.saturating_sub(task.terminal_since_ms) >= TERMINAL_TASK_TTL_MS
-                && !self.object_in_use(&task.output)
-            {
-                due.push(task.output);
-            }
-        }
-        // release_object removes the object and retains-out its producing task,
-        // and is a no-op if the object is already gone (client raced us).
+        let due: Vec<ObjectId> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.state.is_terminal()
+                    && now.saturating_sub(task.terminal_since_ms) >= TERMINAL_TASK_TTL_MS
+                    && !referenced.contains(&task.output)
+            })
+            .map(|task| task.output)
+            .collect();
+        // release_object removes the object and retains-out its producing task.
         let mut reclaimed = 0;
         for output in due {
-            if self.release_object(output).is_ok() && !self.objects.contains_key(&output) {
+            if self.release_object(output).is_ok() {
                 reclaimed += 1;
             }
         }
@@ -1608,7 +1615,7 @@ mod tests {
             )
             .unwrap();
         // First retry (attempt 1) backs off base = 100ms → due at 1100.
-        assert_eq!(outcome, FailOutcome::Retried);
+        assert!(!outcome); // retried, not permanently failed
         assert_eq!(state.tasks[&task].state, TaskState::Runnable);
         assert_eq!(state.tasks[&task].not_before_ms, 1_100);
         // Not yet due: assign_next skips it and returns nothing.
@@ -1668,7 +1675,7 @@ mod tests {
                 500,
             )
             .unwrap();
-        assert_eq!(outcome, FailOutcome::Failed);
+        assert!(outcome); // permanently failed
         assert_eq!(state.tasks[&task].not_before_ms, 0);
     }
 
