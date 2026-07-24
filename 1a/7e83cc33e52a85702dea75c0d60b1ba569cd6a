@@ -1,0 +1,27 @@
+src/arena.rs
+  s_e5fe4a420b3cd8::t_a594ea0b8dc3e8 281-324,518-553
+src/client.rs
+  s_e5fe4a420b3cd8::t_87c66b2b91088d 15,99-104,117-159,436-443,467-498
+src/cluster.rs
+  s_e5fe4a420b3cd8::t_4e924b40825f54 736-763,813
+src/protocol.rs
+  s_e5fe4a420b3cd8::t_1e18c0a2234c59 21-27,196-212,306-309
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1a7e83cc33e52a85702dea75c0d60b1ba569cd6a",
+  "prompts": {},
+  "sessions": {
+    "s_e5fe4a420b3cd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b7526072-49d4-4cf6-958c-965b8c6edfd9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
