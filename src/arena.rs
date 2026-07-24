@@ -21,6 +21,7 @@ use std::{
     collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use memmap2::MmapMut;
@@ -32,6 +33,17 @@ use crate::{ids::ObjectId, operation::Codec};
 /// Sparse virtual size of the arena. mmap reserves the range; pages are backed
 /// only when written, so this is address space, not committed memory.
 const ARENA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// A reservation the client never committed (crash / lost RPC between
+/// `reserve` and `commit`) is reaped after this long, so its slot cannot leak
+/// forever and wedge the large-object put path. Well above any real write.
+const RESERVE_TTL: Duration = Duration::from_secs(60);
+
+/// A released slot's offset is quarantined this long before returning to the
+/// free list, so an in-flight zero-copy reader that already resolved the offset
+/// finishes its memcpy before a re-reserve can overwrite the bytes. Well above
+/// any same-host read.
+const RELEASE_GRACE: Duration = Duration::from_secs(5);
 
 /// Where a reader finds an object: which arena, and at what offset. Size and
 /// checksum travel in the surrounding `ObjectPayload`.
@@ -49,6 +61,9 @@ struct Entry {
     codec: Codec,
     checksum: [u8; 32],
     committed: bool,
+    /// When the slot was reserved; an uncommitted entry past `RESERVE_TTL` is a
+    /// crashed writer and gets reaped. `None` once committed (never expires).
+    reserved_at: Option<Instant>,
 }
 
 /// Metadata a get reply needs for a committed arena object.
@@ -67,6 +82,39 @@ struct Alloc {
     /// compact later if it ever matters.
     free: HashMap<u64, Vec<u64>>,
     live: HashMap<ObjectId, Entry>,
+    /// Released `(slot, offset)` held back until `RELEASE_GRACE` elapses, so a
+    /// reader mid-copy is not overwritten by a re-reserve of the same slot.
+    quarantine: Vec<(Instant, u64, u64)>,
+}
+
+impl Alloc {
+    /// Returns crashed uncommitted reservations and grace-expired releases to
+    /// the free list. Driven lazily from `reserve`/`release`; no background
+    /// thread. O(live + quarantine), both bounded by in-flight object count.
+    fn reap(&mut self, now: Instant) {
+        let expired: Vec<ObjectId> = self
+            .live
+            .iter()
+            .filter(|(_, e)| {
+                e.reserved_at
+                    .is_some_and(|t| now.duration_since(t) >= RESERVE_TTL)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(e) = self.live.remove(&id) {
+                self.free.entry(e.slot).or_default().push(e.offset);
+            }
+        }
+        self.quarantine.retain(|(at, slot, offset)| {
+            if now.duration_since(*at) >= RELEASE_GRACE {
+                self.free.entry(*slot).or_default().push(*offset);
+                false
+            } else {
+                true
+            }
+        });
+    }
 }
 
 /// Writer/owner side: the arena file, its read-write mapping, and the allocator.
@@ -103,6 +151,7 @@ impl ArenaStore {
                 top: 0,
                 free: HashMap::new(),
                 live: HashMap::new(),
+                quarantine: Vec::new(),
             }),
             path,
         })
@@ -125,6 +174,7 @@ impl ArenaStore {
     ) -> Option<(u64, bool)> {
         let slot = size.max(1).div_ceil(8) * 8; // 8-byte aligned exact size
         let mut a = self.alloc.lock();
+        a.reap(Instant::now());
         if let Some(entry) = a.live.get(&id) {
             return Some((entry.offset, entry.committed));
         }
@@ -149,6 +199,7 @@ impl ArenaStore {
                 codec,
                 checksum,
                 committed: false,
+                reserved_at: Some(Instant::now()),
             },
         );
         Some((offset, false))
@@ -158,6 +209,7 @@ impl ArenaStore {
     pub fn commit(&self, id: ObjectId) {
         if let Some(entry) = self.alloc.lock().live.get_mut(&id) {
             entry.committed = true;
+            entry.reserved_at = None; // committed objects never expire
         }
     }
 
@@ -213,12 +265,24 @@ impl ArenaStore {
         Some(slice.to_vec())
     }
 
-    /// Recycles an object's slot back into its exact-size free list.
+    /// Retires an object's slot. The offset is quarantined for `RELEASE_GRACE`
+    /// before returning to the free list, so a zero-copy reader that already
+    /// resolved this offset finishes its copy before a re-reserve can overwrite
+    /// it. `reap` (driven from `reserve`) does the deferred return.
     pub fn release(&self, id: ObjectId) {
         let mut a = self.alloc.lock();
+        let now = Instant::now();
         if let Some(entry) = a.live.remove(&id) {
-            a.free.entry(entry.slot).or_default().push(entry.offset);
+            a.quarantine.push((now, entry.slot, entry.offset));
         }
+        a.reap(now);
+    }
+
+    /// Test hook: drive the lazy reaper as if `d` had elapsed, without sleeping.
+    #[cfg(test)]
+    fn reap_after(&self, d: Duration) {
+        let mut a = self.alloc.lock();
+        a.reap(Instant::now() + d);
     }
 }
 
@@ -349,15 +413,49 @@ mod tests {
 
         store.release(id);
         assert!(store.meta(id).is_none());
+        // Slot is quarantined, not yet reusable: a same-size reserve bumps `top`
+        // to a fresh offset rather than handing back the in-flight one.
         let id2 = ObjectId::new();
-        // Same exact size recycles the same slot.
-        assert_eq!(
+        assert_ne!(
             store
                 .reserve(id2, payload.len() as u64, Codec::RawBytes, checksum)
                 .unwrap()
                 .0,
             offset
         );
+        // After the grace window the quarantined slot recycles to its offset.
+        store.reap_after(RELEASE_GRACE);
+        let id3 = ObjectId::new();
+        assert_eq!(
+            store
+                .reserve(id3, payload.len() as u64, Codec::RawBytes, checksum)
+                .unwrap()
+                .0,
+            offset
+        );
         assert!(map_arena("deadbeef").is_none());
+    }
+
+    #[test]
+    fn uncommitted_reservation_is_reaped_after_ttl() {
+        let store = ArenaStore::new().unwrap();
+        let id = ObjectId::new();
+        let (offset, _) = store.reserve(id, 4096, Codec::RawBytes, [0; 32]).unwrap();
+        // Client crashes before commit: never readable, and the slot must not
+        // leak. After the TTL its offset returns to the free list.
+        assert!(store.meta(id).is_none());
+        store.reap_after(RESERVE_TTL);
+        let id2 = ObjectId::new();
+        assert_eq!(
+            store
+                .reserve(id2, 4096, Codec::RawBytes, [0; 32])
+                .unwrap()
+                .0,
+            offset
+        );
+        // A committed reservation is never reaped as stale.
+        store.commit(id2);
+        store.reap_after(RESERVE_TTL);
+        assert!(store.meta(id2).is_some());
     }
 }
