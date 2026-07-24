@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.6.0
+
+Cross-host and hot-path release: large objects now cross host boundaries via
+chunked streaming, the dispatch hot path sheds redundant copies and an O(n) scan,
+and a first-K-ready fetch primitive lands. Wire protocol major 4 → 7 (chunk
+variants, `GetBatch.min_ready`, and the failure-class/drain work from the 0.5.x
+line all shift request/reply encodings); deploy all components at the same major.
+
+### Features
+
+- **Cross-host chunked streaming.** A `>8 MiB` object crossing a host boundary
+  was a hard failure (the RPC frame caps a single object at ~8 MiB, and only the
+  same-host arena could exceed it). New `PutChunk`/`GetChunk` stream such objects
+  as frame-sized chunks the coordinator writes into / reads out of its arena, so
+  a cross-host client can now put and get multi-hundred-MiB objects. Measured
+  cross-host (RTT 0.66 ms): 256 MiB round-trips at ~200 MB/s put, ~247 MB/s get.
+  Chunk ranges are bounds-checked server-side; the whole object is checksum-
+  verified after reassembly (no per-chunk hashing). Same-host puts still use the
+  zero-copy arena path unchanged.
+- **First-K-ready fetch (`ray.wait`).** `ClusterClient::wait` (and Python
+  `Client.wait`) return as soon as at least `min_ready` of N objects resolve,
+  instead of blocking on the slowest. The enabling primitive for pipelined /
+  off-policy RL loops; `results` / `get_many` keep the all-or-nothing semantics.
+- **Server-side terminal-task reclaim.** A fire-and-forget or crashed client that
+  never calls `Release` can no longer wedge new submits: terminal task records are
+  reclaimed after a TTL backstop, bounded independently of client behavior.
+
+### Performance
+
+- **~2× cross-host put throughput.** The TCP put path dropped three redundant
+  full-payload passes — a re-hash, a re-clone into the arena, and echoing the
+  whole payload back in the reply the caller discarded. Measured cross-host:
+  ~80 → ~170 MB/s put. Same-host arena put also gains (~970 → ~1440 MB/s) from
+  the dropped re-hash.
+- **O(1) replay-cache dispatch.** Every mutation ran two O(n ≤ 16384) scans under
+  the coordinator lock (a full expiry sweep and a byte-total sum); both are gone —
+  a running byte counter and lazy expiry make the common path a single map op.
+
+### Fixes
+
+- Two arena slot-lifecycle bugs on the same-host large-object path (a crashed
+  writer's reservation could leak; a released slot could be recycled under an
+  in-flight reader) — now reaped after a TTL / held through a release grace.
+- Retry backoff (exponential, capped) so a transient fault outlasting the instant
+  retry burst does not exhaust `max_attempts`.
+
+### Internal
+
+- `coordinator.rs` / `cluster.rs` carry a contract-first `//!` header and moved
+  their test modules out; the state machine stays one aggregate (measured: the
+  global lock is not the dispatch bottleneck — avg hold 2.2 µs).
+- `storage-benchmark --coordinator <addr>` benchmarks an external coordinator for
+  real cross-host measurement.
+
 ## 0.5.0
 
 Data-plane and RL-pipeline release: a shared-memory object arena lifts the object

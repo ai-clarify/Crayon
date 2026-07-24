@@ -63,7 +63,7 @@ no data loss and no overhead where the model dominates.
 ## Install
 
 ```bash
-cargo install crayon-rs --version 0.5.0   # library `crayon`, binary `crayon-cluster`
+cargo install crayon-rs --version 0.6.0   # library `crayon`, binary `crayon-cluster`
 ```
 
 Python client (pyo3, arena-aware — gigabyte puts from Python):
