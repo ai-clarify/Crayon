@@ -278,6 +278,50 @@ impl ArenaStore {
         Some(slice.to_vec())
     }
 
+    /// Writes a byte range into a *reserved* (not yet committed) object's slot,
+    /// for a cross-host client streaming a large put in chunks. `rel_offset` is
+    /// relative to the object's start. Unlike `write_at`, the range is untrusted
+    /// (it came off the wire), so it is bounds-checked against the reserved size;
+    /// out-of-range or already-committed writes return `false` and copy nothing.
+    pub fn write_chunk(&self, id: ObjectId, rel_offset: u64, bytes: &[u8]) -> bool {
+        let base = {
+            let a = self.alloc.lock();
+            let e = match a.live.get(&id) {
+                Some(e) if !e.committed => e,
+                _ => return false,
+            };
+            match rel_offset.checked_add(bytes.len() as u64) {
+                Some(end) if end <= e.size => e.offset + rel_offset,
+                _ => return false,
+            }
+        };
+        self.write_at(base, bytes);
+        true
+    }
+
+    /// Reads a byte range out of a committed object, for a cross-host client
+    /// streaming a large get in chunks. The range is untrusted, so it is
+    /// bounds-checked against the object size; out-of-range or uncommitted reads
+    /// return `None`. The caller verifies the whole-object checksum after
+    /// reassembly, so no per-chunk hashing here.
+    pub fn read_chunk(&self, id: ObjectId, rel_offset: u64, len: u64) -> Option<Vec<u8>> {
+        let base = {
+            let a = self.alloc.lock();
+            let e = a.live.get(&id)?;
+            if !e.committed {
+                return None;
+            }
+            match rel_offset.checked_add(len) {
+                Some(end) if end <= e.size => e.offset + rel_offset,
+                _ => return None,
+            }
+        };
+        // SAFETY: committed region within bounds checked above; immutable until release.
+        let slice =
+            unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(base as usize), len as usize) };
+        Some(slice.to_vec())
+    }
+
     /// Retires an object's slot. The offset is quarantined for `RELEASE_GRACE`
     /// before returning to the free list, so a zero-copy reader that already
     /// resolved this offset finishes its copy before a re-reserve can overwrite
@@ -470,5 +514,41 @@ mod tests {
         store.commit(id2);
         store.reap_after(RESERVE_TTL);
         assert!(store.meta(id2).is_some());
+    }
+
+    #[test]
+    fn chunked_write_and_read_round_trip_with_bounds() {
+        let store = ArenaStore::new().unwrap();
+        let id = ObjectId::new();
+        // Object larger than one frame, written in three ranges.
+        let size = 20_000_000u64;
+        store
+            .reserve(id, size, Codec::RawBytes, [0; 32])
+            .unwrap();
+        let chunk = 8_000_000usize;
+        let mut expected = vec![0u8; size as usize];
+        for (i, off) in (0..size).step_by(chunk).enumerate() {
+            let len = chunk.min((size - off) as usize);
+            let data = vec![i as u8 + 1; len];
+            expected[off as usize..off as usize + len].copy_from_slice(&data);
+            assert!(store.write_chunk(id, off, &data), "in-bounds write");
+        }
+        // Out-of-bounds write is rejected, copies nothing.
+        assert!(!store.write_chunk(id, size - 10, &[7u8; 100]));
+        // Cannot read chunks before commit.
+        assert!(store.read_chunk(id, 0, 10).is_none());
+        store.commit(id);
+
+        // Reassemble via read_chunk in a different stride; must match.
+        let mut got = Vec::with_capacity(size as usize);
+        let mut off = 0u64;
+        while off < size {
+            let len = (size - off).min(7_000_000);
+            got.extend_from_slice(&store.read_chunk(id, off, len).unwrap());
+            off += len;
+        }
+        assert_eq!(got, expected);
+        // Out-of-bounds read is rejected.
+        assert!(store.read_chunk(id, size - 5, 10).is_none());
     }
 }

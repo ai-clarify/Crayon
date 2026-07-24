@@ -12,7 +12,7 @@ use crate::{
     operation::{Codec, Operation, TaskArg},
     protocol::{
         ClientReply, ClientRequest, ObjectPayload, RpcReply, RpcRequest, SubmitSpec, TaskStatus,
-        TaskView, WorkerView,
+        TaskView, WorkerView, MAX_OBJECT_BYTES,
     },
     resources::ResourceSet,
 };
@@ -96,6 +96,12 @@ impl ClusterClient {
         if self.arena_writer.lock().is_some() {
             return self.put_arena(codec, bytes).await;
         }
+        // Cross-host and larger than one frame: stream it in chunks. A single
+        // Put frame is capped at MAX_OBJECT_BYTES, so this is the only way a
+        // >8 MiB object crosses a host boundary.
+        if bytes.len() > MAX_OBJECT_BYTES {
+            return self.put_chunked(codec, bytes).await;
+        }
         match self
             .rpc(ClientRequest::Put {
                 codec,
@@ -106,6 +112,49 @@ impl ClusterClient {
             ClientReply::Object(payload) => Ok(payload.id),
             ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected put reply".into())),
+        }
+    }
+    /// Cross-host large put: reserve an arena slot on the coordinator, stream the
+    /// payload as frame-sized `PutChunk`s over TCP, then commit. Mirrors
+    /// `put_arena` but the coordinator (not the client) writes into the arena,
+    /// since a cross-host client cannot map it. `>=1 MiB` puts are unhashed
+    /// (random id, all-zero checksum), matching the same-host path.
+    async fn put_chunked(&self, codec: Codec, bytes: &[u8]) -> Result<ObjectId, Error> {
+        let id = ObjectId::new();
+        let reply = self
+            .rpc(ClientRequest::ArenaReserve {
+                id,
+                codec,
+                size_bytes: bytes.len() as u64,
+                checksum: [0u8; 32], // unhashed: large objects skip the pass
+            })
+            .await?;
+        let id = match reply {
+            // Content already stored (dedup): nothing to stream.
+            ClientReply::Object(payload) => return Ok(payload.id),
+            ClientReply::ArenaReserved { id, .. } => id,
+            ClientReply::Error(error) => return Err(error),
+            _ => return Err(Error::Protocol("unexpected reserve reply".into())),
+        };
+        for (i, chunk) in bytes.chunks(MAX_OBJECT_BYTES).enumerate() {
+            let offset = (i * MAX_OBJECT_BYTES) as u64;
+            match self
+                .rpc(ClientRequest::PutChunk {
+                    id,
+                    offset,
+                    bytes: chunk.to_vec(),
+                })
+                .await?
+            {
+                ClientReply::ChunkWritten => {}
+                ClientReply::Error(error) => return Err(error),
+                _ => return Err(Error::Protocol("unexpected put chunk reply".into())),
+            }
+        }
+        match self.rpc(ClientRequest::ArenaCommit(id)).await? {
+            ClientReply::Object(payload) => Ok(payload.id),
+            ClientReply::Error(error) => Err(error),
+            _ => Err(Error::Protocol("unexpected commit reply".into())),
         }
     }
     /// Same-host put: reserve an arena slot, write the bytes into shared memory
@@ -384,6 +433,14 @@ impl ClusterClient {
         } else {
             location
         };
+        // Larger than one frame: stream it in chunks. Only arena objects can
+        // exceed MAX_OBJECT_BYTES (worker outputs are capped at admission), and
+        // GetLocal would reject them, so this is the only cross-host large-get path.
+        if arena.is_some() && size_bytes > MAX_OBJECT_BYTES as u64 {
+            let bytes = self.get_chunked(id, size_bytes, &source).await?;
+            verify_object(id, id, &bytes, checksum, size_bytes)?;
+            return Ok((codec, bytes));
+        }
         let reply = request(
             &source,
             &envelope(
@@ -406,6 +463,38 @@ impl ClusterClient {
             }
             _ => Err(Error::ObjectConflict(id)),
         }
+    }
+    /// Cross-host large get: pull a committed arena object as frame-sized
+    /// `GetChunk`s from `source` and reassemble. The caller verifies the
+    /// whole-object checksum, so no per-chunk hashing here.
+    async fn get_chunked(
+        &self,
+        id: ObjectId,
+        size_bytes: u64,
+        source: &str,
+    ) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::with_capacity(size_bytes as usize);
+        let mut offset = 0u64;
+        while offset < size_bytes {
+            let len = (size_bytes - offset).min(MAX_OBJECT_BYTES as u64);
+            let reply = request(
+                source,
+                &envelope(
+                    self.cluster_id,
+                    RpcRequest::Client(ClientRequest::GetChunk { id, offset, len }),
+                ),
+            )
+            .await?;
+            match reply {
+                RpcReply::Client(ClientReply::Chunk(bytes)) if bytes.len() as u64 == len => {
+                    out.extend_from_slice(&bytes);
+                    offset += len;
+                }
+                RpcReply::Client(ClientReply::Error(error)) => return Err(error),
+                _ => return Err(Error::ObjectConflict(id)),
+            }
+        }
+        Ok(out)
     }
 
     pub async fn get<T: DeserializeOwned>(&self, reference: &ObjectRef<T>) -> Result<T, Error> {

@@ -733,6 +733,34 @@ impl CoordinatorServer {
                         None => ClientReply::Error(Error::ObjectNotFound(id)),
                     }
                 }
+                ClientRequest::PutChunk { id, offset, bytes } => {
+                    // Cross-host chunked put: write one range into the reserved
+                    // slot. Idempotent by (id, offset) — rewriting a range is
+                    // safe, so this is a mutation but not replay-cached (a MiB
+                    // chunk reply would blow the replay byte budget).
+                    if self.arena.write_chunk(id, offset, &bytes) {
+                        ClientReply::ChunkWritten
+                    } else {
+                        ClientReply::Error(Error::Protocol(
+                            "put chunk out of bounds or object not reserved".into(),
+                        ))
+                    }
+                }
+                ClientRequest::GetChunk { id, offset, len } => {
+                    // Cross-host chunked get: serve one range of a committed
+                    // object. Frame-bounded per chunk; the client reassembles
+                    // and verifies the whole-object checksum.
+                    if len > MAX_OBJECT_BYTES as u64 {
+                        ClientReply::Error(Error::Protocol("get chunk too large".into()))
+                    } else {
+                        match self.arena.read_chunk(id, offset, len) {
+                            Some(bytes) => ClientReply::Chunk(bytes),
+                            None => ClientReply::Error(Error::Protocol(
+                                "get chunk out of bounds or object not committed".into(),
+                            )),
+                        }
+                    }
+                }
                 ClientRequest::Workers => {
                     let state = self.state.lock();
                     ClientReply::Workers(
@@ -782,6 +810,7 @@ fn is_mutation(request: &RpcRequest) -> bool {
             ClientRequest::Put { .. }
                 | ClientRequest::ArenaReserve { .. }
                 | ClientRequest::ArenaCommit(_)
+                | ClientRequest::PutChunk { .. }
                 | ClientRequest::Submit { .. }
                 | ClientRequest::SubmitBatch(_)
                 | ClientRequest::Cancel(_)

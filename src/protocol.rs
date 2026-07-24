@@ -18,11 +18,13 @@ impl fmt::Display for TaskStatus {
 }
 
 pub const MAGIC: [u8; 4] = *b"CRYN";
-// Bumped to 4 in 0.5.0: the shared-memory arena added `ArenaReserve`/`ArenaCommit`
-// (and connection pooling changed the transport), shifting request variant indices
-// — wire-incompatible with 3. Deploy all components at the same major.
-// (3 in 0.4.0: `Failed` swapped `retryable: bool` for a `FailureClass` enum.)
-pub const PROTOCOL_MAJOR: u16 = 6;
+// Bumped to 7: `PutChunk`/`GetChunk` added for cross-host chunked streaming of
+// >8 MiB arena objects, shifting request/reply variant indices — wire-incompatible
+// with 6. Deploy all components at the same major.
+// (6 added `GetBatch.min_ready` for first-K-ready. 5/0.5.0 added the arena's
+// `ArenaReserve`/`ArenaCommit`. 3/0.4.0: `Failed` swapped `retryable: bool` for
+// a `FailureClass` enum.)
+pub const PROTOCOL_MAJOR: u16 = 7;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OBJECT_BYTES: usize = MAX_FRAME_BYTES - 64 * 1024;
@@ -191,6 +193,23 @@ pub enum ClientRequest {
         checksum: [u8; 32],
     },
     ArenaCommit(ObjectId),
+    /// Write a byte range of a reserved arena object over TCP, for a cross-host
+    /// client that cannot mmap the arena. Sits between `ArenaReserve` and
+    /// `ArenaCommit`: the coordinator copies `bytes` into the slot at `offset`.
+    /// Each chunk is one frame, so a multi-GiB object crosses as many chunks.
+    PutChunk {
+        id: ObjectId,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    /// Read a byte range of a committed object, for a cross-host client that
+    /// cannot mmap the arena. The whole-object checksum is verified by the
+    /// client after reassembly; per-chunk fetches are stateless (id+offset+len).
+    GetChunk {
+        id: ObjectId,
+        offset: u64,
+        len: u64,
+    },
     Workers,
     Cancel(TaskId),
     Release(ObjectId),
@@ -284,6 +303,10 @@ pub enum ClientReply {
     Workers(Vec<WorkerView>),
     Cancelled,
     Released,
+    /// A byte range of a committed object, answering `GetChunk`.
+    Chunk(Vec<u8>),
+    /// Acks a `PutChunk`: the range was written into the reserved slot.
+    ChunkWritten,
     Error(Error),
 }
 /// Why a task attempt failed, so the coordinator owns the retry decision instead
