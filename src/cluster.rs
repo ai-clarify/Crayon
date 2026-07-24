@@ -147,11 +147,15 @@ impl CoordinatorServer {
             loop {
                 interval.tick().await;
                 let now = now_ms();
-                let (expired, (assigns, owned, hits), health) = {
+                let (expired, reclaimed, (assigns, owned, hits), health) = {
                     let mut state = reaper.state.lock();
                     let expired = state.expire_workers(now);
+                    // Backstop for terminal tasks a client never Released; keeps
+                    // the task table from growing to MAX_TASKS under fire-and-forget.
+                    let reclaimed = state.reap_terminal_tasks(now);
                     (
                         expired,
+                        reclaimed,
                         (
                             state.sched_assigns,
                             state.sched_owned_input,
@@ -160,6 +164,9 @@ impl CoordinatorServer {
                         state.health_counts(),
                     )
                 };
+                if reclaimed > 0 {
+                    eprintln!("crayon.reclaim terminal_tasks={reclaimed}");
+                }
                 // Locality measurement (evolution-plan gap 3), logged here so the
                 // state machine stays IO-free and no lock is held while printing.
                 if assigns - locality_logged >= 1024 {

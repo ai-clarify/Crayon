@@ -26,6 +26,15 @@ pub const MAX_OBJECTS: usize = 65_536;
 const RETRY_BACKOFF_BASE_MS: u64 = 100;
 const RETRY_BACKOFF_CAP_MS: u64 = 30_000;
 
+/// How long a terminal task's record and output are retained before the server
+/// reclaims them, if the client never calls Release. Client-driven Release stays
+/// the fast path; this is the backstop so a fire-and-forget or crashed client
+/// cannot grow the task table to MAX_TASKS and wedge new submits. Well above any
+/// reasonable result-fetch window — a client that wants its output must Get it
+/// within this window. NOT distributed refcounting (a non-goal): a single-node
+/// retention timer, same shape as the lease / replay / arena reservation TTLs.
+const TERMINAL_TASK_TTL_MS: u64 = 600_000; // 10 min
+
 /// Backoff for the `attempt`-th failure (attempts already made): 1→100ms,
 /// 2→200ms, 3→400ms, … capped. The shift is guarded so a runaway attempt count
 /// cannot overflow.
@@ -66,6 +75,13 @@ impl From<&TaskState> for TaskStatus {
             TaskState::Failed(message) => Self::Failed(message.clone()),
             TaskState::Cancelled => Self::Cancelled,
         }
+    }
+}
+impl TaskState {
+    /// Terminal states never transition again; their output is releasable and
+    /// the record is reclaimable once no live task references the output.
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed(_) | Self::Cancelled)
     }
 }
 
@@ -144,6 +160,10 @@ pub struct TaskRecord {
     /// 0 = immediately runnable. Real state (a retried task keeps its deadline
     /// across a durability snapshot), so not `#[serde(skip)]`.
     pub not_before_ms: u64,
+    /// Wall-clock (ms) the task first became terminal, stamped lazily by the
+    /// reaper; 0 while non-terminal. Drives server-side reclaim after
+    /// `TERMINAL_TASK_TTL_MS` when the client never Releases.
+    pub terminal_since_ms: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectRecord {
@@ -484,6 +504,7 @@ impl CoordinatorState {
                 },
                 assigned: None,
                 not_before_ms: 0,
+                terminal_since_ms: 0,
             },
         );
         if waiting {
@@ -831,6 +852,48 @@ impl CoordinatorState {
         }
         Ok(report)
     }
+    /// Server-side backstop for terminal tasks the client never Releases: stamp
+    /// each terminal task's first-seen time lazily, then reclaim (via the same
+    /// `release_object` path a client Release uses) once it has been terminal for
+    /// `TERMINAL_TASK_TTL_MS` and its output is no longer referenced by a live
+    /// task. Returns how many records were reclaimed. Driven from the reaper tick;
+    /// bounded by the task table size.
+    /// ponytail: the due-scan calls object_in_use (O(tasks)) per terminal task,
+    /// so worst case is O(tasks²) at the reaper cadence — fine because the reclaim
+    /// keeps the table small; add an output→consumers index if a deep DAG ever
+    /// makes it hot.
+    pub fn reap_terminal_tasks(&mut self, now: u64) -> usize {
+        // Stamp newly-terminal tasks; collect those past the TTL whose output is
+        // free to release. A dependent still holding the output blocks reclaim
+        // until it too goes terminal — exactly the client-Release precondition.
+        let mut due: Vec<ObjectId> = Vec::new();
+        for task in self.tasks.values_mut() {
+            if task.state.is_terminal() {
+                if task.terminal_since_ms == 0 {
+                    task.terminal_since_ms = now;
+                }
+            } else {
+                task.terminal_since_ms = 0; // defensive: a re-queued task is not terminal
+            }
+        }
+        for task in self.tasks.values() {
+            if task.state.is_terminal()
+                && now.saturating_sub(task.terminal_since_ms) >= TERMINAL_TASK_TTL_MS
+                && !self.object_in_use(&task.output)
+            {
+                due.push(task.output);
+            }
+        }
+        // release_object removes the object and retains-out its producing task,
+        // and is a no-op if the object is already gone (client raced us).
+        let mut reclaimed = 0;
+        for output in due {
+            if self.release_object(output).is_ok() && !self.objects.contains_key(&output) {
+                reclaimed += 1;
+            }
+        }
+        reclaimed
+    }
     /// One pass over the task/object tables for the periodic health log. Bounded
     /// by MAX_TASKS/MAX_OBJECTS; called at the reaper's ~30s cadence, not a hot
     /// path — cheaper than maintaining per-state live counters.
@@ -918,12 +981,11 @@ impl CoordinatorState {
     }
     pub fn cancel(&mut self, id: TaskId) -> Result<(), Error> {
         let task = self.tasks.get(&id).ok_or(Error::TaskNotFound(id))?;
-        match task.state {
-            TaskState::Succeeded | TaskState::Failed(_) | TaskState::Cancelled => {
-                return Err(Error::IllegalTransition("task is already terminal".into()))
-            }
-            TaskState::CancelRequested => return Ok(()),
-            _ => {}
+        if task.state.is_terminal() {
+            return Err(Error::IllegalTransition("task is already terminal".into()));
+        }
+        if task.state == TaskState::CancelRequested {
+            return Ok(());
         }
         let output = task.output;
         if task.assigned.is_some() {
@@ -975,13 +1037,11 @@ impl CoordinatorState {
     }
     fn object_in_use(&self, id: &ObjectId) -> bool {
         self.tasks.values().any(|task| {
-            !matches!(
-                task.state,
-                TaskState::Succeeded | TaskState::Failed(_) | TaskState::Cancelled
-            ) && task.args.iter().any(|arg| match arg {
-                TaskArg::Object(dep) => dep == id,
-                _ => false,
-            })
+            !task.state.is_terminal()
+                && task.args.iter().any(|arg| match arg {
+                    TaskArg::Object(dep) => dep == id,
+                    _ => false,
+                })
         })
     }
     fn reconcile_dependencies(&mut self) {
@@ -1610,6 +1670,64 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, FailOutcome::Failed);
         assert_eq!(state.tasks[&task].not_before_ms, 0);
+    }
+
+    #[test]
+    fn terminal_task_is_reclaimed_after_ttl_without_client_release() {
+        // A fire-and-forget client never calls Release; the server backstop must
+        // reclaim the terminal task + output so the table cannot grow to MAX_TASKS.
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        let (task, output) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+            .unwrap();
+        let a = state.assign_next(identity.node_id, 0).unwrap().unwrap();
+        state.started(&identity, a.fence).unwrap();
+        state
+            .complete(&identity, completion(a.fence, output))
+            .unwrap();
+        assert_eq!(state.tasks[&task].state, TaskState::Succeeded);
+
+        // First reap stamps terminal_since; nothing is due yet.
+        assert_eq!(state.reap_terminal_tasks(1_000), 0);
+        assert!(state.tasks.contains_key(&task));
+        // Before the TTL: still retained.
+        assert_eq!(
+            state.reap_terminal_tasks(1_000 + TERMINAL_TASK_TTL_MS - 1),
+            0
+        );
+        assert!(state.tasks.contains_key(&task));
+        // At/after the TTL: reclaimed, output gone.
+        assert_eq!(state.reap_terminal_tasks(1_000 + TERMINAL_TASK_TTL_MS), 1);
+        assert!(!state.tasks.contains_key(&task));
+        assert!(!state.objects.contains_key(&output));
+    }
+
+    #[test]
+    fn reclaim_spares_a_terminal_output_a_live_task_still_needs() {
+        // A terminal producer whose output a still-pending consumer references
+        // must NOT be reclaimed — the same precondition client Release enforces.
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        let (producer, out) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+            .unwrap();
+        let a = state.assign_next(identity.node_id, 0).unwrap().unwrap();
+        state.started(&identity, a.fence).unwrap();
+        state.complete(&identity, completion(a.fence, out)).unwrap();
+        // Downstream consumer depends on the producer's output and is not terminal.
+        let (_consumer, _) = state
+            .submit(
+                descriptor().key.clone(),
+                vec![TaskArg::Object(out)],
+                ResourceSet::default(),
+                1,
+            )
+            .unwrap();
+        // Well past the TTL, the producer stays because its output is in use.
+        assert_eq!(state.reap_terminal_tasks(TERMINAL_TASK_TTL_MS * 2), 0);
+        assert!(state.tasks.contains_key(&producer));
+        assert!(state.objects.contains_key(&out));
     }
 
     #[test]

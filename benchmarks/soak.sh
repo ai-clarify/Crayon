@@ -138,9 +138,18 @@ for _ in $(seq "$WORKERS"); do start_worker; done
 wait_for 15 bash -c "test \"\$('$BIN' workers '$COORD_ADDR' | grep -c 127.0.0.1)\" -ge $WORKERS" \
   || log "warning: not all workers registered yet, continuing"
 
-# sustained scheduler load: cheap copy tasks, max_attempts 3 to exercise retry
-( n=0; while :; do
-    "$BIN" submit-detach "$COORD_ADDR" copy "$n" - 1.0 3 >/dev/null 2>&1
+# sustained scheduler load: cheap copy tasks, max_attempts 3 to exercise retry.
+# Mostly release the output (steady-state, the real-RL-client path — see
+# crayon_llm_rl.py) so the table stays bounded by client Release; leave ~1 in 10
+# unreleased to exercise the server-side terminal-task reclaim backstop too.
+( n=0; declare -a pend=(); while :; do
+    out="$("$BIN" submit-detach "$COORD_ADDR" copy "$n" - 1.0 3 2>/dev/null | awk '{print $2}')"
+    [ -n "$out" ] && pend+=("$out")
+    # Release the output submitted a few iterations ago (by now it has completed).
+    if [ "${#pend[@]}" -gt 5 ]; then
+      victim="${pend[0]}"; pend=("${pend[@]:1}")
+      [ $((n % 10)) -ne 0 ] && "$BIN" release "$COORD_ADDR" "$victim" >/dev/null 2>&1
+    fi
     n=$((n + 1)); sleep 0.05
   done ) &
 LOAD_PID="$!"
