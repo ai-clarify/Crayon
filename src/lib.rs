@@ -3,11 +3,11 @@
 //! Cluster tasks invoke versioned registered operations. Crayon does not ship
 //! Rust closures or Python callables across process boundaries.
 
+pub mod arena;
 pub mod client;
 pub mod cluster;
 pub mod coordinator;
 pub mod data_plane;
-pub mod arena;
 pub mod error;
 pub mod ids;
 pub mod operation;

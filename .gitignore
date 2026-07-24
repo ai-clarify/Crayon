@@ -6,3 +6,4 @@ __pycache__/
 artifacts/
 benchmark_artifacts/
 benchmark_rl_*.csv
+crayon-py/dist/

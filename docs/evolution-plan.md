@@ -189,8 +189,6 @@ is measurable, then consider a skip-counter — but only with data.
 
 | Gap | Priority | Effort | Status |
 |---|---|---|---|
-| 1. Worker failure classification | P1 | 0.5 day | Ready to implement |
-| 2. Worker SIGTERM drain | P0 | 1.5 days | Ready to implement |
-| 3. Locality measurement | P2 | 1 day | Measure first, code only if needed |
-
-Total: ~2 days of implementation + 1 day of measurement.
+| 1. Worker failure classification | P1 | 0.5 day | ✅ Done — `Error::failure_class()` (`error.rs`), used at both worker report sites |
+| 2. Worker SIGTERM drain | P0 | 1.5 days | ✅ Done — `WorkerRequest::Drain`, `WorkerState::Draining`, signal handler + grace; protocol major 4→5 |
+| 3. Locality measurement | P2 | 1 day | ✅ Measured — counters in `assign_next`, logged per 1024 assigns. Structural finding: `rl-benchmark` inputs are all `Inline` and the LLM pipeline's judge can never own its rollout input (role-partitioned workers), so the look-ahead never fires on current workloads. Left in place (bounded, cheap); revisit only if a workload with same-role task chains appears. |

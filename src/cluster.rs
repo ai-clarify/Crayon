@@ -378,6 +378,10 @@ impl CoordinatorServer {
                     Ok(()) => WorkerReply::Accepted,
                     Err(error) => WorkerReply::Error(error),
                 },
+                WorkerRequest::Drain(identity) => match self.state.lock().drain(&identity) {
+                    Ok(()) => WorkerReply::Accepted,
+                    Err(error) => WorkerReply::Error(error),
+                },
             }),
             RpcRequest::Client(request) => RpcReply::Client(match request {
                 ClientRequest::Connect => ClientReply::Connected {

@@ -13,7 +13,7 @@
 use std::time::Instant;
 
 use crayon::{
-    coordinator::{CoordinatorState, MAX_TASKS, TaskState},
+    coordinator::{CoordinatorState, TaskState, MAX_TASKS},
     ids::{CoordinatorEpoch, NodeId, WorkerEpoch},
     operation::{Codec, OperationDescriptor, OperationKey},
     protocol::{RegisterWorker, TaskCompletion, WorkerIdentity},
@@ -59,20 +59,10 @@ fn main() {
     let identity = worker(&mut state, 2, 2.0);
     // One task left in-flight (assigned + started), one still runnable.
     let (in_flight, output) = state
-        .submit(
-            op().key,
-            vec![],
-            ResourceSet::cpu_gpu(1.0, 0.0).unwrap(),
-            2,
-        )
+        .submit(op().key, vec![], ResourceSet::cpu_gpu(1.0, 0.0).unwrap(), 2)
         .unwrap();
     let (runnable, _) = state
-        .submit(
-            op().key,
-            vec![],
-            ResourceSet::cpu_gpu(1.0, 0.0).unwrap(),
-            2,
-        )
+        .submit(op().key, vec![], ResourceSet::cpu_gpu(1.0, 0.0).unwrap(), 2)
         .unwrap();
     let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
     state.started(&identity, assignment.fence).unwrap();
@@ -106,7 +96,9 @@ fn main() {
         location: "127.0.0.1:9000".into(),
         bytes: Some(vec![1].into()),
     };
-    recovered_a.complete(&identity, report).expect("fenced completion on recovered state");
+    recovered_a
+        .complete(&identity, report)
+        .expect("fenced completion on recovered state");
     assert_eq!(recovered_a.tasks[&in_flight].state, TaskState::Succeeded);
     assert_eq!(
         recovered_a.workers[&identity.node_id].free_slots,
@@ -128,7 +120,10 @@ fn main() {
     let (replayed, _) = fresh
         .submit(op().key, vec![], ResourceSet::cpu_gpu(1.0, 0.0).unwrap(), 2)
         .unwrap();
-    assert_ne!(replayed, in_flight, "replayed submit reproduced the same id");
+    assert_ne!(
+        replayed, in_flight,
+        "replayed submit reproduced the same id"
+    );
 
     // ---- Cost: snapshot size + serialize/deserialize latency at scale ----
     let count = std::env::args()
@@ -139,7 +134,8 @@ fn main() {
     let mut big = CoordinatorState::new(CoordinatorEpoch::new());
     let _ = worker(&mut big, 1_000_000, 1024.0);
     for _ in 0..count {
-        big.submit(op().key, vec![], ResourceSet::default(), 1).unwrap();
+        big.submit(op().key, vec![], ResourceSet::default(), 1)
+            .unwrap();
     }
     let t0 = Instant::now();
     let snap = snapshot(&big);
@@ -149,7 +145,9 @@ fn main() {
     let deserialize = t1.elapsed();
     assert_eq!(back.tasks.len(), big.tasks.len(), "round-trip lost tasks");
 
-    println!("recovery asserts: 4/4 passed (reconstruction, fencing, reconcile, snapshot-not-replay)");
+    println!(
+        "recovery asserts: 4/4 passed (reconstruction, fencing, reconcile, snapshot-not-replay)"
+    );
     println!(
         "cost @ {} tasks / {} objects: snapshot={:.2} MiB ({} B/task)  serialize={:?}  deserialize={:?}",
         big.tasks.len(),

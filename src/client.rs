@@ -137,9 +137,9 @@ impl ClusterClient {
             ClientReply::ArenaReserved { id, offset } => {
                 {
                     let mut writer = self.arena_writer.lock();
-                    let map = writer.as_mut().ok_or_else(|| {
-                        Error::Protocol("arena writer lost after reserve".into())
-                    })?;
+                    let map = writer
+                        .as_mut()
+                        .ok_or_else(|| Error::Protocol("arena writer lost after reserve".into()))?;
                     let start = offset as usize;
                     let end = start
                         .checked_add(bytes.len())

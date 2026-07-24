@@ -24,6 +24,11 @@ const OBJECT_CONNECTIONS: usize = 128;
 const WORKER_POLL_WAIT_MS: u64 = 2_000;
 /// Outputs at or below this ride inline in the completion; larger stay worker-local.
 const INLINE_RESULT_MAX_BYTES: usize = 64 * 1024;
+/// SIGTERM grace: an in-flight task gets this long (signal-relative) to finish
+/// and report; then the process exits without reporting and the lease reaper
+/// re-queues the task. Matches K8s' default 30s terminationGracePeriodSeconds
+/// with margin for the pod kill.
+const WORKER_DRAIN_GRACE_MS: u64 = 20_000;
 
 fn usage() -> ! {
     eprintln!("usage: crayon-cluster coordinator <addr> [lease-ms] | worker <coordinator> <advertise> [node-id] [cpu] [operations] | submit <coordinator> <a> <b> | submit-detach <coordinator> <operation> <value> [object-id] [cpu] [max-attempts] | status <coordinator> <task-id> | workers <coordinator> | cancel <coordinator> <task-id> | get <coordinator> <object-id> | release <coordinator> <object-id>");
@@ -188,9 +193,15 @@ fn last_integer(text: &str) -> Option<i64> {
     let text = text.replace(',', "");
     text.split(|c: char| !c.is_ascii_digit() && c != '-')
         .rfind(|s| s.chars().any(|c| c.is_ascii_digit()) && s.len() < 12)
-        .and_then(|s| s.trim_start_matches('-').parse::<i64>().ok().map(|n| {
-            if s.starts_with('-') { -n } else { n }
-        }))
+        .and_then(|s| {
+            s.trim_start_matches('-').parse::<i64>().ok().map(|n| {
+                if s.starts_with('-') {
+                    -n
+                } else {
+                    n
+                }
+            })
+        })
 }
 
 /// A resident `benchmarks/llm_sidecar.py` process, spoken to over
@@ -199,7 +210,10 @@ fn last_integer(text: &str) -> Option<i64> {
 #[derive(Default)]
 struct LlmSidecar {
     version: u64,
-    io: Option<(std::process::ChildStdin, std::io::BufReader<std::process::ChildStdout>)>,
+    io: Option<(
+        std::process::ChildStdin,
+        std::io::BufReader<std::process::ChildStdout>,
+    )>,
 }
 
 impl LlmSidecar {
@@ -236,10 +250,8 @@ impl LlmSidecar {
     }
 
     fn load(&mut self, version: u64, weights: &[u8]) -> Result<(), Error> {
-        let path = std::env::temp_dir().join(format!(
-            "crayon-llm-{}-{version}.pt",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("crayon-llm-{}-{version}.pt", std::process::id()));
         std::fs::write(&path, weights)?;
         let result = self.call(&serde_json::json!({
             "cmd": "load", "path": path, "version": version,
@@ -347,8 +359,8 @@ async fn run_worker(
                 }
                 let cfg: LlmRolloutCfg = serde_json::from_slice(&args[0])
                     .map_err(|e| Error::Protocol(format!("llm.rollout config: {e}")))?;
-                let stale = !cfg.weights.is_empty()
-                    && sidecar.lock().unwrap().version != cfg.version;
+                let stale =
+                    !cfg.weights.is_empty() && sidecar.lock().unwrap().version != cfg.version;
                 let weights = if stale {
                     let weights_id = ObjectId::from_str(&cfg.weights)
                         .map_err(|e| Error::Protocol(format!("llm.rollout weights id: {e}")))?;
@@ -362,8 +374,12 @@ async fn run_worker(
                     if let Some(weights) = weights {
                         sidecar.load(cfg.version, &weights)?;
                     }
-                    let completions =
-                        sidecar.rollout(&cfg.seeds, &cfg.prompts, cfg.max_new_tokens, cfg.temperature)?;
+                    let completions = sidecar.rollout(
+                        &cfg.seeds,
+                        &cfg.prompts,
+                        cfg.max_new_tokens,
+                        cfg.temperature,
+                    )?;
                     let rollouts: Vec<LlmRollout> = cfg
                         .seeds
                         .iter()
@@ -383,7 +399,9 @@ async fn run_worker(
         // last integer. Pure Rust — no model, no GPU.
         registry.register(llm_descriptor("judge"), |args| async move {
             if args.is_empty() || args.len() > 2 {
-                return Err(Error::Protocol("llm.judge expects [rollouts, golds?]".into()));
+                return Err(Error::Protocol(
+                    "llm.judge expects [rollouts, golds?]".into(),
+                ));
             }
             let rollouts: Vec<LlmRollout> = serde_json::from_slice(&args[0])
                 .map_err(|e| Error::Protocol(format!("llm.judge input: {e}")))?;
@@ -404,9 +422,7 @@ async fn run_worker(
             };
             let rewards: Vec<f32> = rollouts
                 .iter()
-                .map(|r| {
-                    (last_integer(&r.completion) == golds.get(&r.seed).copied()) as u32 as f32
-                })
+                .map(|r| (last_integer(&r.completion) == golds.get(&r.seed).copied()) as u32 as f32)
                 .collect();
             serde_json::to_vec(&rewards)
                 .map_err(|e| Error::Protocol(format!("llm.judge encode: {e}")))
@@ -417,6 +433,37 @@ async fn run_worker(
     }
     let registry = Arc::new(registry);
     let node_id = node_id.unwrap_or_default();
+    let drain = Arc::new(DrainSignal::default());
+    {
+        // SIGTERM → tell the coordinator immediately (even mid-task, so it
+        // stops assigning), give the in-flight task a signal-relative grace
+        // budget, then exit without reporting — the lease reaper re-queues.
+        let drain = drain.clone();
+        let coordinator = coordinator.to_string();
+        tokio::spawn(async move {
+            let Ok(mut sigterm) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            else {
+                return;
+            };
+            sigterm.recv().await;
+            eprintln!("worker draining on SIGTERM");
+            drain.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let identity = drain.identity.lock().unwrap().clone();
+            if let Some(identity) = identity {
+                let epoch = identity.coordinator_epoch;
+                let _ = rpc(
+                    &coordinator,
+                    RpcRequest::Worker(WorkerRequest::Drain(identity)),
+                    Some(epoch),
+                )
+                .await;
+            }
+            tokio::time::sleep(Duration::from_millis(WORKER_DRAIN_GRACE_MS)).await;
+            eprintln!("worker drain grace expired, exiting");
+            std::process::exit(0);
+        });
+    }
     let mut backoff_ms: u64 = 0;
     loop {
         match run_worker_session(
@@ -426,10 +473,16 @@ async fn run_worker(
             cpu,
             registry.clone(),
             objects.clone(),
+            drain.clone(),
         )
         .await
         {
             Ok(()) => return Ok(()),
+            Err(WorkerSessionEnd::Reconnect)
+                if drain.flag.load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                return Ok(());
+            }
             Err(WorkerSessionEnd::Reconnect) => {
                 backoff_ms = if backoff_ms == 0 {
                     100
@@ -449,6 +502,14 @@ async fn run_worker(
 enum WorkerSessionEnd {
     Reconnect,
     Fatal(Error),
+}
+
+/// Set by the SIGTERM handler; the poll loop exits between tasks, and the
+/// handler itself notifies the coordinator using the last registered identity.
+#[derive(Default)]
+struct DrainSignal {
+    flag: std::sync::atomic::AtomicBool,
+    identity: std::sync::Mutex<Option<WorkerIdentity>>,
 }
 
 fn rand_jitter() -> u64 {
@@ -474,6 +535,7 @@ async fn run_worker_session(
     cpu: f64,
     registry: Arc<OperationRegistry>,
     objects: LocalObjectStore,
+    drain: Arc<DrainSignal>,
 ) -> Result<(), WorkerSessionEnd> {
     let registration = RegisterWorker {
         node_id,
@@ -506,6 +568,7 @@ async fn run_worker_session(
     };
     eprintln!("worker registered successfully");
     let identity = registered.identity;
+    *drain.identity.lock().unwrap() = Some(identity.clone());
     let heartbeat_identity = identity.clone();
     let heartbeat_coordinator = coordinator.to_string();
     let heartbeat_period = Duration::from_millis((registered.lease_timeout_ms / 3).max(10));
@@ -530,6 +593,10 @@ async fn run_worker_session(
         }
     }));
     loop {
+        if drain.flag.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("worker drained, exiting");
+            return Ok(());
+        }
         let poll_reply = match rpc(
             coordinator,
             RpcRequest::Worker(WorkerRequest::Poll {
@@ -630,13 +697,16 @@ async fn execute_assignment(
     let inputs = match fetch_inputs(&client, &assignment).await {
         Ok(inputs) => inputs,
         Err(error) => {
+            // ObjectLost (no lineage — gone forever) and codec errors are
+            // Permanent; transport faults and not-yet-ready inputs retry.
+            let class = error.failure_class();
             report(
                 coordinator,
                 WorkerRequest::Failed {
                     identity: identity.clone(),
                     fence: assignment.fence,
                     message: error.to_string(),
-                    class: FailureClass::Transient,
+                    class,
                 },
                 epoch,
             )
@@ -654,9 +724,13 @@ async fn execute_assignment(
     let result = loop {
         tokio::select! {
             result = &mut execution => break Some(match result {
-                // An operation error is treated as Transient (may succeed on retry);
-                // a panic is Permanent — retrying a crashing op just burns attempts.
-                Ok(value) => value.map_err(|error| (error, FailureClass::Transient)),
+                // Operation errors classify by variant (deterministic errors like
+                // bad input shape are Permanent); a panic is always Permanent —
+                // retrying a crashing op just burns attempts.
+                Ok(value) => value.map_err(|error| {
+                    let class = error.failure_class();
+                    (error, class)
+                }),
                 Err(join_error) if join_error.is_panic() => Err((
                     Error::Protocol("operation panicked".into()),
                     FailureClass::Permanent,

@@ -21,6 +21,9 @@ pub const MAX_OBJECTS: usize = 65_536;
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkerState {
     Alive,
+    /// SIGTERM received: no new assignments, but in-flight work may still
+    /// report and the lease keeps renewing until the worker exits.
+    Draining,
     Dead,
 }
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -116,6 +119,12 @@ pub struct CoordinatorState {
     /// Tasks in `CancelRequested`, so `cancellation_for` visits only tasks
     /// awaiting a worker ack instead of scanning the whole table.
     cancel_requested: HashSet<TaskId>,
+    /// Measurement only (evolution-plan gap 3): how often the locality
+    /// look-ahead actually matters. Logged periodically, no wire exposure.
+    /// ponytail: eprintln metrics; promote to a stats RPC if data warrants it.
+    pub sched_assigns: u64,
+    pub sched_owned_input: u64,
+    pub sched_local_hits: u64,
 }
 impl CoordinatorState {
     pub fn new(epoch: CoordinatorEpoch) -> Self {
@@ -130,6 +139,9 @@ impl CoordinatorState {
             runnable: VecDeque::new(),
             waiting: HashSet::new(),
             cancel_requested: HashSet::new(),
+            sched_assigns: 0,
+            sched_owned_input: 0,
+            sched_local_hits: 0,
         }
     }
     fn changed(&mut self) {
@@ -178,7 +190,9 @@ impl CoordinatorState {
             }
         }
         if let Some(existing) = self.workers.get_mut(&request.node_id) {
-            if existing.state == WorkerState::Alive {
+            // Draining counts as active: overwriting it would orphan its
+            // in-flight task's assignment. Let the lease reaper clear it first.
+            if existing.state != WorkerState::Dead {
                 let same = existing.identity.worker_epoch == request.worker_epoch
                     && existing.advertise_addr == request.advertise_addr
                     && existing.total == request.resources
@@ -415,8 +429,12 @@ impl CoordinatorState {
         }
         // Pop runnable ids, skipping stale entries and re-queuing tasks this
         // worker can't serve. Bounded by the runnable count, not the task table.
-        let (workers, runnable, tasks, objects) =
-            (&self.workers, &mut self.runnable, &self.tasks, &self.objects);
+        let (workers, runnable, tasks, objects) = (
+            &self.workers,
+            &mut self.runnable,
+            &self.tasks,
+            &self.objects,
+        );
         let worker = &workers[&node_id];
         // Prefer a runnable task whose input objects this worker already owns, so a
         // downstream task runs where its inputs are local instead of refetching them
@@ -466,6 +484,26 @@ impl CoordinatorState {
             self.runnable.push_back(id);
         }
         let Some(id) = chosen else { return Ok(None) };
+        // Locality measurement: a task "could" be local if any object input has
+        // a worker owner at all; a "hit" means it was picked via the local branch.
+        let local_hit = self.tasks[&id].args.iter().any(|arg| {
+            matches!(arg, TaskArg::Object(oid)
+                if self.objects.get(oid).and_then(|object| object.owner) == Some(node_id))
+        });
+        let owned_input = local_hit
+            || self.tasks[&id].args.iter().any(|arg| {
+                matches!(arg, TaskArg::Object(oid)
+                    if self.objects.get(oid).and_then(|object| object.owner).is_some())
+            });
+        self.sched_assigns += 1;
+        self.sched_owned_input += owned_input as u64;
+        self.sched_local_hits += local_hit as u64;
+        if self.sched_assigns.is_multiple_of(1024) {
+            eprintln!(
+                "scheduler locality: {}/{} owned-input tasks placed locally ({} assigns)",
+                self.sched_local_hits, self.sched_owned_input, self.sched_assigns
+            );
+        }
         let attempt = Attempt(self.tasks[&id].attempt.0 + 1);
         let lease = LeaseId::new();
         let resources = self.tasks[&id].resources.clone();
@@ -643,7 +681,7 @@ impl CoordinatorState {
         let expired: Vec<_> = self
             .workers
             .values()
-            .filter(|worker| worker.state == WorkerState::Alive && worker.lease_deadline_ms <= now)
+            .filter(|worker| worker.state != WorkerState::Dead && worker.lease_deadline_ms <= now)
             .map(|worker| worker.identity.node_id)
             .collect();
         for node in &expired {
@@ -687,6 +725,12 @@ impl CoordinatorState {
             self.changed();
         }
         Ok(expired)
+    }
+    pub fn drain(&mut self, identity: &WorkerIdentity) -> Result<(), Error> {
+        self.check_identity(identity)?;
+        self.workers.get_mut(&identity.node_id).unwrap().state = WorkerState::Draining;
+        self.changed();
+        Ok(())
     }
     pub fn cancellation_for(&self, identity: &WorkerIdentity) -> Result<Option<TaskFence>, Error> {
         self.check_identity(identity)?;
@@ -852,7 +896,9 @@ impl CoordinatorState {
             .workers
             .get(&identity.node_id)
             .ok_or(Error::StaleFence)?;
-        if worker.state != WorkerState::Alive
+        // Draining workers must still pass: their in-flight task reports
+        // Completed/Failed after the drain request. Only Dead is fenced out.
+        if worker.state == WorkerState::Dead
             || worker.identity.worker_epoch != identity.worker_epoch
             || worker.identity.session_id != identity.session_id
         {
@@ -990,7 +1036,12 @@ mod tests {
             .unwrap();
         let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
         state
-            .fail(&identity, assignment.fence, "boom".into(), FailureClass::Permanent)
+            .fail(
+                &identity,
+                assignment.fence,
+                "boom".into(),
+                FailureClass::Permanent,
+            )
             .unwrap();
         assert!(matches!(state.tasks[&second].state, TaskState::Failed(_)));
         assert!(matches!(state.tasks[&third].state, TaskState::Failed(_)));
@@ -1026,7 +1077,12 @@ mod tests {
             .unwrap();
         let first = state.assign_next(identity.node_id).unwrap().unwrap();
         state
-            .fail(&identity, first.fence, "retry".into(), FailureClass::Transient)
+            .fail(
+                &identity,
+                first.fence,
+                "retry".into(),
+                FailureClass::Transient,
+            )
             .unwrap();
         let second = state.assign_next(identity.node_id).unwrap().unwrap();
         assert_ne!(first.fence.attempt, second.fence.attempt);
@@ -1108,6 +1164,72 @@ mod tests {
         assert_eq!(state.tasks[&blocked].state, TaskState::Cancelled);
     }
 
+    #[test]
+    fn locality_counters_track_owned_input_placement() {
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        let (_, first_output) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+            .unwrap();
+        let first = state.assign_next(identity.node_id).unwrap().unwrap();
+        state
+            .complete(&identity, completion(first.fence, first_output))
+            .unwrap();
+        state
+            .submit(
+                descriptor().key.clone(),
+                vec![TaskArg::Object(first_output)],
+                ResourceSet::default(),
+                1,
+            )
+            .unwrap();
+        state.assign_next(identity.node_id).unwrap().unwrap();
+        assert_eq!(state.sched_assigns, 2);
+        assert_eq!(state.sched_owned_input, 1);
+        assert_eq!(state.sched_local_hits, 1);
+    }
+
+    #[test]
+    fn draining_worker_gets_no_assignments() {
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+            .unwrap();
+        state.drain(&identity).unwrap();
+        assert!(state.assign_next(identity.node_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn draining_worker_can_complete_in_flight_task() {
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new());
+        let (task, output) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+            .unwrap();
+        let assignment = state.assign_next(identity.node_id).unwrap().unwrap();
+        state.drain(&identity).unwrap();
+        state
+            .complete(&identity, completion(assignment.fence, output))
+            .unwrap();
+        assert_eq!(state.tasks[&task].state, TaskState::Succeeded);
+    }
+
+    #[test]
+    fn draining_worker_expiry_requeues_task() {
+        let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+        let identity = register(&mut state, NodeId::new()); // lease deadline 100
+        let (task, _) = state
+            .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 2)
+            .unwrap();
+        state.assign_next(identity.node_id).unwrap().unwrap();
+        state.drain(&identity).unwrap();
+        // Draining worker exits without reporting; the reaper re-queues.
+        let expired = state.expire_workers(1_000).unwrap();
+        assert_eq!(expired, vec![identity.node_id]);
+        assert_eq!(state.tasks[&task].state, TaskState::Runnable);
+    }
+
     fn completion(fence: TaskFence, output: ObjectId) -> TaskCompletion {
         TaskCompletion {
             fence,
@@ -1138,7 +1260,10 @@ mod tests {
         state
             .complete(&identity, completion(assignment.fence, output))
             .unwrap();
-        assert_eq!(state.tasks[&assignment.fence.task_id].state, TaskState::Succeeded);
+        assert_eq!(
+            state.tasks[&assignment.fence.task_id].state,
+            TaskState::Succeeded
+        );
     }
 
     #[test]
@@ -1284,7 +1409,10 @@ mod tests {
         // The non-local task keeps its place and is served next.
         state.started(&identity, picked.fence).unwrap();
         state
-            .complete(&identity, completion(picked.fence, state.tasks[&local].output))
+            .complete(
+                &identity,
+                completion(picked.fence, state.tasks[&local].output),
+            )
             .unwrap();
         let next = state.assign_next(identity.node_id).unwrap().unwrap();
         assert_eq!(next.fence.task_id, non_local);

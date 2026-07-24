@@ -209,8 +209,7 @@ impl ArenaStore {
             (e.offset as usize, e.size as usize)
         };
         // SAFETY: committed region, immutable until released; bounds from Entry.
-        let slice =
-            unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(offset), size) };
+        let slice = unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(offset), size) };
         Some(slice.to_vec())
     }
 
@@ -260,7 +259,9 @@ pub fn copy_wide(dst: &mut [u8], src: &[u8]) {
         dst.copy_from_slice(src);
         return;
     }
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8);
     let chunk = src.len().div_ceil(threads);
     std::thread::scope(|scope| {
         for (d, s) in dst.chunks_mut(chunk).zip(src.chunks(chunk)) {
@@ -340,7 +341,10 @@ mod tests {
         assert_eq!(meta.offset, offset);
         assert_eq!(meta.size, payload.len() as u64);
         let map = map_arena(store.token()).unwrap();
-        assert_eq!(&map[offset as usize..offset as usize + payload.len()], &payload[..]);
+        assert_eq!(
+            &map[offset as usize..offset as usize + payload.len()],
+            &payload[..]
+        );
         assert_eq!(store.read(id).unwrap(), payload);
 
         store.release(id);

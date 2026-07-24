@@ -8,8 +8,8 @@ use crate::{
     resources::ResourceSet,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::fmt;
+use std::sync::Arc;
 
 impl fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -22,7 +22,7 @@ pub const MAGIC: [u8; 4] = *b"CRYN";
 // (and connection pooling changed the transport), shifting request variant indices
 // — wire-incompatible with 3. Deploy all components at the same major.
 // (3 in 0.4.0: `Failed` swapped `retryable: bool` for a `FailureClass` enum.)
-pub const PROTOCOL_MAJOR: u16 = 4;
+pub const PROTOCOL_MAJOR: u16 = 5;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OBJECT_BYTES: usize = MAX_FRAME_BYTES - 64 * 1024;
@@ -321,6 +321,10 @@ pub enum WorkerRequest {
         message: String,
         class: FailureClass,
     },
+    /// SIGTERM received: stop assigning me work. An in-flight task may still
+    /// report Completed/Failed afterwards; if the worker exits before it can,
+    /// the lease reaper re-queues the task as with any silent death.
+    Drain(WorkerIdentity),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcRequest {

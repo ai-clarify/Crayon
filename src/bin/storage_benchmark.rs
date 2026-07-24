@@ -20,10 +20,7 @@ use std::{
 };
 
 use crayon::{
-    client::ClusterClient,
-    data_plane::LocalObjectStore,
-    error::Error,
-    ids::ObjectId,
+    client::ClusterClient, data_plane::LocalObjectStore, error::Error, ids::ObjectId,
     operation::Codec,
 };
 use tokio::net::TcpListener;
@@ -77,7 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, &size) in args.sizes.iter().enumerate() {
         let row = run_e2e(&client, size, &args).await?;
         report.push_str(&format!("    {row}"));
-        report.push_str(if i + 1 < args.sizes.len() { ",\n" } else { "\n" });
+        report.push_str(if i + 1 < args.sizes.len() {
+            ",\n"
+        } else {
+            "\n"
+        });
     }
     report.push_str("  ],\n");
     kill(coordinator);
@@ -87,7 +88,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, &size) in args.sizes.iter().enumerate() {
         let row = measure_read_amp(size, args.samples);
         report.push_str(&format!("    {row}"));
-        report.push_str(if i + 1 < args.sizes.len() { ",\n" } else { "\n" });
+        report.push_str(if i + 1 < args.sizes.len() {
+            ",\n"
+        } else {
+            "\n"
+        });
     }
     report.push_str("  ]\n}\n");
 
@@ -214,8 +219,14 @@ fn parse_args() -> Args {
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![1024, 16384, 262_144, 1_048_576, 4_194_304]);
     Args {
-        samples: m.get("--samples").and_then(|v| v.parse().ok()).unwrap_or(2000),
-        warmups: m.get("--warmups").and_then(|v| v.parse().ok()).unwrap_or(200),
+        samples: m
+            .get("--samples")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000),
+        warmups: m
+            .get("--warmups")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200),
         sizes,
         artifact_dir: m
             .get("--artifact-dir")
