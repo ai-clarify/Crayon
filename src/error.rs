@@ -33,6 +33,8 @@ impl Error {
     /// bad arguments — is deterministic and retrying just burns attempts.
     pub fn failure_class(&self) -> crate::protocol::FailureClass {
         use crate::protocol::FailureClass;
+        // Exhaustive on purpose: Permanent is the destructive direction (no
+        // retry), so every new variant must pick its class here explicitly.
         match self {
             Error::Io(_)
             | Error::DeadlineExceeded
@@ -42,7 +44,19 @@ impl Error {
             | Error::ObjectPending(_)
             | Error::ObjectInUse(_)
             | Error::CapacityExceeded(_) => FailureClass::Transient,
-            _ => FailureClass::Permanent,
+            Error::Protocol(_)
+            | Error::InvalidAddress(_)
+            | Error::InvalidResource(_)
+            | Error::OperationUnavailable(_)
+            | Error::OperationConflict(_)
+            | Error::IllegalTransition(_)
+            | Error::TaskNotFound(_)
+            | Error::TaskFailed(_, _)
+            | Error::TaskCancelled(_)
+            | Error::ObjectLost(_)
+            | Error::ObjectConflict(_)
+            | Error::DependencyFailed(_)
+            | Error::Serialization(_) => FailureClass::Permanent,
         }
     }
 }

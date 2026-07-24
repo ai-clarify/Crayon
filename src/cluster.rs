@@ -96,9 +96,29 @@ impl CoordinatorServer {
         tokio::spawn(async move {
             let period = Duration::from_millis((reaper.lease_ms / 3).max(10));
             let mut interval = tokio::time::interval(period);
+            let mut locality_logged = 0;
             loop {
                 interval.tick().await;
-                let expired = reaper.state.lock().expire_workers(now_ms());
+                let (expired, (assigns, owned, hits)) = {
+                    let mut state = reaper.state.lock();
+                    let expired = state.expire_workers(now_ms());
+                    (
+                        expired,
+                        (
+                            state.sched_assigns,
+                            state.sched_owned_input,
+                            state.sched_local_hits,
+                        ),
+                    )
+                };
+                // Locality measurement (evolution-plan gap 3), logged here so the
+                // state machine stays IO-free and no lock is held while printing.
+                if assigns - locality_logged >= 1024 {
+                    locality_logged = assigns;
+                    eprintln!(
+                        "scheduler locality: {hits}/{owned} owned-input tasks placed locally ({assigns} assigns)"
+                    );
+                }
                 if !matches!(expired, Ok(ref list) if list.is_empty()) {
                     // Expiry retries or fails tasks; wake parked polls to react.
                     reaper.wakeup.notify_waiters();
@@ -791,8 +811,8 @@ pub fn checksum(bytes: &[u8]) -> [u8; 32] {
     }
 }
 /// Completes on the first shutdown signal: SIGTERM or SIGINT on Unix, Ctrl-C
-/// elsewhere. Drives the coordinator's graceful drain.
-async fn shutdown_signal() {
+/// elsewhere. Drives the coordinator's graceful drain and the worker's.
+pub async fn shutdown_signal() {
     #[cfg(unix)]
     {
         let mut term =

@@ -157,6 +157,30 @@ fn stdout(output: Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+/// SIGTERM the process and require a clean (graceful-drain) exit in time.
+fn sigterm_and_wait_exit(child: &mut Child, timeout: Duration, what: &str) {
+    assert!(Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            assert!(
+                exit.success(),
+                "{what} did not exit cleanly on SIGTERM: {exit:?}"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not drain/exit on SIGTERM within {timeout:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn remote_execution_and_typed_readiness() {
     let mut cluster = Cluster::start(5_000);
@@ -381,26 +405,7 @@ fn coordinator_exits_cleanly_on_sigterm() {
         assert!(Instant::now() < deadline, "coordinator never came up");
         thread::sleep(Duration::from_millis(25));
     }
-    assert!(Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .unwrap()
-        .success());
-    let deadline = Instant::now() + Duration::from_secs(12);
-    loop {
-        if let Some(exit) = child.try_wait().unwrap() {
-            assert!(
-                exit.success(),
-                "coordinator did not exit cleanly on SIGTERM: {exit:?}"
-            );
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "coordinator did not drain/exit on SIGTERM in 12s"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    sigterm_and_wait_exit(&mut child, Duration::from_secs(12), "coordinator");
 }
 
 #[test]
@@ -413,26 +418,11 @@ fn worker_drains_on_sigterm() {
     cluster.eventually(Duration::from_secs(10), || {
         cluster.status(&task).contains("Running")
     });
-    let pid = cluster.workers[0].child.id().to_string();
-    assert!(Command::new("kill")
-        .args(["-TERM", &pid])
-        .status()
-        .unwrap()
-        .success());
-    // max_attempts = 1: success proves the first attempt survived the signal.
-    cluster.eventually(Duration::from_secs(10), || {
-        cluster.status(&task).contains("Succeeded")
-    });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(exit) = cluster.workers[0].child.try_wait().unwrap() {
-            assert!(exit.success(), "worker did not exit cleanly: {exit:?}");
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "worker did not exit after drain in 10s"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    sigterm_and_wait_exit(
+        &mut cluster.workers[0].child,
+        Duration::from_secs(10),
+        "worker",
+    );
+    // max_attempts = 1: Succeeded proves the first attempt survived the signal.
+    assert!(cluster.status(&task).contains("Succeeded"));
 }

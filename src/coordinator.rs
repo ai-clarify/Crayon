@@ -120,10 +120,14 @@ pub struct CoordinatorState {
     /// awaiting a worker ack instead of scanning the whole table.
     cancel_requested: HashSet<TaskId>,
     /// Measurement only (evolution-plan gap 3): how often the locality
-    /// look-ahead actually matters. Logged periodically, no wire exposure.
-    /// ponytail: eprintln metrics; promote to a stats RPC if data warrants it.
+    /// look-ahead actually matters. The server's reaper task logs these
+    /// periodically; transient, so they never enter serialized state.
+    /// ponytail: log-line metrics; promote to a stats RPC if data warrants it.
+    #[serde(skip)]
     pub sched_assigns: u64,
+    #[serde(skip)]
     pub sched_owned_input: u64,
+    #[serde(skip)]
     pub sched_local_hits: u64,
 }
 impl CoordinatorState {
@@ -443,7 +447,7 @@ impl CoordinatorState {
         const LOCALITY_LOOKAHEAD: usize = 16;
         let mut requeue: Vec<TaskId> = Vec::new(); // not servable by this worker
         let mut passed: Vec<TaskId> = Vec::new(); // servable, not local; keep FIFO priority
-        let mut chosen = None;
+        let mut chosen: Option<(TaskId, bool)> = None; // (task, picked via local branch)
         let mut looked = 0;
         while let Some(id) = runnable.pop_front() {
             let Some(task) = tasks.get(&id) else { continue };
@@ -461,7 +465,7 @@ impl CoordinatorState {
                     if objects.get(oid).and_then(|object| object.owner) == Some(node_id))
             });
             if local {
-                chosen = Some(id);
+                chosen = Some((id, true));
                 break;
             }
             passed.push(id);
@@ -471,25 +475,23 @@ impl CoordinatorState {
             }
         }
         if chosen.is_none() {
-            chosen = passed.first().copied();
+            chosen = passed.first().map(|&id| (id, false));
         }
         // Servable-but-passed-over tasks go back to the front (FIFO priority kept);
         // tasks this worker cannot serve go to the back, as before.
         for id in passed.into_iter().rev() {
-            if Some(id) != chosen {
+            if chosen.map(|(picked, _)| picked) != Some(id) {
                 self.runnable.push_front(id);
             }
         }
         for id in requeue {
             self.runnable.push_back(id);
         }
-        let Some(id) = chosen else { return Ok(None) };
-        // Locality measurement: a task "could" be local if any object input has
-        // a worker owner at all; a "hit" means it was picked via the local branch.
-        let local_hit = self.tasks[&id].args.iter().any(|arg| {
-            matches!(arg, TaskArg::Object(oid)
-                if self.objects.get(oid).and_then(|object| object.owner) == Some(node_id))
-        });
+        let Some((id, local_hit)) = chosen else {
+            return Ok(None);
+        };
+        // Locality measurement: local_hit is the selection loop's own verdict;
+        // owned_input asks whether locality was even possible for this task.
         let owned_input = local_hit
             || self.tasks[&id].args.iter().any(|arg| {
                 matches!(arg, TaskArg::Object(oid)
@@ -498,12 +500,6 @@ impl CoordinatorState {
         self.sched_assigns += 1;
         self.sched_owned_input += owned_input as u64;
         self.sched_local_hits += local_hit as u64;
-        if self.sched_assigns.is_multiple_of(1024) {
-            eprintln!(
-                "scheduler locality: {}/{} owned-input tasks placed locally ({} assigns)",
-                self.sched_local_hits, self.sched_owned_input, self.sched_assigns
-            );
-        }
         let attempt = Attempt(self.tasks[&id].attempt.0 + 1);
         let lease = LeaseId::new();
         let resources = self.tasks[&id].resources.clone();

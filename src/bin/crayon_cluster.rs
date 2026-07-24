@@ -435,29 +435,18 @@ async fn run_worker(
     let node_id = node_id.unwrap_or_default();
     let drain = Arc::new(DrainSignal::default());
     {
-        // SIGTERM → tell the coordinator immediately (even mid-task, so it
-        // stops assigning), give the in-flight task a signal-relative grace
-        // budget, then exit without reporting — the lease reaper re-queues.
+        // Shutdown signal → notify the coordinator immediately (even mid-task,
+        // so it stops assigning), then grace timer, then exit unreported.
         let drain = drain.clone();
         let coordinator = coordinator.to_string();
         tokio::spawn(async move {
-            let Ok(mut sigterm) =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            else {
-                return;
-            };
-            sigterm.recv().await;
-            eprintln!("worker draining on SIGTERM");
-            drain.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            crayon::cluster::shutdown_signal().await;
+            eprintln!("worker draining on shutdown signal");
+            drain.set();
             let identity = drain.identity.lock().unwrap().clone();
             if let Some(identity) = identity {
                 let epoch = identity.coordinator_epoch;
-                let _ = rpc(
-                    &coordinator,
-                    RpcRequest::Worker(WorkerRequest::Drain(identity)),
-                    Some(epoch),
-                )
-                .await;
+                let _ = report(&coordinator, WorkerRequest::Drain(identity), epoch).await;
             }
             tokio::time::sleep(Duration::from_millis(WORKER_DRAIN_GRACE_MS)).await;
             eprintln!("worker drain grace expired, exiting");
@@ -478,12 +467,10 @@ async fn run_worker(
         .await
         {
             Ok(()) => return Ok(()),
-            Err(WorkerSessionEnd::Reconnect)
-                if drain.flag.load(std::sync::atomic::Ordering::SeqCst) =>
-            {
-                return Ok(());
-            }
             Err(WorkerSessionEnd::Reconnect) => {
+                if drain.is_set() {
+                    return Ok(());
+                }
                 backoff_ms = if backoff_ms == 0 {
                     100
                 } else {
@@ -510,6 +497,15 @@ enum WorkerSessionEnd {
 struct DrainSignal {
     flag: std::sync::atomic::AtomicBool,
     identity: std::sync::Mutex<Option<WorkerIdentity>>,
+}
+
+impl DrainSignal {
+    fn set(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn is_set(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 fn rand_jitter() -> u64 {
@@ -593,7 +589,7 @@ async fn run_worker_session(
         }
     }));
     loop {
-        if drain.flag.load(std::sync::atomic::Ordering::SeqCst) {
+        if drain.is_set() {
             eprintln!("worker drained, exiting");
             return Ok(());
         }
