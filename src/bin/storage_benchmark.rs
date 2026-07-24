@@ -119,11 +119,28 @@ async fn run_e2e(client: &ClusterClient, size: usize, args: &Args) -> Result<Str
         payload[..8.min(size)].copy_from_slice(&(iter as u64).to_le_bytes()[..8.min(size)]);
 
         let start = Instant::now();
-        let id: ObjectId = client.put_bytes(&payload).await?;
+        let id: ObjectId = match client.put_bytes(&payload).await {
+            Ok(id) => id,
+            // Past the frame/object cap the put hard-fails; record the boundary
+            // instead of aborting the whole sweep. ponytail: cross-host cliff probe.
+            Err(error) => {
+                return Ok(format!(
+                    "{{\"size_bytes\": {size}, \"error\": \"put: {error}\"}}"
+                ))
+            }
+        };
         let put_elapsed = start.elapsed();
 
         let start = Instant::now();
-        let (_codec, got) = client.get_bytes(id).await?;
+        let got = match client.get_bytes(id).await {
+            Ok((_codec, got)) => got,
+            Err(error) => {
+                let _ = client.release(id).await;
+                return Ok(format!(
+                    "{{\"size_bytes\": {size}, \"error\": \"get: {error}\"}}"
+                ));
+            }
+        };
         let get_elapsed = start.elapsed();
         if got.len() != expected {
             return Err(Error::Protocol("payload size mismatch".into()));
