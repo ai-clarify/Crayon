@@ -1,0 +1,13 @@
+{
+  "samples": 200, "warmups": 20,
+  "e2e": [
+    {"size_bytes": 1048576, "put_p50_us": 6022.24, "put_p99_us": 7965.99, "put_mb_s": 164.2, "get_p50_us": 6588.13, "get_p99_us": 7979.82, "get_mb_s": 147.7},
+    {"size_bytes": 4194304, "error": "get: DeadlineExceeded"},
+    {"size_bytes": 8323072, "put_p50_us": 43194.17, "put_p99_us": 52726.72, "put_mb_s": 176.8, "get_p50_us": 41267.30, "get_p99_us": 59853.77, "get_mb_s": 184.2},
+    {"size_bytes": 8323073, "put_p50_us": 36005.50, "put_p99_us": 44559.83, "put_mb_s": 210.5, "get_p50_us": 39191.70, "get_p99_us": 47812.60, "get_mb_s": 200.4},
+    {"size_bytes": 16646144, "put_p50_us": 70957.17, "put_p99_us": 85045.45, "put_mb_s": 222.3, "get_p50_us": 69966.83, "get_p99_us": 77863.71, "get_mb_s": 226.8},
+    {"size_bytes": 67108864, "put_p50_us": 267586.85, "put_p99_us": 321881.32, "put_mb_s": 227.9, "get_p50_us": 292626.23, "get_p99_us": 342210.43, "get_mb_s": 216.8}
+  ],
+  "read_amplification": [
+  ]
+}

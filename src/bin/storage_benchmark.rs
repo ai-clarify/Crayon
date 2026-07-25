@@ -152,8 +152,15 @@ async fn run_e2e(client: &ClusterClient, size: usize, args: &Args) -> Result<Str
             }
         };
         let get_elapsed = start.elapsed();
-        if got.len() != expected {
-            return Err(Error::Protocol("payload size mismatch".into()));
+        // Byte-exact, not just length: for >=1 MiB the stored checksum is the
+        // all-zero "unhashed" sentinel, so the client's own verify is size-only.
+        // A chunked-reassembly corruption keeps the length but scrambles content,
+        // so compare the whole buffer here — this is the correctness guard.
+        if got != payload {
+            return Err(Error::Protocol(format!(
+                "payload mismatch at {size} bytes (len {} vs {expected})",
+                got.len()
+            )));
         }
         // Free it so memory stays bounded, like Ray dropping the ref after get.
         client.release(id).await?;
