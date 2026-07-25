@@ -50,6 +50,19 @@ class Sidecar:
             self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
         return {"ok": True}
 
+    def _format(self, prompt):
+        # Instruction/reasoning models (e.g. Qwen) answer well only through their
+        # chat template; a base model has none, so fall back to the raw prompt.
+        # rollout AND learn must format identically, or REINFORCE scores the
+        # wrong token positions.
+        if getattr(self.tok, "chat_template", None):
+            return self.tok.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        return prompt
+
     def save(self, out):
         state = {k: v.cpu() for k, v in self.model.state_dict().items()}
         torch.save(state, out)
@@ -64,6 +77,7 @@ class Sidecar:
     @torch.no_grad()
     def rollout(self, seeds, max_new_tokens, temperature=1.0, prompts=None):
         prompts = prompts or [prompt_for(s) for s in seeds]
+        prompts = [self._format(p) for p in prompts]
         enc = self.tok(prompts, return_tensors="pt", padding=True).to("cuda")
         sampling = (
             {"do_sample": True, "temperature": temperature, "top_p": 0.95}
@@ -96,8 +110,9 @@ class Sidecar:
         for start in range(0, len(items), micro):
             chunk = items[start : start + micro]
             adv = advantage[start : start + micro]
-            texts = [i["prompt"] + i["completion"] for i in chunk]
-            prompt_lens = [len(self.tok(i["prompt"])["input_ids"]) for i in chunk]
+            fmt = [self._format(i["prompt"]) for i in chunk]
+            texts = [f + i["completion"] for f, i in zip(fmt, chunk)]
+            prompt_lens = [len(self.tok(f)["input_ids"]) for f in fmt]
             enc = self.tok(texts, return_tensors="pt", padding=True).to("cuda")
             logits = self.model(**enc).logits[:, :-1]
             targets = enc.input_ids[:, 1:]

@@ -60,6 +60,17 @@ class RolloutActor:
         ).cuda()
 
     def rollout(self, prompts, max_new_tokens):
+        # Match llm_sidecar._format: instruction/reasoning models answer well only
+        # through their chat template; a base model has none, so fall back to raw.
+        if getattr(self.tok, "chat_template", None):
+            prompts = [
+                self.tok.apply_chat_template(
+                    [{"role": "user", "content": p}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                for p in prompts
+            ]
         with self.torch.no_grad():
             enc = self.tok(prompts, return_tensors="pt", padding=True).to("cuda")
             out = self.model.generate(
