@@ -201,11 +201,11 @@ fn multi_stage_dag_fetches_worker_local_output() {
     let mut cluster = Cluster::start(5_000);
     cluster.worker("copy", 1.0);
     let (first, first_output) = cluster.submit("copy", 41, None, 1.0, 1);
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         cluster.status(&first).contains("Succeeded")
     });
     let (second, second_output) = cluster.submit("copy", 0, Some(&first_output), 1.0, 1);
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         cluster.status(&second).contains("Succeeded")
     });
     assert_eq!(
@@ -244,12 +244,12 @@ fn running_cancellation_releases_capacity_after_ack() {
     let mut cluster = Cluster::start(5_000);
     let worker = cluster.worker("sleep", 1.0);
     let (task, output) = cluster.submit("sleep", 5_000, None, 1.0, 1);
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         cluster.status(&task).contains("Running")
     });
     let cancel = cluster.run(["cancel", &cluster.coordinator, &task]);
     assert!(cancel.status.success());
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         cluster.status(&task).contains("Cancelled")
     });
     let workers = stdout(cluster.run(["workers", &cluster.coordinator]));
@@ -269,7 +269,7 @@ fn worker_loss_retries_and_loses_owned_objects() {
     cluster.worker("sleep", 1.0);
     let (task, output) = cluster.submit("sleep", 5_000, None, 1.0, 2);
     let mut owner = None;
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         let status = cluster.status(&task);
         let fields: Vec<_> = status.split_whitespace().collect();
         if fields.get(2) == Some(&"Running") {
@@ -282,7 +282,7 @@ fn worker_loss_retries_and_loses_owned_objects() {
     let first_owner = owner.unwrap();
     cluster.kill_worker(&first_owner);
     let mut second_owner = None;
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         let status = cluster.status(&task);
         let fields: Vec<_> = status.split_whitespace().collect();
         if fields.get(2) == Some(&"Running") && fields.get(3) == Some(&"2") {
@@ -292,7 +292,7 @@ fn worker_loss_retries_and_loses_owned_objects() {
             false
         }
     });
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         cluster.status(&task).contains("Succeeded")
     });
     assert_eq!(
@@ -332,14 +332,14 @@ fn release_of_running_output_is_rejected_and_coordinator_survives() {
     let mut cluster = Cluster::start(5_000);
     cluster.worker("sleep", 1.0);
     let (task, output) = cluster.submit("sleep", 1_500, None, 1.0, 1);
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         cluster.status(&task).contains("Running")
     });
     let release = cluster.run(["release", &cluster.coordinator, &output]);
     assert!(!release.status.success());
     assert!(String::from_utf8_lossy(&release.stderr).contains("ObjectInUse"));
     // Coordinator is still alive and the task still finishes.
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         cluster.status(&task).contains("Succeeded")
     });
     assert!(cluster
@@ -357,11 +357,11 @@ fn busy_worker_survives_release_of_owned_output() {
     let mut cluster = Cluster::start(5_000);
     cluster.worker("sleep", 1.0);
     let (task_a, output_a) = cluster.submit("sleep", 100, None, 1.0, 1);
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         cluster.status(&task_a).contains("Succeeded")
     });
     let (task_b, _) = cluster.submit("sleep", 3_000, None, 1.0, 1);
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         cluster.status(&task_b).contains("Running")
     });
     let release = cluster.run(["release", &cluster.coordinator, &output_a]);
@@ -383,7 +383,7 @@ fn dead_worker_is_evicted_from_registry() {
     let address = cluster.worker("sleep", 1.0);
     let node = cluster.workers[0].node_id.clone();
     cluster.kill_worker(&node);
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         !stdout(cluster.run(["workers", &cluster.coordinator])).contains(&address)
     });
 }
@@ -400,7 +400,7 @@ fn coordinator_exits_cleanly_on_sigterm() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + READY_TIMEOUT;
     while !Command::new(binary)
         .args(["workers", &addr])
         .output()
@@ -421,7 +421,7 @@ fn worker_drains_on_sigterm() {
     let mut cluster = Cluster::start(5_000);
     cluster.worker("sleep", 1.0);
     let (task, _) = cluster.submit("sleep", 2_000, None, 1.0, 1);
-    cluster.eventually(Duration::from_secs(10), || {
+    cluster.eventually(READY_TIMEOUT, || {
         cluster.status(&task).contains("Running")
     });
     sigterm_and_wait_exit(
@@ -458,7 +458,7 @@ fn coordinator_logs_start_and_health_to_stderr() {
         }
     });
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + READY_TIMEOUT;
     let (mut saw_start, mut saw_health) = (false, false);
     while Instant::now() < deadline && !(saw_start && saw_health) {
         match rx.recv_timeout(Duration::from_millis(500)) {
