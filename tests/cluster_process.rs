@@ -529,3 +529,65 @@ fn local_subcommand_spawns_a_working_cluster() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn submit_to_unknown_operation_is_rejected() {
+    // A submit for an operation the CLI does not know is refused up front,
+    // non-zero exit, and the coordinator keeps serving.
+    let cluster = Cluster::start(5_000);
+    let out = cluster.run([
+        "submit-detach",
+        &cluster.coordinator,
+        "no-such-op",
+        "1",
+        "-",
+        "1",
+        "1",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("OperationUnavailable"));
+    assert!(cluster
+        .run(["workers", &cluster.coordinator])
+        .status
+        .success());
+}
+
+#[test]
+fn get_of_unknown_object_errors_without_panicking() {
+    // A get for a well-formed but never-stored id errors cleanly; the
+    // coordinator does not panic and stays up for the next request.
+    let cluster = Cluster::start(5_000);
+    let missing = "0".repeat(64); // 64 hex chars: valid shape, no such object
+    let out = cluster.run(["get", &cluster.coordinator, &missing]);
+    assert!(!out.status.success());
+    assert!(cluster
+        .run(["workers", &cluster.coordinator])
+        .status
+        .success());
+}
+
+#[test]
+fn malformed_object_id_is_rejected() {
+    // A get with a syntactically invalid id is rejected by the client before it
+    // ever hits the coordinator; still a clean non-zero exit, no panic.
+    let cluster = Cluster::start(5_000);
+    let out = cluster.run(["get", &cluster.coordinator, "not-a-valid-hex-id"]);
+    assert!(!out.status.success());
+    assert!(cluster
+        .run(["workers", &cluster.coordinator])
+        .status
+        .success());
+}
+
+#[test]
+fn status_of_unknown_task_errors_cleanly() {
+    // Status for a task id that was never submitted errors, coordinator survives.
+    let cluster = Cluster::start(5_000);
+    let missing = "1".repeat(32); // valid TaskId shape, never submitted
+    let out = cluster.run(["status", &cluster.coordinator, &missing]);
+    assert!(!out.status.success());
+    assert!(cluster
+        .run(["workers", &cluster.coordinator])
+        .status
+        .success());
+}
