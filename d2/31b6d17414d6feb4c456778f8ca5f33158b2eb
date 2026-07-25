@@ -1,0 +1,21 @@
+tests/cluster_process.rs
+  s_e5fe4a420b3cd8::t_31b6e63d39f067 204,208,247,252,272,285,295,335,342,360,364,386,403,424,461
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d231b6d17414d6feb4c456778f8ca5f33158b2eb",
+  "prompts": {},
+  "sessions": {
+    "s_e5fe4a420b3cd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b7526072-49d4-4cf6-958c-965b8c6edfd9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
