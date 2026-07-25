@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "crayon-rs"
-version = "0.6.0"
+version = "0.6.1"
 description = "Python client for the Crayon distributed task runtime"
 requires-python = ">=3.9"
 

@@ -63,7 +63,7 @@ no data loss and no overhead where the model dominates.
 ## Install
 
 ```bash
-cargo install crayon-rs --version 0.6.0   # library `crayon`, binary `crayon-cluster`
+cargo install crayon-rs --version 0.6.1   # library `crayon`, binary `crayon-cluster`
 ```
 
 Python client (pyo3, arena-aware — gigabyte puts from Python):
@@ -75,27 +75,39 @@ pip install target/wheels/crayon-*.whl
 
 ```python
 import crayon
-c = crayon.Client("127.0.0.1:7000")
+c = crayon.local_cluster(workers=4)           # spawns coordinator + workers here
 oid = c.put(b"\x00" * (1 << 30))              # 1 GB, via shared memory
 task, out = c.submit("llm", "rollout", 1, [b'{"seeds":[1],"max_new_tokens":48}'])
 print(c.get(out, timeout_ms=120_000))
-c.release(oid)
+c.release(oid)                                # cluster is killed when `c` is dropped
 ```
 
+Connect to an already-running cluster instead with `crayon.Client("host:port")`.
+`local_cluster` needs the `crayon-cluster` binary on `PATH` or at
+`$CRAYON_CLUSTER_BIN`.
+
 ## Run
+
+One command brings up a coordinator + workers on this host and blocks until
+Ctrl-C — the `ray.init()` analogue:
 
 ```bash
 cargo build --release --bin crayon-cluster
 
-# terminal 1
-target/release/crayon-cluster coordinator 127.0.0.1:7000
+# terminal 1: coordinator + 2 workers, prints the coordinator address
+target/release/crayon-cluster local 2
 
-# terminal 2
-target/release/crayon-cluster worker 127.0.0.1:7000 127.0.0.1:7001
-
-# terminal 3
-target/release/crayon-cluster submit 127.0.0.1:7000 20 22
+# terminal 2: submit against the printed address
+target/release/crayon-cluster submit 127.0.0.1:<port> 20 22
 # 42
+```
+
+Or wire the processes by hand (what `local` does for you):
+
+```bash
+target/release/crayon-cluster coordinator 127.0.0.1:7000   # terminal 1
+target/release/crayon-cluster worker 127.0.0.1:7000 127.0.0.1:7001   # terminal 2
+target/release/crayon-cluster submit 127.0.0.1:7000 20 22   # terminal 3
 ```
 
 End-to-end LLM RL / GSM8K (real model, three roles, Python-driven):

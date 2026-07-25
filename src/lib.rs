@@ -10,6 +10,7 @@ pub mod coordinator;
 pub mod data_plane;
 pub mod error;
 pub mod ids;
+pub mod local;
 pub mod operation;
 pub mod protocol;
 pub mod resources;
@@ -17,5 +18,6 @@ pub mod worker;
 
 pub use client::{ClusterClient, ObjectRef, Ready, TaskHandle};
 pub use error::Error;
+pub use local::LocalCluster;
 pub use operation::{Codec, Operation, OperationDescriptor, OperationKey, TaskArg};
 pub use resources::{ResourceQuantity, ResourceSet};

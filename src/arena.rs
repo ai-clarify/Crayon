@@ -317,8 +317,9 @@ impl ArenaStore {
             }
         };
         // SAFETY: committed region within bounds checked above; immutable until release.
-        let slice =
-            unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(base as usize), len as usize) };
+        let slice = unsafe {
+            std::slice::from_raw_parts(self.map.as_ptr().add(base as usize), len as usize)
+        };
         Some(slice.to_vec())
     }
 
@@ -522,9 +523,7 @@ mod tests {
         let id = ObjectId::new();
         // Object larger than one frame, written in three ranges.
         let size = 20_000_000u64;
-        store
-            .reserve(id, size, Codec::RawBytes, [0; 32])
-            .unwrap();
+        store.reserve(id, size, Codec::RawBytes, [0; 32]).unwrap();
         let chunk = 8_000_000usize;
         let mut expected = vec![0u8; size as usize];
         for (i, off) in (0..size).step_by(chunk).enumerate() {

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.1
+
+Ergonomics: one-call local cluster, the `ray.init()` analogue. No wire change
+(protocol stays 7).
+
+### Features
+
+- **`crayon-cluster local [workers] [ops]`** and **`crayon.local_cluster(workers=N)`**
+  spawn a coordinator + N workers on this host and (Python) return a connected
+  client; the child processes are killed when the handle is dropped. Removes the
+  three-terminal, position-argument dance for local development. `local_cluster`
+  resolves the `crayon-cluster` binary from `$CRAYON_CLUSTER_BIN` or `PATH`.
+  Both share one `LocalCluster` spawner in the library (`crayon::LocalCluster`).
+
 ## 0.6.0
 
 Cross-host and hot-path release: large objects now cross host boundaries via

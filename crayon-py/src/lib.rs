@@ -75,6 +75,10 @@ fn descriptor(namespace: &str, name: &str, version: u32, codec: &Codec) -> Opera
 struct Client {
     runtime: tokio::runtime::Runtime,
     inner: ClusterClient,
+    /// Set only when created via `local_cluster`: owns the spawned coordinator +
+    /// workers, killing them when this Client is dropped. `None` for a plain
+    /// connect to an existing cluster.
+    _cluster: Option<::crayon::LocalCluster>,
 }
 
 #[pymethods]
@@ -83,14 +87,7 @@ impl Client {
     /// shared-memory arena so puts and gets bypass the socket).
     #[new]
     fn new(address: String) -> PyResult<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(runtime_err)?;
-        let mut inner = ClusterClient::connect(address);
-        runtime.block_on(inner.connect_epoch()).map_err(runtime_err)?;
-        Ok(Self { runtime, inner })
+        Self::connect(address, None)
     }
 
     /// Stores raw bytes; returns the hex object id. Same-host, the payload is
@@ -280,8 +277,40 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Builds the private runtime, connects, and discovers the epoch. `cluster`
+    /// is `Some` only for `local_cluster`, whose child processes this Client owns.
+    fn connect(address: String, cluster: Option<::crayon::LocalCluster>) -> PyResult<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(runtime_err)?;
+        let mut inner = ClusterClient::connect(address);
+        runtime.block_on(inner.connect_epoch()).map_err(runtime_err)?;
+        Ok(Self {
+            runtime,
+            inner,
+            _cluster: cluster,
+        })
+    }
+}
+
+/// Spawns a coordinator + `workers` worker processes on this host and returns a
+/// `Client` connected to them — the one-call `ray.init()` analogue. The spawned
+/// processes are killed when the returned Client is dropped. Needs the
+/// `crayon-cluster` binary on `PATH` or at `$CRAYON_CLUSTER_BIN`.
+#[pyfunction]
+#[pyo3(signature = (workers = 2, ops = "all"))]
+fn local_cluster(workers: usize, ops: &str) -> PyResult<Client> {
+    let cluster = ::crayon::LocalCluster::start(workers, ops).map_err(runtime_err)?;
+    let addr = cluster.coordinator_addr.clone();
+    Client::connect(addr, Some(cluster))
+}
+
 #[pymodule]
 fn crayon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
+    m.add_function(wrap_pyfunction!(local_cluster, m)?)?;
     Ok(())
 }

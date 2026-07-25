@@ -6,6 +6,7 @@ use crayon::{
     data_plane::LocalObjectStore,
     error::Error,
     ids::{ClusterId, NodeId, ObjectId, TaskId, WorkerEpoch},
+    local::LocalCluster,
     operation::{Codec, OperationDescriptor, OperationKey, TaskArg},
     protocol::{
         ClientReply, ClientRequest, Envelope, FailureClass, ObjectPayload, RegisterWorker,
@@ -31,7 +32,7 @@ const INLINE_RESULT_MAX_BYTES: usize = 64 * 1024;
 const WORKER_DRAIN_GRACE_MS: u64 = 20_000;
 
 fn usage() -> ! {
-    eprintln!("usage: crayon-cluster coordinator <addr> [lease-ms] | worker <coordinator> <advertise> [node-id] [cpu] [operations] | submit <coordinator> <a> <b> | submit-detach <coordinator> <operation> <value> [object-id] [cpu] [max-attempts] | status <coordinator> <task-id> | workers <coordinator> | cancel <coordinator> <task-id> | get <coordinator> <object-id> | release <coordinator> <object-id>");
+    eprintln!("usage: crayon-cluster local [workers] [operations] | coordinator <addr> [lease-ms] | worker <coordinator> <advertise> [node-id] [cpu] [operations] | submit <coordinator> <a> <b> | submit-detach <coordinator> <operation> <value> [object-id] [cpu] [max-attempts] | status <coordinator> <task-id> | workers <coordinator> | cancel <coordinator> <task-id> | get <coordinator> <object-id> | release <coordinator> <object-id>");
     std::process::exit(2)
 }
 
@@ -67,6 +68,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.get(6).map(String::as_str).unwrap_or("all"),
             )
             .await?
+        }
+        Some("local") => {
+            // One-command local cluster: coordinator + N workers on this host.
+            // Prints the coordinator address on stdout, then blocks until Ctrl-C;
+            // the LocalCluster handle kills every child on drop.
+            let workers = args
+                .get(2)
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(2);
+            let ops = args.get(3).map(String::as_str).unwrap_or("all");
+            let cluster = LocalCluster::start(workers, ops)?;
+            println!("{}", cluster.coordinator_addr);
+            eprintln!(
+                "crayon.local coordinator={} workers={workers} ops={ops} — Ctrl-C to stop",
+                cluster.coordinator_addr
+            );
+            crayon::cluster::shutdown_signal().await;
+            eprintln!("crayon.local stopping");
         }
         Some("submit") => {
             let coordinator = args.get(2).unwrap_or_else(|| usage());

@@ -485,3 +485,47 @@ fn coordinator_logs_start_and_health_to_stderr() {
     assert!(saw_start, "no crayon.start line on coordinator stderr");
     assert!(saw_health, "no crayon.health line on coordinator stderr");
 }
+
+#[test]
+fn local_subcommand_spawns_a_working_cluster() {
+    // `crayon-cluster local N` is the one-command cluster: it prints the
+    // coordinator address on stdout, then blocks. Verify it comes up with N
+    // registered workers and that a task runs end to end through it.
+    use std::io::{BufRead, BufReader};
+
+    let binary = env!("CARGO_BIN_EXE_crayon-cluster");
+    let mut child = Command::new(binary)
+        .args(["local", "2", "all"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // First stdout line is the coordinator address.
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut addr = String::new();
+    out.read_line(&mut addr).unwrap();
+    let addr = addr.trim().to_owned();
+    assert!(addr.starts_with("127.0.0.1:"), "unexpected addr {addr:?}");
+
+    // Both workers register, and a submitted task runs.
+    let run = |args: &[&str]| Command::new(binary).args(args).output().unwrap();
+    let deadline = Instant::now() + READY_TIMEOUT;
+    let ready = loop {
+        let listed = String::from_utf8_lossy(&run(&["workers", &addr]).stdout)
+            .lines()
+            .count();
+        if listed >= 2 || Instant::now() >= deadline {
+            break listed;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(ready, 2, "local cluster did not register 2 workers");
+
+    let out = run(&["submit", &addr, "20", "22"]);
+    assert!(out.status.success());
+    assert_eq!(stdout(out), "42");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
