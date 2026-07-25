@@ -244,9 +244,7 @@ fn running_cancellation_releases_capacity_after_ack() {
     let mut cluster = Cluster::start(5_000);
     let worker = cluster.worker("sleep", 1.0);
     let (task, output) = cluster.submit("sleep", 5_000, None, 1.0, 1);
-    cluster.eventually(READY_TIMEOUT, || {
-        cluster.status(&task).contains("Running")
-    });
+    cluster.eventually(READY_TIMEOUT, || cluster.status(&task).contains("Running"));
     let cancel = cluster.run(["cancel", &cluster.coordinator, &task]);
     assert!(cancel.status.success());
     cluster.eventually(READY_TIMEOUT, || {
@@ -332,9 +330,7 @@ fn release_of_running_output_is_rejected_and_coordinator_survives() {
     let mut cluster = Cluster::start(5_000);
     cluster.worker("sleep", 1.0);
     let (task, output) = cluster.submit("sleep", 1_500, None, 1.0, 1);
-    cluster.eventually(READY_TIMEOUT, || {
-        cluster.status(&task).contains("Running")
-    });
+    cluster.eventually(READY_TIMEOUT, || cluster.status(&task).contains("Running"));
     let release = cluster.run(["release", &cluster.coordinator, &output]);
     assert!(!release.status.success());
     assert!(String::from_utf8_lossy(&release.stderr).contains("ObjectInUse"));
@@ -421,9 +417,7 @@ fn worker_drains_on_sigterm() {
     let mut cluster = Cluster::start(5_000);
     cluster.worker("sleep", 1.0);
     let (task, _) = cluster.submit("sleep", 2_000, None, 1.0, 1);
-    cluster.eventually(READY_TIMEOUT, || {
-        cluster.status(&task).contains("Running")
-    });
+    cluster.eventually(READY_TIMEOUT, || cluster.status(&task).contains("Running"));
     sigterm_and_wait_exit(
         &mut cluster.workers[0].child,
         Duration::from_secs(10),
