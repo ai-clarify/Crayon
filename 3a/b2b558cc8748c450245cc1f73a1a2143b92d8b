@@ -1,0 +1,29 @@
+CHANGELOG.md
+  s_e5fe4a420b3cd8::t_bbf1276d5b8e6c 3-5,19-39
+Cargo.lock
+  s_e5fe4a420b3cd8::t_19f87fa7a5cb8a 92
+Cargo.toml
+  s_e5fe4a420b3cd8::t_df7a8b3844e0b3 3
+crayon-py/Cargo.toml
+  s_e5fe4a420b3cd8::t_5a815b455155d9 3
+crayon-py/pyproject.toml
+  s_e5fe4a420b3cd8::t_a408769bd67270 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3ab2b558cc8748c450245cc1f73a1a2143b92d8b",
+  "prompts": {},
+  "sessions": {
+    "s_e5fe4a420b3cd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b7526072-49d4-4cf6-958c-965b8c6edfd9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
