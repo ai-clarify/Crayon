@@ -110,6 +110,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&out, &report)?;
     print!("{report}");
     eprintln!("wrote {}", out.display());
+    if let Some(path) = &args.baseline {
+        let base: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let new: serde_json::Value = serde_json::from_str(&report)?;
+        let rows = new["e2e"].as_array().unwrap();
+        let mut failed = false;
+        for row in base["e2e"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| r.get("error").is_none())
+        {
+            let size = row["size_bytes"].as_u64().unwrap();
+            let Some(now) = rows.iter().find(|r| r["size_bytes"].as_u64() == Some(size)) else {
+                continue;
+            };
+            for metric in ["put_mb_s", "get_mb_s"] {
+                let (Some(value), Some(baseline)) = (now[metric].as_f64(), row[metric].as_f64())
+                else {
+                    continue;
+                };
+                let regression = value < baseline * (1.0 - args.tolerance);
+                failed |= regression;
+                println!(
+                    "{} size={size} {metric} {value} vs base {baseline} ({:+.1}%)",
+                    if regression { "REGRESSION" } else { "OK" },
+                    (value / baseline - 1.0) * 100.0
+                );
+            }
+        }
+        if failed {
+            std::process::exit(1);
+        }
+    }
     Ok(())
 }
 
@@ -241,6 +274,8 @@ struct Args {
     artifact_dir: PathBuf,
     /// External coordinator address; if set, benchmark it instead of a local spawn.
     coordinator: Option<String>,
+    baseline: Option<PathBuf>,
+    tolerance: f64,
 }
 fn parse_args() -> Args {
     let mut m = std::collections::HashMap::new();
@@ -269,6 +304,11 @@ fn parse_args() -> Args {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("benchmark_artifacts/storage")),
         coordinator: m.get("--coordinator").cloned(),
+        baseline: m.get("--baseline").map(PathBuf::from),
+        tolerance: m
+            .get("--tolerance")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.15),
     }
 }
 async fn free_addr() -> Result<String, Error> {

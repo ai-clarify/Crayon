@@ -195,6 +195,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     kill(coordinator);
 
     write_artifacts(&args, &samples, total_episodes, total)?;
+    if let Some(path) = &args.baseline {
+        let base: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let baseline = base["episodes_per_s"].as_f64().unwrap();
+        let value = total_episodes as f64 / total.as_secs_f64();
+        let regression = value < baseline * (1.0 - args.tolerance);
+        println!(
+            "{} episodes_per_s {value} vs base {baseline} ({:+.1}%)",
+            if regression { "REGRESSION" } else { "OK" },
+            (value / baseline - 1.0) * 100.0
+        );
+        if regression {
+            std::process::exit(1);
+        }
+    }
     Ok(())
 }
 
@@ -215,6 +229,8 @@ struct Args {
     max_attempts: u32,
     seed_base: u64,
     artifact_dir: PathBuf,
+    baseline: Option<PathBuf>,
+    tolerance: f64,
 }
 
 fn print_help() {
@@ -275,6 +291,11 @@ fn parse_args() -> Args {
             .get("--artifact-dir")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("benchmark_artifacts/rl")),
+        baseline: values.get("--baseline").map(PathBuf::from),
+        tolerance: values
+            .get("--tolerance")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.15),
     }
 }
 
