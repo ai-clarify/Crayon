@@ -39,12 +39,6 @@ const ARENA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// forever and wedge the large-object put path. Well above any real write.
 const RESERVE_TTL: Duration = Duration::from_secs(60);
 
-/// A released slot's offset is quarantined this long before returning to the
-/// free list, so an in-flight zero-copy reader that already resolved the offset
-/// finishes its memcpy before a re-reserve can overwrite the bytes. Well above
-/// any same-host read.
-const RELEASE_GRACE: Duration = Duration::from_secs(5);
-
 /// Where a reader finds an object: which arena, and at what offset. Size and
 /// checksum travel in the surrounding `ObjectPayload`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,15 +76,11 @@ struct Alloc {
     /// compact later if it ever matters.
     free: HashMap<u64, Vec<u64>>,
     live: HashMap<ObjectId, Entry>,
-    /// Released `(slot, offset)` held back until `RELEASE_GRACE` elapses, so a
-    /// reader mid-copy is not overwritten by a re-reserve of the same slot.
-    quarantine: Vec<(Instant, u64, u64)>,
 }
 
 impl Alloc {
-    /// Returns crashed uncommitted reservations and grace-expired releases to
-    /// the free list. Driven lazily from `reserve`/`release`; no background
-    /// thread. O(live + quarantine), both bounded by in-flight object count.
+    /// Returns crashed uncommitted reservations to the free list. Driven lazily
+    /// from `reserve`; no background thread. O(live), bounded by in-flight puts.
     fn reap(&mut self, now: Instant) {
         let expired: Vec<ObjectId> = self
             .live
@@ -106,14 +96,6 @@ impl Alloc {
                 self.free.entry(e.slot).or_default().push(e.offset);
             }
         }
-        self.quarantine.retain(|(at, slot, offset)| {
-            if now.duration_since(*at) >= RELEASE_GRACE {
-                self.free.entry(*slot).or_default().push(*offset);
-                false
-            } else {
-                true
-            }
-        });
     }
 }
 
@@ -151,7 +133,6 @@ impl ArenaStore {
                 top: 0,
                 free: HashMap::new(),
                 live: HashMap::new(),
-                quarantine: Vec::new(),
             }),
             path,
         })
@@ -323,17 +304,16 @@ impl ArenaStore {
         Some(slice.to_vec())
     }
 
-    /// Retires an object's slot. The offset is quarantined for `RELEASE_GRACE`
-    /// before returning to the free list, so a zero-copy reader that already
-    /// resolved this offset finishes its copy before a re-reserve can overwrite
-    /// it. `reap` (driven from `reserve`) does the deferred return.
+    /// Recycles a slot into its exact-size free list, LIFO — the next same-size
+    /// reserve reuses the warmest offset, so the put/read/release hot path never
+    /// walks into cold arena pages. Release asserts no reader still holds the
+    /// offset; releasing mid-read is an application use-after-free (a single-node
+    /// arena does no reader refcounting).
     pub fn release(&self, id: ObjectId) {
         let mut a = self.alloc.lock();
-        let now = Instant::now();
         if let Some(entry) = a.live.remove(&id) {
-            a.quarantine.push((now, entry.slot, entry.offset));
+            a.free.entry(entry.slot).or_default().push(entry.offset);
         }
-        a.reap(now);
     }
 
     /// Test hook: drive the lazy reaper as if `d` had elapsed, without sleeping.
@@ -471,22 +451,12 @@ mod tests {
 
         store.release(id);
         assert!(store.meta(id).is_none());
-        // Slot is quarantined, not yet reusable: a same-size reserve bumps `top`
-        // to a fresh offset rather than handing back the in-flight one.
+        // Same exact size recycles the released offset immediately (LIFO), so the
+        // hot path reuses warm pages rather than bumping `top` into cold arena.
         let id2 = ObjectId::new();
-        assert_ne!(
-            store
-                .reserve(id2, payload.len() as u64, Codec::RawBytes, checksum)
-                .unwrap()
-                .0,
-            offset
-        );
-        // After the grace window the quarantined slot recycles to its offset.
-        store.reap_after(RELEASE_GRACE);
-        let id3 = ObjectId::new();
         assert_eq!(
             store
-                .reserve(id3, payload.len() as u64, Codec::RawBytes, checksum)
+                .reserve(id2, payload.len() as u64, Codec::RawBytes, checksum)
                 .unwrap()
                 .0,
             offset
