@@ -56,6 +56,10 @@ host, never asserted.
 
 ## Workflow
 
+- **MANDATORY: extreme brevity in code and comments.** As few as possible —
+  fewer lines, fewer words, fewer comments. Delete any comment that restates
+  the code; keep only what explains *why* or a non-obvious invariant. Every
+  line must earn its place. Not a preference — a hard rule.
 - **Simplify before every commit.** Before staging changes, do a simplification pass:
   delete dead code, replace custom logic with stdlib/native equivalents, collapse
   duplication, drop unused abstractions. A commit that adds functionality must
