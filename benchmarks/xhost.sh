@@ -27,6 +27,9 @@ HOST_A_IP="${HOST_A_IP:-10.37.2.27}"      # A's routable IP that B dials
 PORT="${PORT:-$(( (RANDOM % 20000) + 30000 ))}"
 LEASE_MS="${LEASE_MS:-5000}"
 REMOTE_DIR="${REMOTE_DIR:-~/crayon-bench}"
+# Per-run remote scratch dir, keyed by the (random) port so concurrent runs on
+# the same host never clobber each other's coord.log / perf artifacts.
+RUN_DIR="\$HOME/crayon-run-$PORT"
 SAMPLES="${SAMPLES:-200}"
 WARMUPS="${WARMUPS:-20}"
 # Cross-host throughput regression gate: compare this run against a committed
@@ -48,15 +51,17 @@ say()   { echo "[xhost] $*"; }
 fail()  { echo "[xhost] FAIL: $*" >&2; exit 1; }
 
 cleanup() {
-  say "teardown: killing coordinator on $HOST_A"
-  ssh_a "kill ${COORD_PID:-0} 2>/dev/null; pkill -f '[t]arget/release/crayon-cluster coordinator' 2>/dev/null; true" || true
+  say "teardown: killing coordinator on $HOST_A, removing $RUN_DIR"
+  ssh_a "kill ${COORD_PID:-0} 2>/dev/null; pkill -f '[t]arget/release/crayon-cluster coordinator 0.0.0.0:$PORT' 2>/dev/null; rm -rf $RUN_DIR; true" || true
 }
 trap cleanup EXIT INT TERM
 
-# 0. idempotency: clear stale processes/run dirs on both hosts.
-say "pre-clean $HOST_A and $HOST_B"
-ssh_a "pkill -f '[t]arget/release/crayon-cluster' 2>/dev/null; rm -rf ~/crayon-run; mkdir -p ~/crayon-run; true" || fail "cannot reach $HOST_A"
-ssh_b "pkill -f '[t]arget/release/crayon-cluster' 2>/dev/null; true" || fail "cannot reach $HOST_B"
+# 0. idempotency: make this run's private scratch dir. No global pkill — the
+#    per-port coordinator is killed by name at teardown, so concurrent runs on
+#    other ports are left alone.
+say "pre-clean $HOST_A and $HOST_B (run dir: $RUN_DIR)"
+ssh_a "rm -rf $RUN_DIR; mkdir -p $RUN_DIR; true" || fail "cannot reach $HOST_A"
+ssh_b "true" || fail "cannot reach $HOST_B"
 
 # 1. sync + build release on both hosts (mac binary is the wrong arch).
 say "sync repo to both hosts"
@@ -83,7 +88,7 @@ ssh_b "pip install --no-deps --break-system-packages --force-reinstall $REMOTE_D
 
 # 2. launch coordinator detached on A, capture its remote pid.
 say "start coordinator on $HOST_A at $COORD_ADDR"
-COORD_PID="$(ssh_a "cd $REMOTE_DIR && nohup ./target/release/crayon-cluster coordinator $COORD_ADDR $LEASE_MS >/dev/null 2>~/crayon-run/coord.log & echo \$!")" || fail "launch coordinator"
+COORD_PID="$(ssh_a "cd $REMOTE_DIR && nohup ./target/release/crayon-cluster coordinator $COORD_ADDR $LEASE_MS >/dev/null 2>$RUN_DIR/coord.log & echo \$!")" || fail "launch coordinator"
 say "coordinator pid=$COORD_PID"
 
 # 3. readiness gate from B (poll, no fixed sleep). Startup banner is on stderr.
@@ -92,7 +97,7 @@ ssh_b "cd $REMOTE_DIR && for i in \$(seq 1 75); do ./target/release/crayon-clust
 
 # 4. cross-host guard: A's arena file must NOT exist on B, else B would mmap it
 #    and silently take the same-host path (chunk code never runs => false pass).
-ARENA_PATH="$(ssh_a "grep -oE 'arena_path=[^ ]+' ~/crayon-run/coord.log | head -1 | cut -d= -f2")"
+ARENA_PATH="$(ssh_a "grep -oE 'arena_path=[^ ]+' $RUN_DIR/coord.log | head -1 | cut -d= -f2")"
 [ -n "$ARENA_PATH" ] || fail "no arena_path in coordinator log"
 say "coordinator arena: $ARENA_PATH"
 ssh_b "test ! -e '$ARENA_PATH'" || fail "arena file exists on $HOST_B — hosts share /dev/shm, not a real cross-host test"
@@ -122,13 +127,13 @@ say "correctness passed"
 say "perf: storage-benchmark --coordinator (sizes: $PERF_SIZES)"
 BASE_ARG=""
 [ -n "$BASELINE" ] && BASE_ARG="--baseline $REMOTE_DIR/$BASELINE --tolerance $TOLERANCE"
-ssh_b "cd $REMOTE_DIR && ./target/release/storage-benchmark --coordinator $DIAL --sizes $PERF_SIZES --samples $SAMPLES --warmups $WARMUPS --artifact-dir ~/crayon-run/xhost $BASE_ARG 2>/dev/null" || fail "perf sweep regressed past ${TOLERANCE} vs $BASELINE"
+ssh_b "cd $REMOTE_DIR && mkdir -p $RUN_DIR && ./target/release/storage-benchmark --coordinator $DIAL --sizes $PERF_SIZES --samples $SAMPLES --warmups $WARMUPS --artifact-dir $RUN_DIR/xhost $BASE_ARG 2>/dev/null" || fail "perf sweep regressed past ${TOLERANCE} vs $BASELINE"
 
 # 7. record perf JSON for regression tracking.
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 SHA="$(git -C "$REPO" rev-parse --short HEAD)"
 mkdir -p "$REPO/benchmarks/results/xhost"
 OUT="$REPO/benchmarks/results/xhost/${STAMP}-${SHA}-${HOST_A}_${HOST_B}.json"
-ssh_b "cat ~/crayon-run/xhost/storage_summary.json" > "$OUT" 2>/dev/null && say "recorded $OUT" || say "warn: could not fetch perf JSON"
+ssh_b "cat $RUN_DIR/xhost/storage_summary.json; rm -rf $RUN_DIR" > "$OUT" 2>/dev/null && say "recorded $OUT" || say "warn: could not fetch perf JSON"
 
 say "DONE — cross-host correctness + perf both passed"
