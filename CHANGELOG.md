@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.6.2
+
+Correctness + regression-hardening. No wire change (protocol stays 7).
 
 ### Fixes
 
@@ -13,6 +15,27 @@
   quarantine masked is an application use-after-free (a client releasing an
   object another still reads) — out of scope, as the arena does no reader
   refcounting. The unrelated reservation-leak fix (TTL reap) stays.
+
+### Regression guards
+
+- **Arena slot-reuse unit guard.** The 5× regression passed all 64 correctness
+  tests because none asserted a performance or allocator invariant. A serial
+  put/read/release churn now asserts `used_bytes()` plateaus at one slot;
+  machine-speed-independent, and it fails on the quarantine behavior.
+- **`--baseline` throughput gate** on `storage-benchmark` and `rl-benchmark`:
+  compare put/get MB/s (per size) and episodes/s against a committed baseline,
+  exit non-zero past `--tolerance` (default 0.15). Catches "slower but not
+  leaking" regressions the unit guard can't.
+- **`xhost.sh` gates the cross-host perf sweep** against the committed baseline
+  (removed the pipe that swallowed the exit code), and uses a per-run scratch
+  dir + port-scoped kill so concurrent runs no longer clobber each other.
+
+### Docs
+
+- `ClusterClient::release` now documents its reader-lifetime contract.
+- README storage/RL numbers re-measured on v100 vs Ray 2.56.1 with the fix in
+  place; committed baselines under `benchmarks/results/{storage,rl}/`. Narrowed
+  the amplification claim to the measured sizes.
 
 ## 0.6.1
 

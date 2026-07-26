@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "crayon-rs"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "bincode",
  "blake3",

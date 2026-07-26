@@ -1,6 +1,6 @@
 [package]
 name = "crayon-py"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 description = "Python client for the Crayon distributed task runtime"
 license = "MIT"
