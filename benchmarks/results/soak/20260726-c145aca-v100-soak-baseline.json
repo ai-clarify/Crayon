@@ -1,0 +1,33 @@
+{
+  "host": "v100",
+  "commit": "c145aca",
+  "date": "2026-07-26",
+  "note": "Stopped early at ~46min (user request); 36h target not reached. All leak/OOM/disk signals had already plateaued. Binary built from a tree with the release-quarantine removed (112830a) — arena keeps only the reserve-TTL reaper.",
+  "config": {
+    "workers": 4,
+    "lease_ms": 5000,
+    "obj_size_bytes": 1048576,
+    "sample_sec": 30,
+    "chaos_every_sec": 60,
+    "duration_target_s": 129600
+  },
+  "run": {
+    "samples": 93,
+    "span_s": 2763,
+    "result": "OK (no threshold breached before stop)"
+  },
+  "plateaus": {
+    "coord_rss_mib": {"peak": 14, "ceiling": 2048, "verdict": "flat after warmup — no coord memory leak"},
+    "arena_bytes_mib": {"peak": 294, "verdict": "high-water hit ~294 then flat under continuous 1MiB put/release churn — reserve-TTL reap holds, no arena leak"},
+    "tasks": {"peak": 1082, "ceiling": 20000, "verdict": "bounded ~1074 — terminal-task reclaim holds (pre-fix would climb to MAX_TASKS 16384)"},
+    "shm_free_mib": {"min": 6376, "floor": 512, "verdict": "stable — no tmpfs fill"}
+  },
+  "chaos": {
+    "worker_kills": "kill -9 a random worker every ~60s, restart fresh",
+    "objects_lost": 860,
+    "retries_total": 25,
+    "failures_total": 0,
+    "verdict": "every lease-expiry object loss retried under backoff; zero permanent failures"
+  },
+  "final_health": "crayon.health tasks=1063 running=0 succeeded=1063 failed=0 objects=1113 available=309 reserved=0 lost=804 workers=4 arena_bytes=308281344 retries_total=25 failures_total=0"
+}
