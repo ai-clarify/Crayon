@@ -487,6 +487,31 @@ mod tests {
         assert!(store.meta(id2).is_some());
     }
 
+    // Regression guard for the 5x same-host put regression (112830a): a serial
+    // put/read/release churn of one size must reuse its slot, so `top` plateaus
+    // at one slot regardless of loop count. Under the old release-quarantine
+    // nothing recycled and `top` grew to iters*slot, cold-faulting every put.
+    // Machine-speed-independent: asserts the allocator invariant, not a latency.
+    #[test]
+    fn same_size_churn_reuses_one_slot() {
+        let store = ArenaStore::new().unwrap();
+        let size = 1 << 20;
+        let payload = vec![7u8; size];
+        let checksum = crate::cluster::checksum(&payload);
+        for _ in 0..1000 {
+            let id = ObjectId::new();
+            let (offset, _) = store
+                .reserve(id, size as u64, Codec::RawBytes, checksum)
+                .unwrap();
+            store.write_at(offset, &payload);
+            store.commit(id);
+            assert_eq!(store.read(id).unwrap().len(), size);
+            store.release(id);
+        }
+        // One 8-byte-aligned slot, not 1000. `top` is the high-water mark.
+        assert_eq!(store.used_bytes(), size as u64);
+    }
+
     #[test]
     fn chunked_write_and_read_round_trip_with_bounds() {
         let store = ArenaStore::new().unwrap();
