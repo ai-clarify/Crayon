@@ -565,6 +565,10 @@ impl ClusterClient {
             _ => Err(Error::Protocol("unexpected cancel reply".into())),
         }
     }
+    /// Releases the object after every `get` has fully returned its bytes.
+    /// Releasing while a same-host arena reader is still copying is application
+    /// use-after-free: the arena deliberately has no reader refcounting, matching
+    /// the coordinator's non-goal of distributed reference counting.
     pub async fn release(&self, id: ObjectId) -> Result<(), Error> {
         match self.rpc(ClientRequest::Release(id)).await? {
             ClientReply::Released => Ok(()),

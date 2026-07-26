@@ -33,9 +33,9 @@ fast path.
 | 16 MB | **1.1 ms** / 1.7 ms | **1.0 ms** / 3.3 ms | 2.4× |
 | 1 GB | **51 ms** / 66 ms | **134 ms** / 624 ms | 3.7× |
 
-Write/read amplification is 0.0 at every size (counting allocator). The
-shared-memory arena carries same-host payloads of any size — the 8 MiB RPC
-frame cap applies only across hosts.
+Read amplification is 0.0 at the measured sizes (counting allocator): a get is
+a slice out of the mmap, no copy. The shared-memory arena carries same-host
+payloads of any size — the 8 MiB RPC frame cap applies only across hosts.
 
 **Scheduling** (`rl-benchmark` vs `ray_rl_benchmark.py`, identical bandit
 workload, 6 workers × 16 parallel rollouts × 300 iterations):

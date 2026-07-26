@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **Same-host put 5× regression.** 0.6.1's release-grace (a 5 s quarantine before
+  a freed arena slot returned to the free list) meant any put/read/release burst
+  shorter than 5 s — the storage benchmark and every ephemeral RL worker — never
+  recycled a slot, so each put's memcpy hit a cold, never-faulted arena page.
+  Measured on v100, 1 MiB: put 855→171 µs, get 190→113 µs. Released slots now
+  recycle immediately (LIFO), reusing warm pages. The reader/writer race the
+  quarantine masked is an application use-after-free (a client releasing an
+  object another still reads) — out of scope, as the arena does no reader
+  refcounting. The unrelated reservation-leak fix (TTL reap) stays.
+
 ## 0.6.1
 
 Ergonomics: one-call local cluster, the `ray.init()` analogue. No wire change
