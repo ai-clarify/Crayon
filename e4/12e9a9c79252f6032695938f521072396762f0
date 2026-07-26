@@ -1,0 +1,21 @@
+src/arena.rs
+  s_e5fe4a420b3cd8::t_b342034a542b2d 490-514
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e412e9a9c79252f6032695938f521072396762f0",
+  "prompts": {},
+  "sessions": {
+    "s_e5fe4a420b3cd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b7526072-49d4-4cf6-958c-965b8c6edfd9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
