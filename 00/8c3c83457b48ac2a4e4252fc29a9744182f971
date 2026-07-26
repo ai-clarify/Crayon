@@ -1,0 +1,33 @@
+CHANGELOG.md
+  s_e5fe4a420b3cd8::t_4b4d82628484d4 3-16
+README.md
+  s_e5fe4a420b3cd8::t_6766ffff532006 36-38
+src/client.rs
+  s_26174b97fd8d19::t_82000c910fe897 568-571
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "008c3c83457b48ac2a4e4252fc29a9744182f971",
+  "prompts": {},
+  "sessions": {
+    "s_26174b97fd8d19": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aa475d0c-8a10-442b-a69f-df1043cce35a",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_e5fe4a420b3cd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b7526072-49d4-4cf6-958c-965b8c6edfd9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
