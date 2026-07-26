@@ -29,6 +29,10 @@ LEASE_MS="${LEASE_MS:-5000}"
 REMOTE_DIR="${REMOTE_DIR:-~/crayon-bench}"
 SAMPLES="${SAMPLES:-200}"
 WARMUPS="${WARMUPS:-20}"
+# Cross-host throughput regression gate: compare this run against a committed
+# baseline and fail if any size regresses past TOLERANCE. Empty BASELINE skips.
+BASELINE="${BASELINE:-benchmarks/results/xhost/20260725-67b7641-v100_digest-baseline.json}"
+TOLERANCE="${TOLERANCE:-0.2}"
 COORD_ADDR="0.0.0.0:$PORT"
 DIAL="$HOST_A_IP:$PORT"
 # MAX_OBJECT_BYTES = 8 MiB - 64 KiB. Straddle it: last single-frame, first
@@ -112,9 +116,13 @@ print('CORRECTNESS_OK')
 PY" || fail "cross-host correctness"
 say "correctness passed"
 
-# 6. PERF: cross-host throughput sweep from B against A's coordinator.
+# 6. PERF: cross-host throughput sweep from B against A's coordinator. With a
+#    BASELINE, storage-benchmark exits non-zero on a >TOLERANCE regression — no
+#    output-masking pipe here, so that exit code propagates through ssh.
 say "perf: storage-benchmark --coordinator (sizes: $PERF_SIZES)"
-ssh_b "cd $REMOTE_DIR && ./target/release/storage-benchmark --coordinator $DIAL --sizes $PERF_SIZES --samples $SAMPLES --warmups $WARMUPS --artifact-dir ~/crayon-run/xhost 2>/dev/null | grep -A20 '\"e2e\"'" || fail "perf sweep"
+BASE_ARG=""
+[ -n "$BASELINE" ] && BASE_ARG="--baseline $REMOTE_DIR/$BASELINE --tolerance $TOLERANCE"
+ssh_b "cd $REMOTE_DIR && ./target/release/storage-benchmark --coordinator $DIAL --sizes $PERF_SIZES --samples $SAMPLES --warmups $WARMUPS --artifact-dir ~/crayon-run/xhost $BASE_ARG 2>/dev/null" || fail "perf sweep regressed past ${TOLERANCE} vs $BASELINE"
 
 # 7. record perf JSON for regression tracking.
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
