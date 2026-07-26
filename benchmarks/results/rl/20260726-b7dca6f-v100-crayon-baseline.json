@@ -1,0 +1,12 @@
+{
+  "episodes_per_s": 11653.268757909838,
+  "iterations": 300,
+  "max_attempts": 3,
+  "parallelism": 16,
+  "policy_dim": 32,
+  "seed_base": 42,
+  "steps": 500,
+  "total_episodes": 4800,
+  "total_time_s": 0.411901596,
+  "workers": 6
+}

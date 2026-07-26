@@ -28,10 +28,10 @@ fast path.
 
 | Payload | put Crayon / Ray | get Crayon / Ray | Round trip |
 |---|---|---|---|
-| 1 KB | **96 µs** / 297 µs | **48 µs** / 70 µs | 2.5× |
-| 1 MB | **169 µs** / 519 µs | **122 µs** / 160 µs | 2.3× |
-| 16 MB | **940 µs** / 1.6 ms | **981 µs** / 3.3 ms | 2.6× |
-| 1 GB | **51 ms** / 66 ms | **131 ms** / 622 ms | 3.8× |
+| 1 KB | **79 µs** / 316 µs | **39 µs** / 70 µs | 3.3× |
+| 1 MB | **164 µs** / 541 µs | **114 µs** / 154 µs | 2.5× |
+| 16 MB | **1.1 ms** / 1.7 ms | **1.0 ms** / 3.3 ms | 2.4× |
+| 1 GB | **51 ms** / 66 ms | **134 ms** / 624 ms | 3.7× |
 
 Write/read amplification is 0.0 at every size (counting allocator). The
 shared-memory arena carries same-host payloads of any size — the 8 MiB RPC
@@ -39,7 +39,7 @@ frame cap applies only across hosts.
 
 **Scheduling** (`rl-benchmark` vs `ray_rl_benchmark.py`, identical bandit
 workload, 6 workers × 16 parallel rollouts × 300 iterations):
-**11 984 episodes/s vs 1 593 — 7.5× faster.**
+**11 653 episodes/s vs 1 539 — 7.6× faster.**
 
 **Real LLM RL** (Qwen3.5-0.8B on one V100, 2 rollout actors + judge + REINFORCE
 learner): the 2 GB policy broadcasts through the arena in **381 ms**; 30

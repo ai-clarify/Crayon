@@ -1,0 +1,63 @@
+{
+  "samples": 300,
+  "warmups": 50,
+  "e2e": [
+    {
+      "size_bytes": 1024,
+      "put_p50_us": 79.15,
+      "put_p99_us": 117.89,
+      "put_mb_s": 11.4,
+      "get_p50_us": 38.66,
+      "get_p99_us": 68.05,
+      "get_mb_s": 23.1
+    },
+    {
+      "size_bytes": 1048576,
+      "put_p50_us": 163.92,
+      "put_p99_us": 261.08,
+      "put_mb_s": 5823.2,
+      "get_p50_us": 114.22,
+      "get_p99_us": 181.7,
+      "get_mb_s": 8498.4
+    },
+    {
+      "size_bytes": 16777216,
+      "put_p50_us": 1091.99,
+      "put_p99_us": 1534.99,
+      "put_mb_s": 13824.1,
+      "get_p50_us": 1002.3,
+      "get_p99_us": 1745.27,
+      "get_mb_s": 14243.5
+    },
+    {
+      "size_bytes": 1073741824,
+      "put_p50_us": 51369.48,
+      "put_p99_us": 64882.58,
+      "put_mb_s": 19293.0,
+      "get_p50_us": 134441.97,
+      "get_p99_us": 171543.69,
+      "get_mb_s": 7398.7
+    }
+  ],
+  "read_amplification": [
+    {
+      "size_bytes": 1024,
+      "reads": 300,
+      "bytes_allocated": 0,
+      "amplification": 0.0
+    },
+    {
+      "size_bytes": 1048576,
+      "reads": 300,
+      "bytes_allocated": 0,
+      "amplification": 0.0
+    },
+    {
+      "size_bytes": 16777216,
+      "reads": 300,
+      "bytes_allocated": 0,
+      "amplification": 0.0
+    }
+  ],
+  "note": "small trio samples=300; 1GB samples=30 (appended)"
+}

@@ -10,6 +10,6 @@ benchmark_rl_*.csv
 soak*.csv
 crayon-py/dist/
 
-# Two-host perf runs (keep committed baselines, ignore ad-hoc reruns)
-benchmarks/results/xhost/*.json
-!benchmarks/results/xhost/*-baseline.json
+# Benchmark runs (keep committed baselines, ignore ad-hoc reruns)
+benchmarks/results/*/*.json
+!benchmarks/results/*/*-baseline.json
