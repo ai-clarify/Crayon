@@ -1,0 +1,53 @@
+Cargo.toml
+  s_359fa7115f4065::t_a3cf03dbf7aece 16
+README.md
+  s_359fa7115f4065::t_26ad4490f6fd6d 36-39,41-43,45-49,56-58
+benchmarks/ray_rl_benchmark.py
+  s_359fa7115f4065::t_d5e43fc8d9e9e5 61-66,95-97
+benchmarks/soak.sh
+  s_359fa7115f4065::t_e700edbe858c46 62-66,69,93-100,128,151,199-200,230,237-240,270,277-279
+benchmarks/xhost.sh
+  s_359fa7115f4065::t_541b4db1bdd6b9 37,91
+docker-compose.yml
+  s_359fa7115f4065::t_7226a4cb298572 4,13
+src/arena.rs
+  s_359fa7115f4065::t_50564aa474b977 31-36,62-64,69-74,180-182,186-197,203-205,207,213,222-224,229-252,255-259,261-263,269-280,282,331-359,361-367,521-528,530-533,535-536,540,546-565,567-568,570-592,596,599-601,604-612,617-643,652-659,661-662,674-676,683-685,687-689,691
+src/bin/crayon_cluster.rs
+  s_359fa7115f4065::t_50367c3f9c7144 14,19-23,39,56-62,76,235-240,243-244,248-250,252-322,329-334,338-340,343,347,354-359,365-370,377-379,381-384,393,397,443,455,464-469,474-483,878,894-906,924-929,933,941-942,949-965
+src/bin/rl_benchmark.rs
+  s_359fa7115f4065::t_18a04bfd88732b 138-140,143-152,190-195
+src/bin/storage_benchmark.rs
+  s_359fa7115f4065::t_d51529298d3040 116-120,122-129,131-135,168,172
+src/client.rs
+  s_359fa7115f4065::t_b5e6a4b0c57d53 14-15,130,133,136-138,147,158-161,188,194-198,211-214
+src/cluster.rs
+  s_359fa7115f4065::t_430f7b72c4ffab 490-495,640-671,674,705,714-720,724-731,736-739,742,745-753,817
+src/cluster_tests.rs
+  s_359fa7115f4065::t_8449a6fd81c00c 8,52-150,309-310,338-340,344-345
+src/coordinator.rs
+  s_359fa7115f4065::t_2fbac464f79789 550-573,892-897
+src/coordinator_tests.rs
+  s_359fa7115f4065::t_7d77d1c6f3fb49 63-81,369-399
+src/protocol.rs
+  s_359fa7115f4065::t_6a25dcce45d372 21-23,143-148,196-200,208,293-294,298
+tests/cluster_process.rs
+  s_359fa7115f4065::t_295c74980907df 264,302
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "be549b53634d38ce45c018e320e184f2c2b56f1e",
+  "prompts": {},
+  "sessions": {
+    "s_359fa7115f4065": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4ac0526d-4959-4684-a384-771c9bcb4bc1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
