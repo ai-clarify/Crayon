@@ -1,0 +1,29 @@
+README.md
+  s_e5fe4a420b3cd8::t_1108ffef01c344 31-34,42,66
+benchmarks/results/rl/20260727-3ab2b55-v100-crayon-baseline.json
+  s_e5fe4a420b3cd8::t_500d90eab5cd0d 2,10,12
+benchmarks/results/rl/20260727-3ab2b55-v100-ray-baseline.json
+  s_e5fe4a420b3cd8::t_88f4ef46ec8534 10-12
+benchmarks/results/storage/20260727-3ab2b55-v100-crayon-baseline.json
+  s_e5fe4a420b3cd8::t_fe86fadc77bab1 7-12,16-21,25-30,34-39,43-45,47-48
+benchmarks/results/storage/20260727-3ab2b55-v100-ray-baseline.json
+  s_e5fe4a420b3cd8::t_e71014919a78b8 7-9,14-17,21-24,28-31,34-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2eb73da04c6762d86ba887521adaee36df3bdfb4",
+  "prompts": {},
+  "sessions": {
+    "s_e5fe4a420b3cd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b7526072-49d4-4cf6-958c-965b8c6edfd9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
