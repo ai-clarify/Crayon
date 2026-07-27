@@ -7,6 +7,6 @@
   "max_attempts": 3,
   "seed_base": 42,
   "total_episodes": 4800,
-  "total_time_s": 3.119797163992189,
-  "episodes_per_s": 1538.5615627196005
+  "total_time_s": 3.092356624023523,
+  "episodes_per_s": 1552.2142442143786
 }

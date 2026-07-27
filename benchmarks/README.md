@@ -27,22 +27,14 @@ On a server-class host (Intel Xeon Platinum 8260, 8 logical CPUs):
 
 | System         | episodes/s | total time | per iteration |
 |----------------|-----------:|-----------:|--------------:|
-| **Crayon**     |   **4311** |     3.71 s |        3.7 ms |
-| Ray 2.56.1     |       1752 |     9.13 s |        9.1 ms |
-| **Speed-up**   |   **2.5×** |            |               |
-
-On a laptop-class host (Apple M4 Pro, 14 logical CPUs):
-
-| System         | episodes/s | total time | per iteration |
-|----------------|-----------:|-----------:|--------------:|
-| **Crayon**     |   **2341** |     6.84 s |        6.8 ms |
-| Ray 2.53       |        486 |    32.91 s |       32.9 ms |
-| **Speed-up**   |   **4.8×** |            |               |
+| **Crayon**     |   **9924** |     1.61 s |        1.6 ms |
+| Ray 2.56.1     |       1764 |     9.07 s |        9.1 ms |
+| **Speed-up**   |   **5.6×** |            |               |
 
 Crayon's per-iteration cost is flat to completion — no degradation as tasks
 accumulate — so the run length is unbounded. On the Xeon host this workload was
-6.1× *slower* than Ray before the 0.3.0 control-plane rewrite; it is now 2.5×
-faster — a ~15× swing on the same hardware.
+6.1× *slower* than Ray before the 0.3.0 control-plane rewrite; it is now 5.6×
+faster — a ~34× swing on the same hardware.
 
 ## Scaling with worker count
 
@@ -53,21 +45,18 @@ tracks how well each system's control plane scales with node count.
 
 | workers | Crayon (ep/s) | Ray 2.56 (ep/s) | Crayon advantage |
 |--------:|--------------:|----------------:|-----------------:|
-|       1 |          2902 |             958 |            3.0×  |
-|       2 |          4782 |               — |               —  |
-|       4 |          6377 |            1972 |            3.2×  |
-|       8 |          7531 |            1587 |            4.7×  |
-|      16 |          8709 |            1120 |            7.8×  |
+|       1 |          5468 |             955 |            5.7×  |
+|       2 |          7682 |               — |               —  |
+|       4 |         10655 |            2071 |            5.1×  |
+|       8 |         13860 |            1865 |            7.4×  |
+|      16 |         15432 |            1163 |           13.3×  |
 
 Crayon rises with worker count past the host's core count. **Ray peaks at 4
 workers and then regresses** — adding workers makes it slower, as central (GCS +
 Python) scheduling contention and plasma pressure outweigh the added
-parallelism. The advantage therefore widens with scale: 3.0× at one worker, 7.8×
-at sixteen, with the trend pointing higher on a real multi-node cluster where
-per-task central-scheduler cost dominates. These are post-`4adf025` numbers:
-shortening the coordinator's critical sections lifted 16-worker throughput 28%
-(6785 → 8709), and the gain grows with worker count because it removes shared-lock
-contention.
+parallelism. The advantage therefore widens with scale: 5.7× at one worker,
+13.3× at sixteen, with the trend pointing higher on a real multi-node cluster
+where per-task central-scheduler cost dominates.
 
 ## Scaling with per-task compute
 
@@ -76,17 +65,17 @@ varying `--steps` to make each rollout heavier, on the Xeon host:
 
 | steps/task | Crayon total | Ray total | speed-up | saved / 1000 iters |
 |-----------:|-------------:|----------:|---------:|-------------------:|
-|          1 |       3.60 s |    7.96 s |    2.2×  |             4.4 s  |
-|        100 |       3.61 s |    8.28 s |    2.3×  |             4.7 s  |
-|        500 |       3.68 s |    9.30 s |    2.5×  |             5.6 s  |
-|       2000 |       3.65 s |   12.07 s |    3.3×  |             8.4 s  |
+|          1 |       1.56 s |    8.04 s |    5.2×  |             6.5 s  |
+|        100 |       1.61 s |    8.24 s |    5.1×  |             6.6 s  |
+|        500 |       1.57 s |    9.11 s |    5.8×  |             7.5 s  |
+|       2000 |       1.63 s |   11.99 s |    7.4×  |            10.4 s  |
 
-Crayon's wall-clock is **flat** as the task gets heavier (3.60 → 3.65 s) because
+Crayon's wall-clock is **flat** as the task gets heavier (1.56 → 1.63 s) because
 its four workers run rollouts in true parallel. Ray gets **linearly slower**
-(7.96 → 12.07 s): its Python scheduling layer and the GIL serialize even the
+(8.04 → 11.99 s): its Python scheduling layer and the GIL serialize even the
 compute, so heavier tasks are not fully parallelized. The consequence is
 counter-intuitive but measured — **the heavier the per-task compute, the larger
-Crayon's end-to-end advantage** (3.3× at steps=2000), the opposite of a
+Crayon's end-to-end advantage** (7.4× at steps=2000), the opposite of a
 framework whose only edge is scheduling overhead.
 
 ## Why Crayon is faster here
@@ -115,15 +104,15 @@ itself is nearly free.
 
 If per-task compute is large (raise `--steps`), both systems become CPU-bound
 and converge to the same hardware ceiling — the framework stops mattering. The
-4.8× reflects control-plane efficiency, which is exactly what shows up in
-fan-out workloads of many small tasks.
+measured speed-up reflects control-plane efficiency, which is exactly what shows
+up in fan-out workloads of many small tasks.
 
 ## Reproduce
 
 ```sh
 # Crayon (release)
-cargo build --release --bin rl_benchmark --bin crayon-cluster
-./target/release/rl_benchmark \
+cargo build --release --bin rl-benchmark --bin crayon-cluster
+./target/release/rl-benchmark \
   --workers 4 --parallelism 16 --iterations 1000 --steps 500 \
   --policy-dim 32 --seed 42 --artifact-dir /tmp/crayon-rl
 

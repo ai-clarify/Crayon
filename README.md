@@ -28,10 +28,10 @@ fast path.
 
 | Payload | put Crayon / Ray | get Crayon / Ray | Round trip |
 |---|---|---|---|
-| 1 KB | **79 µs** / 316 µs | **39 µs** / 70 µs | 3.3× |
-| 1 MB | **164 µs** / 541 µs | **114 µs** / 154 µs | 2.5× |
-| 16 MB | **1.1 ms** / 1.7 ms | **1.0 ms** / 3.3 ms | 2.4× |
-| 1 GB | **51 ms** / 66 ms | **134 ms** / 624 ms | 3.7× |
+| 1 KB | **80 µs** / 304 µs | **39 µs** / 70 µs | 3.1× |
+| 1 MB | **159 µs** / 528 µs | **110 µs** / 151 µs | 2.5× |
+| 16 MB | **1.1 ms** / 1.6 ms | **1.0 ms** / 3.3 ms | 2.4× |
+| 1 GB | **50 ms** / 66 ms | **132 ms** / 620 ms | 3.8× |
 
 Read amplification is 0.0 at the measured sizes (counting allocator): a get is
 a slice out of the mmap, no copy. The shared-memory arena carries same-host
@@ -39,7 +39,7 @@ payloads of any size — the 8 MiB RPC frame cap applies only across hosts.
 
 **Scheduling** (`rl-benchmark` vs `ray_rl_benchmark.py`, identical bandit
 workload, 6 workers × 16 parallel rollouts × 300 iterations):
-**11 653 episodes/s vs 1 539 — 7.6× faster.**
+**11 799 episodes/s vs 1 552 — 7.6× faster.**
 
 **Real LLM RL** (Qwen3.5-0.8B on one V100, 2 rollout actors + judge + REINFORCE
 learner): the 2 GB policy broadcasts through the arena in **381 ms**; 30
@@ -63,7 +63,7 @@ no data loss and no overhead where the model dominates.
 ## Install
 
 ```bash
-cargo install crayon-rs --version 0.6.1   # library `crayon`, binary `crayon-cluster`
+cargo install crayon-rs --version 0.6.2   # library `crayon`, binary `crayon-cluster`
 ```
 
 Python client (pyo3, arena-aware — gigabyte puts from Python):

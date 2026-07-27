@@ -1,0 +1,35 @@
+{
+  "samples": 300,
+  "warmups": 50,
+  "e2e": [
+    {
+      "size_bytes": 1024,
+      "put_p50_us": 303.97,
+      "put_mb_s": 3.0,
+      "get_p50_us": 69.57,
+      "get_mb_s": 13.7
+    },
+    {
+      "size_bytes": 1048576,
+      "put_p50_us": 527.51,
+      "put_mb_s": 1587.6,
+      "get_p50_us": 151.16,
+      "get_mb_s": 6434.8
+    },
+    {
+      "size_bytes": 16777216,
+      "put_p50_us": 1621.09,
+      "put_mb_s": 6827.2,
+      "get_p50_us": 3304.76,
+      "get_mb_s": 4831.9
+    },
+    {
+      "size_bytes": 1073741824,
+      "put_p50_us": 66189.31,
+      "put_mb_s": 15492.8,
+      "get_p50_us": 619984.02,
+      "get_mb_s": 1649.6
+    }
+  ],
+  "note": "Ray 2.56.1. small trio samples=300; 1GB samples=30 (appended)."
+}
