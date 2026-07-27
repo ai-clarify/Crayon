@@ -113,23 +113,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = &args.baseline {
         let base: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
         let new: serde_json::Value = serde_json::from_str(&report)?;
-        let rows = new["e2e"].as_array().unwrap();
+        let base_rows = base["e2e"].as_array().ok_or("baseline missing e2e rows")?;
+        let rows = new["e2e"].as_array().ok_or("result missing e2e rows")?;
+        if base_rows.len() != rows.len() {
+            return Err("baseline/result size sets differ".into());
+        }
         let mut failed = false;
-        for row in base["e2e"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|r| r.get("error").is_none())
-        {
-            let size = row["size_bytes"].as_u64().unwrap();
-            let Some(now) = rows.iter().find(|r| r["size_bytes"].as_u64() == Some(size)) else {
-                continue;
-            };
+        for row in base_rows {
+            let size = row["size_bytes"]
+                .as_u64()
+                .ok_or("baseline row missing size")?;
+            let now = rows
+                .iter()
+                .find(|candidate| candidate["size_bytes"].as_u64() == Some(size))
+                .ok_or("result missing baseline size")?;
             for metric in ["put_mb_s", "get_mb_s"] {
-                let (Some(value), Some(baseline)) = (now[metric].as_f64(), row[metric].as_f64())
-                else {
-                    continue;
-                };
+                let value = now[metric].as_f64().ok_or("result metric missing")?;
+                let baseline = row[metric].as_f64().ok_or("baseline metric missing")?;
+                if !value.is_finite() || value <= 0.0 || !baseline.is_finite() || baseline <= 0.0 {
+                    return Err("invalid benchmark metric".into());
+                }
                 let regression = value < baseline * (1.0 - args.tolerance);
                 failed |= regression;
                 println!(
@@ -162,28 +165,11 @@ async fn run_e2e(client: &ClusterClient, size: usize, args: &Args) -> Result<Str
         payload[..8.min(size)].copy_from_slice(&(iter as u64).to_le_bytes()[..8.min(size)]);
 
         let start = Instant::now();
-        let id: ObjectId = match client.put_bytes(&payload).await {
-            Ok(id) => id,
-            // Past the frame/object cap the put hard-fails; record the boundary
-            // instead of aborting the whole sweep. ponytail: cross-host cliff probe.
-            Err(error) => {
-                return Ok(format!(
-                    "{{\"size_bytes\": {size}, \"error\": \"put: {error}\"}}"
-                ))
-            }
-        };
+        let id: ObjectId = client.put_bytes(&payload).await?;
         let put_elapsed = start.elapsed();
 
         let start = Instant::now();
-        let got = match client.get_bytes(id).await {
-            Ok((_codec, got)) => got,
-            Err(error) => {
-                let _ = client.release(id).await;
-                return Ok(format!(
-                    "{{\"size_bytes\": {size}, \"error\": \"get: {error}\"}}"
-                ));
-            }
-        };
+        let (_codec, got) = client.get_bytes(id).await?;
         let get_elapsed = start.elapsed();
         // Byte-exact, not just length: for >=1 MiB the stored checksum is the
         // all-zero "unhashed" sentinel, so the client's own verify is size-only.

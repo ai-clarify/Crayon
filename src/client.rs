@@ -11,8 +11,8 @@ use crate::{
     ids::{ClusterId, CoordinatorEpoch, ObjectId, TaskId},
     operation::{Codec, Operation, TaskArg},
     protocol::{
-        ClientReply, ClientRequest, ObjectPayload, RpcReply, RpcRequest, SubmitSpec, TaskStatus,
-        TaskView, WorkerView, MAX_OBJECT_BYTES,
+        ArenaWriteMode, ClientReply, ClientRequest, ObjectPayload, RpcReply, RpcRequest,
+        SubmitSpec, TaskStatus, TaskView, WorkerView, MAX_OBJECT_BYTES,
     },
     resources::ResourceSet,
 };
@@ -127,12 +127,15 @@ impl ClusterClient {
                 codec,
                 size_bytes: bytes.len() as u64,
                 checksum: [0u8; 32], // unhashed: large objects skip the pass
+                mode: ArenaWriteMode::Streamed,
             })
             .await?;
-        let id = match reply {
+        let (id, reservation) = match reply {
             // Content already stored (dedup): nothing to stream.
             ClientReply::Object(payload) => return Ok(payload.id),
-            ClientReply::ArenaReserved { id, .. } => id,
+            ClientReply::ArenaReserved {
+                id, reservation, ..
+            } => (id, reservation),
             ClientReply::Error(error) => return Err(error),
             _ => return Err(Error::Protocol("unexpected reserve reply".into())),
         };
@@ -141,6 +144,7 @@ impl ClusterClient {
             match self
                 .rpc(ClientRequest::PutChunk {
                     id,
+                    reservation,
                     offset,
                     bytes: chunk.to_vec(),
                 })
@@ -151,7 +155,10 @@ impl ClusterClient {
                 _ => return Err(Error::Protocol("unexpected put chunk reply".into())),
             }
         }
-        match self.rpc(ClientRequest::ArenaCommit(id)).await? {
+        match self
+            .rpc(ClientRequest::ArenaCommit { id, reservation })
+            .await?
+        {
             ClientReply::Object(payload) => Ok(payload.id),
             ClientReply::Error(error) => Err(error),
             _ => Err(Error::Protocol("unexpected commit reply".into())),
@@ -178,12 +185,17 @@ impl ClusterClient {
                 codec,
                 size_bytes: bytes.len() as u64,
                 checksum,
+                mode: ArenaWriteMode::Direct,
             })
             .await?;
         match reply {
             // Content already stored: reserve resolved as a get.
             ClientReply::Object(payload) => Ok(payload.id),
-            ClientReply::ArenaReserved { id, offset } => {
+            ClientReply::ArenaReserved {
+                id,
+                offset,
+                reservation,
+            } => {
                 {
                     let mut writer = self.arena_writer.lock();
                     let map = writer
@@ -196,7 +208,10 @@ impl ClusterClient {
                         .ok_or_else(|| Error::Protocol("arena offset out of bounds".into()))?;
                     crate::arena::copy_wide(&mut map[start..end], bytes);
                 }
-                match self.rpc(ClientRequest::ArenaCommit(id)).await? {
+                match self
+                    .rpc(ClientRequest::ArenaCommit { id, reservation })
+                    .await?
+                {
                     ClientReply::Object(payload) => Ok(payload.id),
                     ClientReply::Error(error) => Err(error),
                     _ => Err(Error::Protocol("unexpected commit reply".into())),

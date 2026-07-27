@@ -33,28 +33,29 @@ fast path.
 | 16 MB | **1.1 ms** / 1.6 ms | **1.0 ms** / 3.3 ms | 2.4× |
 | 1 GB | **50 ms** / 66 ms | **132 ms** / 620 ms | 3.8× |
 
-Read amplification is 0.0 at the measured sizes (counting allocator): a get is
-a slice out of the mmap, no copy. The shared-memory arena carries same-host
-payloads of any size — the 8 MiB RPC frame cap applies only across hosts.
+`LocalObjectStore` lookup has zero payload allocation (`Arc<[u8]>` clone). The
+same-host arena bypasses socket transfer, but the current owning Rust/Python get
+APIs copy mmap bytes into their return value. The arena carries same-host
+payloads of any size; the 8 MiB RPC frame cap applies only across hosts.
 
-**Scheduling** (`rl-benchmark` vs `ray_rl_benchmark.py`, identical bandit
-workload, 6 workers × 16 parallel rollouts × 300 iterations):
-**11 799 episodes/s vs 1 552 — 7.6× faster.**
+**Scheduling:** the committed `rl-benchmark` number is a tiny-task control-plane
+result and is being remeasured after aligning Ray to one `ray.get(refs)` call.
+Do not treat the previous 7.6× result as an end-to-end RL training speedup.
 
-**Real LLM RL** (Qwen3.5-0.8B on one V100, 2 rollout actors + judge + REINFORCE
-learner): the 2 GB policy broadcasts through the arena in **381 ms**; 30
-training iterations lift arithmetic accuracy 0.24 → 0.55. On the full GSM8K
-test split (1 319 problems, greedy), Crayon and Ray produce **bit-identical
-scores** (305 correct) at identical GPU-bound throughput — the pipeline adds
-no data loss and no overhead where the model dominates.
+**Real LLM RL:** the committed 381 ms number measured policy placement into the
+arena, not the time until every actor loaded the policy. Actor-ready policy sync
+is measured separately before publishing a replacement result. The GSM8K run
+showed equal GPU-bound throughput and bit-identical scores (305 correct); it did
+not show an end-to-end speedup.
 
 ## Design
 
 - One authoritative coordinator; workers register versioned operations
   (`namespace.name.vN`) — closures are never shipped.
 - Plasma-style arena: a single mmap'd file per coordinator; same-host clients
-  reserve/commit and read objects as slices. Puts < 1 MiB are
-  content-addressed (blake3, dedup); larger puts skip hashing for speed.
+  reserve/commit without socket payload transfer. Owning get APIs currently copy
+  from the mmap. Puts < 1 MiB are content-addressed (blake3, dedup); larger puts
+  skip hashing for speed.
 - Fenced at-least-once execution: stale sessions and stale attempts cannot
   publish results; mutations are idempotent by request id.
 - Event-driven control plane: blocking gets, long-poll workers, batched

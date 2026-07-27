@@ -34,7 +34,7 @@ SAMPLES="${SAMPLES:-200}"
 WARMUPS="${WARMUPS:-20}"
 # Cross-host throughput regression gate: compare this run against a committed
 # baseline and fail if any size regresses past TOLERANCE. Empty BASELINE skips.
-BASELINE="${BASELINE:-benchmarks/results/xhost/20260725-67b7641-v100_digest-baseline.json}"
+BASELINE="${BASELINE-benchmarks/results/xhost/20260725-67b7641-v100_digest-baseline.json}"
 TOLERANCE="${TOLERANCE:-0.2}"
 COORD_ADDR="0.0.0.0:$PORT"
 DIAL="$HOST_A_IP:$PORT"
@@ -88,7 +88,7 @@ ssh_b "pip install --no-deps --break-system-packages --force-reinstall $REMOTE_D
 
 # 2. launch coordinator detached on A, capture its remote pid.
 say "start coordinator on $HOST_A at $COORD_ADDR"
-COORD_PID="$(ssh_a "cd $REMOTE_DIR && nohup ./target/release/crayon-cluster coordinator $COORD_ADDR $LEASE_MS >/dev/null 2>$RUN_DIR/coord.log & echo \$!")" || fail "launch coordinator"
+COORD_PID="$(ssh_a "cd $REMOTE_DIR && nohup ./target/release/crayon-cluster coordinator $COORD_ADDR $LEASE_MS --unsafe-allow-remote-bind >/dev/null 2>$RUN_DIR/coord.log & echo \$!")" || fail "launch coordinator"
 say "coordinator pid=$COORD_PID"
 
 # 3. readiness gate from B (poll, no fixed sleep). Startup banner is on stderr.

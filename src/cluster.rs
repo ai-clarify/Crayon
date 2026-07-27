@@ -487,8 +487,12 @@ impl CoordinatorServer {
                     } else {
                         match state.cancellation_for(&identity) {
                             Ok(Some(fence)) => WorkerReply::Cancel(fence),
-                            Ok(None) => match state.assign_next(identity.node_id, now_ms()) {
-                                Ok(value) => WorkerReply::Assignment(value),
+                            Ok(None) => match state.assigned_unstarted(&identity) {
+                                Ok(Some(value)) => WorkerReply::Assignment(Some(value)),
+                                Ok(None) => match state.assign_next(identity.node_id, now_ms()) {
+                                    Ok(value) => WorkerReply::Assignment(value),
+                                    Err(error) => WorkerReply::Error(error),
+                                },
                                 Err(error) => WorkerReply::Error(error),
                             },
                             Err(error) => WorkerReply::Error(error),
@@ -633,40 +637,42 @@ impl CoordinatorServer {
                     }
                 }
                 ClientRequest::GetBatch { objects, .. } => {
-                    let state = self.state.lock();
-                    // Bound the cumulative INLINE bytes cloned by a single batch to
-                    // one frame's worth. Without this, a request full of duplicate
-                    // ids (they fit the 8 MB frame) forces terabytes of allocation
-                    // under the lock before write_frame's size check ever runs.
-                    // A batch whose inline bytes sum past one frame could never be
-                    // sent anyway, so overflowing slots return CapacityExceeded and
-                    // the result vec keeps exactly one entry per requested id, in
-                    // order. Redirected outputs carry `bytes: None` and cost nothing.
-                    let mut total: usize = 0;
-                    let mut results = Vec::with_capacity(objects.len());
-                    let mut overflow = false;
-                    for id in objects {
-                        if overflow {
-                            results.push(Err(Error::CapacityExceeded(
-                                "get batch response too large".into(),
-                            )));
-                            continue;
-                        }
-                        let resolved = state.resolve_object(id);
-                        if let Ok(payload) = &resolved {
-                            let inline = payload.bytes.as_ref().map_or(0, |b| b.len());
-                            if total.saturating_add(inline) > MAX_OBJECT_BYTES {
-                                overflow = true;
-                                results.push(Err(Error::CapacityExceeded(
-                                    "get batch response too large".into(),
-                                )));
-                                continue;
+                    let overflow = Err(Error::CapacityExceeded(
+                        "get batch response too large".into(),
+                    ));
+                    let base = bincode::serialized_size(&RpcReply::Client(
+                        ClientReply::ObjectBatch(Vec::new()),
+                    ))
+                    .unwrap_or(u64::MAX);
+                    let overflow_size = bincode::serialized_size(&overflow).unwrap_or(u64::MAX);
+                    if base.saturating_add(overflow_size.saturating_mul(objects.len() as u64))
+                        > MAX_FRAME_BYTES as u64
+                    {
+                        ClientReply::Error(Error::CapacityExceeded(
+                            "get batch response too large".into(),
+                        ))
+                    } else {
+                        let state = self.state.lock();
+                        let mut used = base;
+                        let mut results = Vec::with_capacity(objects.len());
+                        for (index, id) in objects.iter().copied().enumerate() {
+                            let resolved = state.resolve_object(id);
+                            let size = bincode::serialized_size(&resolved).unwrap_or(u64::MAX);
+                            let remaining = (objects.len() - index - 1) as u64;
+                            if used
+                                .saturating_add(size)
+                                .saturating_add(remaining.saturating_mul(overflow_size))
+                                <= MAX_FRAME_BYTES as u64
+                            {
+                                used += size;
+                                results.push(resolved);
+                            } else {
+                                used += overflow_size;
+                                results.push(overflow.clone());
                             }
-                            total += inline;
                         }
-                        results.push(resolved);
+                        ClientReply::ObjectBatch(results)
                     }
-                    ClientReply::ObjectBatch(results)
                 }
                 ClientRequest::GetLocal(id) => {
                     // Explicit byte fetch: the cross-host fallback for an arena
@@ -696,6 +702,7 @@ impl CoordinatorServer {
                     codec,
                     size_bytes,
                     checksum,
+                    mode,
                 } => {
                     // Content addressing: same checksum => same object, so a
                     // repeat reserve of stored content resolves as a plain get.
@@ -704,48 +711,46 @@ impl CoordinatorServer {
                         self.arena_annotate(&mut payload);
                         ClientReply::Object(payload)
                     } else {
-                        match self.arena.reserve(id, size_bytes, codec, checksum) {
-                            Some((offset, _)) => ClientReply::ArenaReserved { id, offset },
-                            None => ClientReply::Error(Error::CapacityExceeded(
-                                "arena exhausted".into(),
-                            )),
+                        match self.arena.reserve(id, size_bytes, codec, checksum, mode) {
+                            Ok(reservation) => ClientReply::ArenaReserved {
+                                id,
+                                offset: reservation.offset,
+                                reservation: reservation.reservation,
+                            },
+                            Err(error) => ClientReply::Error(error),
                         }
                     }
                 }
-                ClientRequest::ArenaCommit(id) => {
-                    self.arena.commit(id);
-                    match self.arena.meta(id) {
-                        Some(meta) => {
-                            let registered = self.state.lock().put_meta(
-                                id,
-                                meta.codec.clone(),
-                                meta.size,
-                                meta.checksum,
-                            );
-                            match registered.and_then(|id| self.state.lock().resolve_object(id)) {
+                ClientRequest::ArenaCommit { id, reservation } => {
+                    match self.arena.commit(id, reservation) {
+                        Ok(meta) => {
+                            let mut state = self.state.lock();
+                            match state
+                                .put_meta(id, meta.codec, meta.size, meta.checksum)
+                                .and_then(|id| state.resolve_object(id))
+                            {
                                 Ok(mut payload) => {
                                     self.arena_annotate(&mut payload);
                                     ClientReply::Object(payload)
                                 }
-                                Err(error) => ClientReply::Error(error),
+                                Err(error) => {
+                                    let _ = self.arena.rollback(id, reservation);
+                                    ClientReply::Error(error)
+                                }
                             }
                         }
-                        None => ClientReply::Error(Error::ObjectNotFound(id)),
+                        Err(error) => ClientReply::Error(error),
                     }
                 }
-                ClientRequest::PutChunk { id, offset, bytes } => {
-                    // Cross-host chunked put: write one range into the reserved
-                    // slot. Idempotent by (id, offset) — rewriting a range is
-                    // safe, so this is a mutation but not replay-cached (a MiB
-                    // chunk reply would blow the replay byte budget).
-                    if self.arena.write_chunk(id, offset, &bytes) {
-                        ClientReply::ChunkWritten
-                    } else {
-                        ClientReply::Error(Error::Protocol(
-                            "put chunk out of bounds or object not reserved".into(),
-                        ))
-                    }
-                }
+                ClientRequest::PutChunk {
+                    id,
+                    reservation,
+                    offset,
+                    bytes,
+                } => match self.arena.write_chunk(id, reservation, offset, &bytes) {
+                    Ok(()) => ClientReply::ChunkWritten,
+                    Err(error) => ClientReply::Error(error),
+                },
                 ClientRequest::GetChunk { id, offset, len } => {
                     // Cross-host chunked get: serve one range of a committed
                     // object. Frame-bounded per chunk; the client reassembles
@@ -809,7 +814,7 @@ fn is_mutation(request: &RpcRequest) -> bool {
             client,
             ClientRequest::Put { .. }
                 | ClientRequest::ArenaReserve { .. }
-                | ClientRequest::ArenaCommit(_)
+                | ClientRequest::ArenaCommit { .. }
                 | ClientRequest::PutChunk { .. }
                 | ClientRequest::Submit { .. }
                 | ClientRequest::SubmitBatch(_)

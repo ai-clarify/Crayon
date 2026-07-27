@@ -5,7 +5,7 @@ use super::*;
 use crate::{
     ids::{NodeId, ObjectId, WorkerEpoch},
     operation::{Codec, OperationDescriptor, OperationKey, TaskArg},
-    protocol::{RegisterWorker, TaskStatus},
+    protocol::{ArenaWriteMode, RegisterWorker, TaskStatus},
     resources::ResourceSet,
 };
 
@@ -47,6 +47,105 @@ fn registered_server() -> (CoordinatorServer, crate::protocol::WorkerIdentity) {
         panic!("registration failed")
     };
     (server, registered.identity)
+}
+
+#[test]
+fn poll_redelivers_assignment_after_lost_reply() {
+    let (server, identity) = registered_server();
+    server
+        .dispatch_once(&with_epoch(
+            &server,
+            future_envelope(
+                server.cluster_id,
+                RpcRequest::Client(ClientRequest::Submit {
+                    operation: descriptor().key,
+                    args: vec![],
+                    resources: ResourceSet::default(),
+                    max_attempts: 1,
+                }),
+            ),
+        ))
+        .unwrap();
+    let poll = || {
+        with_epoch(
+            &server,
+            future_envelope(
+                server.cluster_id,
+                RpcRequest::Worker(WorkerRequest::Poll {
+                    identity: identity.clone(),
+                    wait_ms: 0,
+                }),
+            ),
+        )
+    };
+    let assignment = |reply| match reply {
+        RpcReply::Worker(WorkerReply::Assignment(Some(value))) => value,
+        other => panic!("expected assignment, got {other:?}"),
+    };
+    let first = assignment(server.dispatch_once(&poll()).unwrap());
+    let second = assignment(server.dispatch_once(&poll()).unwrap());
+    assert_eq!(first.fence, second.fence);
+    assert_eq!(server.state.lock().sched_assigns, 1);
+    server.state.lock().started(&identity, first.fence).unwrap();
+    assert!(matches!(
+        server.dispatch_once(&poll()),
+        Ok(RpcReply::Worker(WorkerReply::Assignment(None)))
+    ));
+}
+
+#[test]
+fn arena_commit_rolls_back_when_metadata_conflicts() {
+    let (server, _) = registered_server();
+    let id = ObjectId::new();
+    let reserve = server
+        .dispatch_once(&with_epoch(
+            &server,
+            future_envelope(
+                server.cluster_id,
+                RpcRequest::Client(ClientRequest::ArenaReserve {
+                    id,
+                    codec: Codec::RawBytes,
+                    size_bytes: 3,
+                    checksum: [2; 32],
+                    mode: ArenaWriteMode::Direct,
+                }),
+            ),
+        ))
+        .unwrap();
+    let RpcReply::Client(ClientReply::ArenaReserved {
+        offset,
+        reservation,
+        ..
+    }) = reserve
+    else {
+        panic!("reserve failed")
+    };
+    server.arena.write_at(offset, b"abc");
+    server
+        .state
+        .lock()
+        .put_meta(id, Codec::JsonV1, 3, [1; 32])
+        .unwrap();
+    let commit = server
+        .dispatch_once(&with_epoch(
+            &server,
+            future_envelope(
+                server.cluster_id,
+                RpcRequest::Client(ClientRequest::ArenaCommit { id, reservation }),
+            ),
+        ))
+        .unwrap();
+    assert!(matches!(
+        commit,
+        RpcReply::Client(ClientReply::Error(Error::ObjectConflict(value))) if value == id
+    ));
+    assert!(server.arena.meta(id).is_none());
+    let next = ObjectId::new();
+    let recycled = server
+        .arena
+        .reserve(next, 3, Codec::RawBytes, [0; 32], ArenaWriteMode::Direct)
+        .unwrap();
+    assert_eq!(recycled.offset, offset);
 }
 
 #[test]
@@ -207,10 +306,8 @@ async fn transport_retry_reuses_the_envelope() {
     server.await.unwrap();
 }
 
-// F1: a GetBatch must not clone unbounded inline bytes. Cumulative inline
-// payload is capped at one frame (MAX_OBJECT_BYTES); overflow slots return
-// CapacityExceeded so the reply always fits a frame regardless of how many
-// duplicate ids a single request packs in.
+// F1: a GetBatch reply must fit the actual frame after metadata and error slots,
+// not merely keep cloned payload bytes under the object cap.
 #[test]
 fn get_batch_response_bytes_are_bounded() {
     let (server, _) = registered_server();
@@ -238,20 +335,14 @@ fn get_batch_response_bytes_are_bounded() {
     };
     // One entry per requested id, in order.
     assert_eq!(results.len(), 6);
-    let ok_count = MAX_OBJECT_BYTES / object_size;
-    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), ok_count);
-    assert!(results[0].is_ok());
-    assert!(results[1].is_ok());
+    let ok_count = results.iter().filter(|r| r.is_ok()).count();
+    assert!(ok_count >= 2);
+    assert!(results[..ok_count].iter().all(Result::is_ok));
     for result in &results[ok_count..] {
         assert!(matches!(result, Err(Error::CapacityExceeded(_))));
     }
-    // Cumulative cloned inline bytes never exceed one frame.
-    let cloned: usize = results
-        .iter()
-        .filter_map(|r| r.as_ref().ok())
-        .map(|p| p.bytes.as_ref().map_or(0, |b| b.len()))
-        .sum();
-    assert!(cloned <= MAX_OBJECT_BYTES);
+    let wire = bincode::serialize(&RpcReply::Client(ClientReply::ObjectBatch(results))).unwrap();
+    assert!(wire.len() <= MAX_FRAME_BYTES);
 }
 
 // F2: a dispatched mutation is always cached. Filling MAX_REPLAY_ENTRIES is

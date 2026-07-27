@@ -61,6 +61,25 @@ fn duplicate_registration_is_idempotent_only_when_exact() {
 }
 
 #[test]
+fn assigned_task_is_redelivered_without_consuming_resources_twice() {
+    let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+    let identity = register(&mut state, NodeId::new());
+    state
+        .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+        .unwrap();
+    let first = state.assign_next(identity.node_id, 0).unwrap().unwrap();
+    let revision = state.revision;
+    let second = state.assigned_unstarted(&identity).unwrap().unwrap();
+    assert_eq!(first.fence, second.fence);
+    assert_eq!(first.output_id, second.output_id);
+    assert_eq!(state.workers[&identity.node_id].free_slots, 0);
+    assert_eq!(state.sched_assigns, 1);
+    assert_eq!(state.revision, revision);
+    state.started(&identity, first.fence).unwrap();
+    assert!(state.assigned_unstarted(&identity).unwrap().is_none());
+}
+
+#[test]
 fn failure_propagates_through_waiting_chain() {
     let mut state = CoordinatorState::new(CoordinatorEpoch::new());
     let identity = register(&mut state, NodeId::new());
@@ -345,6 +364,37 @@ fn release_reclaims_terminal_task_and_object() {
     state.release_object(output).unwrap();
     assert!(!state.tasks.contains_key(&task));
     assert!(!state.objects.contains_key(&output));
+}
+
+#[test]
+fn worker_expiry_preserves_inline_output_and_loses_redirected_output() {
+    let mut state = CoordinatorState::new(CoordinatorEpoch::new());
+    let identity = register(&mut state, NodeId::new());
+    let (_, inline_output) = state
+        .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+        .unwrap();
+    let inline = state.assign_next(identity.node_id, 0).unwrap().unwrap();
+    state
+        .complete(&identity, completion(inline.fence, inline_output))
+        .unwrap();
+    let (_, remote_output) = state
+        .submit(descriptor().key.clone(), vec![], ResourceSet::default(), 1)
+        .unwrap();
+    let remote = state.assign_next(identity.node_id, 0).unwrap().unwrap();
+    let mut remote_completion = completion(remote.fence, remote_output);
+    remote_completion.bytes = None;
+    state.complete(&identity, remote_completion).unwrap();
+
+    let expired = state.expire_workers(1_000).unwrap();
+    assert_eq!(expired[0].objects_lost, 1);
+    let payload = state.resolve_object(inline_output).unwrap();
+    assert_eq!(payload.bytes.as_deref(), Some(&[7][..]));
+    assert_eq!(payload.location, "coordinator");
+    assert_eq!(state.objects[&inline_output].owner, None);
+    assert!(matches!(
+        state.resolve_object(remote_output),
+        Err(Error::ObjectLost(id)) if id == remote_output
+    ));
 }
 
 #[test]

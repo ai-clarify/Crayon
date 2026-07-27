@@ -59,9 +59,14 @@ PEAK_ARENA=0
 PEAK_TASKS=0
 MIN_SHM_MB=999999999
 FAILED=0
+COMPLETED=0
+SAMPLES=0
+CHAOS_COUNT=0
+FIRST_FAILURE=""
+SUMMARY_JSON="${SUMMARY_JSON:-$RUN_DIR/summary.json}"
 
 log() { printf '%s soak: %s\n' "$(date +%H:%M:%S)" "$*"; }
-fail() { FAILED=1; printf '\n!!!!!! SOAK FAIL: %s !!!!!!\n\n' "$*" >&2; [ "$FAIL_FAST" = 1 ] && exit 1; return 0; }
+fail() { FAILED=1; [ -z "$FIRST_FAILURE" ] && FIRST_FAILURE="$*"; printf '\n!!!!!! SOAK FAIL: %s !!!!!!\n\n' "$*" >&2; [ "$FAIL_FAST" = 1 ] && exit 1; return 0; }
 
 # ---- lifecycle --------------------------------------------------------------
 cleanup() {
@@ -85,7 +90,14 @@ summary() {
   [ "$MIN_SHM_MB" != 999999999 ] && echo "min /dev/shm free: ${MIN_SHM_MB} MiB (floor ${SHM_FLOOR_MB} MiB)"
   local last; last="$(grep '^crayon.health' "$COORD_LOG" 2>/dev/null | tail -1)"
   [ -n "$last" ] && echo "final health    : $last"
-  if [ "$FAILED" = 1 ]; then echo "RESULT: FAIL (a threshold was breached)"; else echo "RESULT: OK"; fi
+  local result="INTERRUPTED"
+  [ "$FAILED" = 1 ] && result="FAIL"
+  [ "$FAILED" = 0 ] && [ "$COMPLETED" = 1 ] && result="PASS"
+  [ "$SMOKE" = 1 ] && [ "$result" = "PASS" ] && result="DEGRADED"
+  printf '{"result":"%s","completed":%s,"samples":%s,"chaos_events":%s,"peak_rss_kb":%s,"peak_arena_bytes":%s,"peak_tasks":%s,"failure":%s}\n' \
+    "$result" "$COMPLETED" "$SAMPLES" "$CHAOS_COUNT" "$PEAK_RSS_KB" "$PEAK_ARENA" "$PEAK_TASKS" \
+    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$FIRST_FAILURE")" >"$SUMMARY_JSON"
+  echo "RESULT: $result   summary: $SUMMARY_JSON"
   echo "======================================================"
 }
 
@@ -113,7 +125,7 @@ find_python() {
     echo "$venv/bin/python"; return 0
   fi
   if python3 -c "$check" 2>/dev/null; then echo "python3"; return 0; fi
-  log "crayon Client API not importable; building wheel into $venv (one-time)"
+  log "crayon Client API not importable; building wheel into $venv (one-time)" >&2
   python3 -m venv "$venv" >/dev/null 2>&1 || { log "venv creation failed"; return 1; }
   ( "$venv/bin/pip" install -q maturin >/dev/null 2>&1 \
     && cd "$REPO/crayon-py" \
@@ -136,7 +148,7 @@ wait_for 15 "$BIN" workers "$COORD_ADDR" || { log "coordinator did not come up";
 
 for _ in $(seq "$WORKERS"); do start_worker; done
 wait_for 15 bash -c "test \"\$('$BIN' workers '$COORD_ADDR' | grep -c 127.0.0.1)\" -ge $WORKERS" \
-  || log "warning: not all workers registered yet, continuing"
+  || { fail "not all workers registered"; exit 1; }
 
 # sustained scheduler load: cheap copy tasks, max_attempts 3 to exercise retry.
 # Mostly release the output (steady-state, the real-RL-client path — see
@@ -184,7 +196,8 @@ while True:
 PYEOF
   CHURN_PID="$!"
 else
-  log "WARNING: no crayon wheel — skipping arena churn (leak signal reduced to unit tests)"
+  fail "crayon Client API unavailable; arena churn is required"
+  exit 1
 fi
 
 # ---- sampling loop ----------------------------------------------------------
@@ -214,12 +227,17 @@ while [ "$(date +%s)" -lt "$END" ]; do
   shm="-"; [ -d /dev/shm ] && shm="$(df -m /dev/shm 2>/dev/null | awk 'NR==2{print $4}')"
 
   health="$(grep '^crayon.health' "$COORD_LOG" 2>/dev/null | tail -1)"
+  if [ -z "$health" ]; then fail "missing coordinator health sample"; break; fi
   read -r tasks running succeeded failed objects lost abytes retries failures <<<"$(
     awk '{ for (i=2;i<=NF;i++){ split($i,kv,"="); v[kv[1]]=kv[2] }
            print v["tasks"], v["running"], v["succeeded"], v["failed"], v["objects"],
                  v["lost"], v["arena_bytes"], v["retries_total"], v["failures_total"] }' <<<"$health"
   )"
   tasks="${tasks:-0}"; abytes="${abytes:-0}"
+  if ! [[ "$tasks" =~ ^[0-9]+$ && "$abytes" =~ ^[0-9]+$ ]]; then fail "malformed coordinator health sample"; break; fi
+  SAMPLES=$((SAMPLES + 1))
+  if ! kill -0 "$LOAD_PID" 2>/dev/null; then fail "scheduler load process died"; break; fi
+  if ! kill -0 "$CHURN_PID" 2>/dev/null; then fail "arena churn process died"; break; fi
 
   echo "$now,$rss,$afile,$shm,${tasks},${running:-0},${succeeded:-0},${failed:-0},${objects:-0},${lost:-0},$abytes,${retries:-0},${failures:-0}" >>"$CSV"
 
@@ -249,12 +267,16 @@ while [ "$(date +%s)" -lt "$END" ]; do
     kill -9 "$victim" 2>/dev/null; wait "$victim" 2>/dev/null
     unset 'WORKER_PIDS[idx]'
     WORKER_PIDS=("${WORKER_PIDS[@]}")
+    CHAOS_COUNT=$((CHAOS_COUNT + 1))
     start_worker
   fi
 
   log "rss=$((rss/1024))MiB arena=$((abytes/1024/1024))MiB tasks=$tasks shm=${shm}MiB retries=${retries:-0} failures=${failures:-0}"
 done
 
+COMPLETED=1
+[ "$SAMPLES" -gt 0 ] || fail "no health samples collected"
+[ "$CHAOS_COUNT" -gt 0 ] || fail "no worker chaos cycle completed"
 log "duration reached; exiting (cleanup + summary on trap)"
 # summary runs from the EXIT trap; propagate FAIL as a non-zero exit.
 [ "$FAILED" = 1 ] && exit 1 || exit 0

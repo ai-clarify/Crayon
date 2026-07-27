@@ -547,6 +547,30 @@ impl CoordinatorState {
         self.changed();
         Ok((id, output))
     }
+    pub fn assigned_unstarted(
+        &self,
+        identity: &WorkerIdentity,
+    ) -> Result<Option<TaskAssignment>, Error> {
+        self.check_identity(identity)?;
+        Ok(self.tasks.values().find_map(|task| {
+            let (node, epoch, session, lease) = task.assigned?;
+            (task.state == TaskState::Assigned
+                && node == identity.node_id
+                && epoch == identity.worker_epoch
+                && session == identity.session_id)
+                .then(|| TaskAssignment {
+                    fence: TaskFence {
+                        task_id: task.id,
+                        attempt: task.attempt,
+                        lease_id: lease,
+                    },
+                    operation: task.operation.clone(),
+                    args: task.args.clone(),
+                    output_id: task.output,
+                    resources: task.resources.clone(),
+                })
+        }))
+    }
     pub fn assign_next(
         &mut self,
         node_id: NodeId,
@@ -865,9 +889,12 @@ impl CoordinatorState {
             }
             for object in self.objects.values_mut() {
                 if object.owner == Some(*node) && object.state == ObjectState::Available {
-                    object.state = ObjectState::Lost;
-                    object.location = None;
-                    tally.objects_lost += 1;
+                    object.owner = None;
+                    object.location = object.bytes.is_some().then(|| "coordinator".into());
+                    if object.bytes.is_none() {
+                        object.state = ObjectState::Lost;
+                        tally.objects_lost += 1;
+                    }
                 }
             }
             // Ephemeral workers die on completion and never return, so drop the

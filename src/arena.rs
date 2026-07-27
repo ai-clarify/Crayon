@@ -28,7 +28,12 @@ use memmap2::MmapMut;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::{ids::ObjectId, operation::Codec};
+use crate::{
+    error::Error,
+    ids::{ObjectId, RequestId},
+    operation::Codec,
+    protocol::ArenaWriteMode,
+};
 
 /// Sparse virtual size of the arena. mmap reserves the range; pages are backed
 /// only when written, so this is address space, not committed memory.
@@ -54,10 +59,17 @@ struct Entry {
     slot: u64,
     codec: Codec,
     checksum: [u8; 32],
+    reservation: RequestId,
+    mode: ArenaWriteMode,
+    written_until: u64,
     committed: bool,
-    /// When the slot was reserved; an uncommitted entry past `RESERVE_TTL` is a
-    /// crashed writer and gets reaped. `None` once committed (never expires).
     reserved_at: Option<Instant>,
+}
+
+pub struct Reservation {
+    pub offset: u64,
+    pub reservation: RequestId,
+    pub committed: bool,
 }
 
 /// Metadata a get reply needs for a committed arena object.
@@ -165,25 +177,40 @@ impl ArenaStore {
         size: u64,
         codec: Codec,
         checksum: [u8; 32],
-    ) -> Option<(u64, bool)> {
-        let slot = size.max(1).div_ceil(8) * 8; // 8-byte aligned exact size
+        mode: ArenaWriteMode,
+    ) -> Result<Reservation, Error> {
+        let slot = size.max(1).div_ceil(8) * 8;
         let mut a = self.alloc.lock();
         a.reap(Instant::now());
         if let Some(entry) = a.live.get(&id) {
-            return Some((entry.offset, entry.committed));
+            if entry.size != size
+                || entry.codec != codec
+                || entry.checksum != checksum
+                || entry.mode != mode
+            {
+                return Err(Error::ObjectConflict(id));
+            }
+            return Ok(Reservation {
+                offset: entry.offset,
+                reservation: entry.reservation,
+                committed: entry.committed,
+            });
         }
         let offset = match a.free.get_mut(&slot).and_then(Vec::pop) {
             Some(off) => off,
             None => {
                 let off = a.top;
-                let next = off.checked_add(slot)?;
+                let next = off
+                    .checked_add(slot)
+                    .ok_or_else(|| Error::CapacityExceeded("arena exhausted".into()))?;
                 if next > ARENA_BYTES {
-                    return None;
+                    return Err(Error::CapacityExceeded("arena exhausted".into()));
                 }
                 a.top = next;
                 off
             }
         };
+        let reservation = RequestId::new();
         a.live.insert(
             id,
             Entry {
@@ -192,30 +219,67 @@ impl ArenaStore {
                 slot,
                 codec,
                 checksum,
+                reservation,
+                mode,
+                written_until: 0,
                 committed: false,
                 reserved_at: Some(Instant::now()),
             },
         );
-        Some((offset, false))
+        Ok(Reservation {
+            offset,
+            reservation,
+            committed: false,
+        })
     }
 
-    /// Marks a reserved object as fully written and readable.
-    pub fn commit(&self, id: ObjectId) {
-        if let Some(entry) = self.alloc.lock().live.get_mut(&id) {
-            entry.committed = true;
-            entry.reserved_at = None; // committed objects never expire
+    pub fn commit(&self, id: ObjectId, reservation: RequestId) -> Result<Meta, Error> {
+        let mut a = self.alloc.lock();
+        let entry = a.live.get_mut(&id).ok_or(Error::ObjectNotFound(id))?;
+        if entry.reservation != reservation {
+            return Err(Error::StaleFence);
         }
+        if entry.mode == ArenaWriteMode::Streamed && entry.written_until != entry.size {
+            return Err(Error::Protocol("arena object incomplete".into()));
+        }
+        entry.committed = true;
+        entry.reserved_at = None;
+        Ok(Meta {
+            offset: entry.offset,
+            size: entry.size,
+            codec: entry.codec.clone(),
+            checksum: entry.checksum,
+        })
+    }
+
+    pub fn rollback(&self, id: ObjectId, reservation: RequestId) -> Result<(), Error> {
+        let mut a = self.alloc.lock();
+        let entry = a.live.get(&id).ok_or(Error::ObjectNotFound(id))?;
+        if entry.reservation != reservation || !entry.committed {
+            return Err(Error::StaleFence);
+        }
+        let entry = a.live.remove(&id).unwrap();
+        a.free.entry(entry.slot).or_default().push(entry.offset);
+        Ok(())
     }
 
     /// Coordinator-side write: reserve + copy `bytes` in + commit, for payloads
     /// the coordinator already holds (e.g. a same-host object arriving inline).
     pub fn put(&self, id: ObjectId, bytes: &[u8], codec: Codec, checksum: [u8; 32]) -> Option<u64> {
-        let (offset, already) = self.reserve(id, bytes.len() as u64, codec, checksum)?;
-        if !already {
-            self.write_at(offset, bytes);
-            self.commit(id);
+        let reservation = self
+            .reserve(
+                id,
+                bytes.len() as u64,
+                codec,
+                checksum,
+                ArenaWriteMode::Direct,
+            )
+            .ok()?;
+        if !reservation.committed {
+            self.write_at(reservation.offset, bytes);
+            self.commit(id, reservation.reservation).ok()?;
         }
-        Some(offset)
+        Some(reservation.offset)
     }
 
     /// Copies `bytes` into an allocator-owned region. Callers must only write a
@@ -264,20 +328,43 @@ impl ArenaStore {
     /// relative to the object's start. Unlike `write_at`, the range is untrusted
     /// (it came off the wire), so it is bounds-checked against the reserved size;
     /// out-of-range or already-committed writes return `false` and copy nothing.
-    pub fn write_chunk(&self, id: ObjectId, rel_offset: u64, bytes: &[u8]) -> bool {
-        let base = {
-            let a = self.alloc.lock();
-            let e = match a.live.get(&id) {
-                Some(e) if !e.committed => e,
-                _ => return false,
+    pub fn write_chunk(
+        &self,
+        id: ObjectId,
+        reservation: RequestId,
+        rel_offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        let mut a = self.alloc.lock();
+        let entry = a.live.get_mut(&id).ok_or(Error::ObjectNotFound(id))?;
+        if entry.reservation != reservation || entry.committed {
+            return Err(Error::StaleFence);
+        }
+        if entry.mode != ArenaWriteMode::Streamed {
+            return Err(Error::Protocol("arena reservation is not streamed".into()));
+        }
+        let end = rel_offset
+            .checked_add(bytes.len() as u64)
+            .filter(|&end| end <= entry.size)
+            .ok_or_else(|| Error::Protocol("put chunk out of bounds".into()))?;
+        let base = entry.offset + rel_offset;
+        if rel_offset == entry.written_until {
+            self.write_at(base, bytes);
+            entry.written_until = end;
+            entry.reserved_at = Some(Instant::now());
+            return Ok(());
+        }
+        if end <= entry.written_until {
+            let existing = unsafe {
+                std::slice::from_raw_parts(self.map.as_ptr().add(base as usize), bytes.len())
             };
-            match rel_offset.checked_add(bytes.len() as u64) {
-                Some(end) if end <= e.size => e.offset + rel_offset,
-                _ => return false,
-            }
-        };
-        self.write_at(base, bytes);
-        true
+            return if existing == bytes {
+                Ok(())
+            } else {
+                Err(Error::ObjectConflict(id))
+            };
+        }
+        Err(Error::Protocol("put chunk must be contiguous".into()))
     }
 
     /// Reads a byte range out of a committed object, for a cross-host client
@@ -431,67 +518,129 @@ mod tests {
         let id = ObjectId::new();
         let payload = vec![9u8; 40_000];
         let checksum = crate::cluster::checksum(&payload);
-        let (offset, already) = store
-            .reserve(id, payload.len() as u64, Codec::RawBytes, checksum)
+        let reserved = store
+            .reserve(
+                id,
+                payload.len() as u64,
+                Codec::RawBytes,
+                checksum,
+                ArenaWriteMode::Direct,
+            )
             .unwrap();
-        assert!(!already);
-        assert!(store.meta(id).is_none()); // not yet committed
-        store.write_at(offset, &payload);
-        store.commit(id);
+        assert!(!reserved.committed);
+        assert!(store.meta(id).is_none());
+        store.write_at(reserved.offset, &payload);
+        store.commit(id, reserved.reservation).unwrap();
 
-        let meta = store.meta(id).expect("committed");
-        assert_eq!(meta.offset, offset);
+        let meta = store.meta(id).unwrap();
+        assert_eq!(meta.offset, reserved.offset);
         assert_eq!(meta.size, payload.len() as u64);
         let map = map_arena(store.token()).unwrap();
         assert_eq!(
-            &map[offset as usize..offset as usize + payload.len()],
+            &map[reserved.offset as usize..reserved.offset as usize + payload.len()],
             &payload[..]
         );
         assert_eq!(store.read(id).unwrap(), payload);
 
         store.release(id);
-        assert!(store.meta(id).is_none());
-        // Same exact size recycles the released offset immediately (LIFO), so the
-        // hot path reuses warm pages rather than bumping `top` into cold arena.
-        let id2 = ObjectId::new();
-        assert_eq!(
-            store
-                .reserve(id2, payload.len() as u64, Codec::RawBytes, checksum)
-                .unwrap()
-                .0,
-            offset
-        );
+        let next = store
+            .reserve(
+                ObjectId::new(),
+                payload.len() as u64,
+                Codec::RawBytes,
+                checksum,
+                ArenaWriteMode::Direct,
+            )
+            .unwrap();
+        assert_eq!(next.offset, reserved.offset);
         assert!(map_arena("deadbeef").is_none());
     }
 
     #[test]
-    fn uncommitted_reservation_is_reaped_after_ttl() {
+    fn reservation_is_token_fenced_and_streamed_commit_requires_coverage() {
         let store = ArenaStore::new().unwrap();
         let id = ObjectId::new();
-        let (offset, _) = store.reserve(id, 4096, Codec::RawBytes, [0; 32]).unwrap();
-        // Client crashes before commit: never readable, and the slot must not
-        // leak. After the TTL its offset returns to the free list.
-        assert!(store.meta(id).is_none());
+        let reserved = store
+            .reserve(id, 6, Codec::RawBytes, [0; 32], ArenaWriteMode::Streamed)
+            .unwrap();
+        assert_eq!(
+            store.write_chunk(id, RequestId::new(), 0, b"abc"),
+            Err(Error::StaleFence)
+        );
+        store
+            .write_chunk(id, reserved.reservation, 0, b"abc")
+            .unwrap();
+        assert!(matches!(
+            store.commit(id, reserved.reservation),
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            store.write_chunk(id, reserved.reservation, 4, b"ef"),
+            Err(Error::Protocol(_))
+        ));
+        store
+            .write_chunk(id, reserved.reservation, 0, b"abc")
+            .unwrap();
+        assert_eq!(
+            store.write_chunk(id, reserved.reservation, 0, b"abd"),
+            Err(Error::ObjectConflict(id))
+        );
+        store
+            .write_chunk(id, reserved.reservation, 3, b"def")
+            .unwrap();
+        store.commit(id, reserved.reservation).unwrap();
+        assert_eq!(store.read(id).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn stale_reservation_cannot_mutate_recycled_slot() {
+        let store = ArenaStore::new().unwrap();
+        let id = ObjectId::new();
+        let old = store
+            .reserve(id, 4096, Codec::RawBytes, [0; 32], ArenaWriteMode::Direct)
+            .unwrap();
         store.reap_after(RESERVE_TTL);
         let id2 = ObjectId::new();
-        assert_eq!(
-            store
-                .reserve(id2, 4096, Codec::RawBytes, [0; 32])
-                .unwrap()
-                .0,
-            offset
-        );
-        // A committed reservation is never reaped as stale.
-        store.commit(id2);
+        let new = store
+            .reserve(id2, 4096, Codec::RawBytes, [0; 32], ArenaWriteMode::Direct)
+            .unwrap();
+        assert_eq!(old.offset, new.offset);
+        assert!(matches!(
+            store.commit(id2, old.reservation),
+            Err(Error::StaleFence)
+        ));
+        store.commit(id2, new.reservation).unwrap();
         store.reap_after(RESERVE_TTL);
         assert!(store.meta(id2).is_some());
     }
 
-    // Regression guard for the 5x same-host put regression (112830a): a serial
-    // put/read/release churn of one size must reuse its slot, so `top` plateaus
-    // at one slot regardless of loop count. Under the old release-quarantine
-    // nothing recycled and `top` grew to iters*slot, cold-faulting every put.
-    // Machine-speed-independent: asserts the allocator invariant, not a latency.
+    #[test]
+    fn rollback_recycles_immediately() {
+        let store = ArenaStore::new().unwrap();
+        let second_id = ObjectId::new();
+        let second = store
+            .reserve(
+                second_id,
+                1024,
+                Codec::RawBytes,
+                [0; 32],
+                ArenaWriteMode::Direct,
+            )
+            .unwrap();
+        store.commit(second_id, second.reservation).unwrap();
+        store.rollback(second_id, second.reservation).unwrap();
+        let third = store
+            .reserve(
+                ObjectId::new(),
+                1024,
+                Codec::RawBytes,
+                [0; 32],
+                ArenaWriteMode::Direct,
+            )
+            .unwrap();
+        assert_eq!(third.offset, second.offset);
+    }
+
     #[test]
     fn same_size_churn_reuses_one_slot() {
         let store = ArenaStore::new().unwrap();
@@ -500,15 +649,20 @@ mod tests {
         let checksum = crate::cluster::checksum(&payload);
         for _ in 0..1000 {
             let id = ObjectId::new();
-            let (offset, _) = store
-                .reserve(id, size as u64, Codec::RawBytes, checksum)
+            let reserved = store
+                .reserve(
+                    id,
+                    size as u64,
+                    Codec::RawBytes,
+                    checksum,
+                    ArenaWriteMode::Direct,
+                )
                 .unwrap();
-            store.write_at(offset, &payload);
-            store.commit(id);
+            store.write_at(reserved.offset, &payload);
+            store.commit(id, reserved.reservation).unwrap();
             assert_eq!(store.read(id).unwrap().len(), size);
             store.release(id);
         }
-        // One 8-byte-aligned slot, not 1000. `top` is the high-water mark.
         assert_eq!(store.used_bytes(), size as u64);
     }
 
@@ -516,24 +670,26 @@ mod tests {
     fn chunked_write_and_read_round_trip_with_bounds() {
         let store = ArenaStore::new().unwrap();
         let id = ObjectId::new();
-        // Object larger than one frame, written in three ranges.
         let size = 20_000_000u64;
-        store.reserve(id, size, Codec::RawBytes, [0; 32]).unwrap();
+        let reserved = store
+            .reserve(id, size, Codec::RawBytes, [0; 32], ArenaWriteMode::Streamed)
+            .unwrap();
         let chunk = 8_000_000usize;
         let mut expected = vec![0u8; size as usize];
         for (i, off) in (0..size).step_by(chunk).enumerate() {
             let len = chunk.min((size - off) as usize);
             let data = vec![i as u8 + 1; len];
             expected[off as usize..off as usize + len].copy_from_slice(&data);
-            assert!(store.write_chunk(id, off, &data), "in-bounds write");
+            store
+                .write_chunk(id, reserved.reservation, off, &data)
+                .unwrap();
         }
-        // Out-of-bounds write is rejected, copies nothing.
-        assert!(!store.write_chunk(id, size - 10, &[7u8; 100]));
-        // Cannot read chunks before commit.
+        assert!(store
+            .write_chunk(id, reserved.reservation, size - 10, &[7u8; 100])
+            .is_err());
         assert!(store.read_chunk(id, 0, 10).is_none());
-        store.commit(id);
+        store.commit(id, reserved.reservation).unwrap();
 
-        // Reassemble via read_chunk in a different stride; must match.
         let mut got = Vec::with_capacity(size as usize);
         let mut off = 0u64;
         while off < size {
@@ -542,7 +698,6 @@ mod tests {
             off += len;
         }
         assert_eq!(got, expected);
-        // Out-of-bounds read is rejected.
         assert!(store.read_chunk(id, size - 5, 10).is_none());
     }
 }

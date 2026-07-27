@@ -58,15 +58,12 @@ def main():
             env_seed = (args.seed + iteration * 1000 + w) % (1 << 31)
             refs.append(rollout.remote(policy_seed, theta, env_seed, args.steps))
 
-        returns = []
-        for ref in refs:
-            try:
-                res = ray.get(ref, timeout=30)
-                returns.append(res["episode_return"])
-            except Exception as e:
-                print(f"iteration {iteration} task failed: {e}")
+        results = ray.get(refs, timeout=30)
+        if len(results) != args.parallelism:
+            raise RuntimeError(f"incomplete iteration: {len(results)}/{args.parallelism}")
+        returns = [result["episode_return"] for result in results]
 
-        mean_return = sum(returns) / len(returns) if returns else 0.0
+        mean_return = sum(returns) / len(returns)
         # same policy update as Crayon
         delta = 0.01 * math.tanh(mean_return)
         for i in range(len(theta)):
@@ -95,6 +92,9 @@ def main():
         f"total_time {total:.2f}s | {total_episodes / total:.2f} episodes/s"
     )
 
+    expected = args.iterations * args.parallelism
+    if total_episodes != expected:
+        raise RuntimeError(f"incomplete benchmark: {total_episodes}/{expected} episodes")
     ray.shutdown()
 
     manifest = {

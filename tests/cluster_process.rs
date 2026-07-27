@@ -261,7 +261,7 @@ fn running_cancellation_releases_capacity_after_ack() {
 }
 
 #[test]
-fn worker_loss_retries_and_loses_owned_objects() {
+fn worker_loss_retries_and_preserves_inline_output() {
     let mut cluster = Cluster::start(300);
     cluster.worker("sleep", 1.0);
     cluster.worker("sleep", 1.0);
@@ -299,8 +299,7 @@ fn worker_loss_retries_and_loses_owned_objects() {
     );
     cluster.kill_worker(&second_owner.unwrap());
     cluster.eventually_every(Duration::from_secs(5), Duration::from_millis(150), || {
-        let lost = cluster.run(["get", &cluster.coordinator, &output]);
-        !lost.status.success() && String::from_utf8_lossy(&lost.stderr).contains("ObjectLost")
+        stdout(cluster.run(["get", &cluster.coordinator, &output])) == "5000"
     });
 }
 

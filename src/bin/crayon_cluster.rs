@@ -11,12 +11,16 @@ use crayon::{
     protocol::{
         ClientReply, ClientRequest, Envelope, FailureClass, ObjectPayload, RegisterWorker,
         RpcReply, RpcRequest, TaskAssignment, TaskCompletion, WorkerIdentity, WorkerReply,
-        WorkerRequest,
+        WorkerRequest, MAX_FRAME_BYTES,
     },
     resources::ResourceSet,
     worker::OperationRegistry,
 };
-use tokio::sync::Semaphore;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::{Mutex, Semaphore},
+};
 
 const CLUSTER_ID: ClusterId = ClusterId([0; 16]);
 const OBJECT_CONNECTIONS: usize = 128;
@@ -32,7 +36,7 @@ const INLINE_RESULT_MAX_BYTES: usize = 64 * 1024;
 const WORKER_DRAIN_GRACE_MS: u64 = 20_000;
 
 fn usage() -> ! {
-    eprintln!("usage: crayon-cluster local [workers] [operations] | coordinator <addr> [lease-ms] | worker <coordinator> <advertise> [node-id] [cpu] [operations] | submit <coordinator> <a> <b> | submit-detach <coordinator> <operation> <value> [object-id] [cpu] [max-attempts] | status <coordinator> <task-id> | workers <coordinator> | cancel <coordinator> <task-id> | get <coordinator> <object-id> | release <coordinator> <object-id>");
+    eprintln!("usage: crayon-cluster local [workers] [operations] | coordinator <addr> [lease-ms] [--unsafe-allow-remote-bind] | worker <coordinator> <advertise> [node-id] [cpu] [operations] [--unsafe-allow-remote-bind] | submit <coordinator> <a> <b> | submit-detach <coordinator> <operation> <value> [object-id] [cpu] [max-attempts] | status <coordinator> <task-id> | workers <coordinator> | cancel <coordinator> <task-id> | get <coordinator> <object-id> | release <coordinator> <object-id>");
     std::process::exit(2)
 }
 
@@ -49,10 +53,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|value| value.parse())
                 .transpose()?
                 .unwrap_or(5_000);
-            CoordinatorServer::new(CLUSTER_ID, lease_ms)
-                .allow_remote_bind()
-                .serve(args.get(2).unwrap_or_else(|| usage()))
-                .await?
+            let server = CoordinatorServer::new(CLUSTER_ID, lease_ms);
+            let server = if args.iter().any(|arg| arg == "--unsafe-allow-remote-bind") {
+                server.allow_remote_bind()
+            } else {
+                server
+            };
+            server.serve(args.get(2).unwrap_or_else(|| usage())).await?
         }
         Some("worker") => {
             run_worker(
@@ -66,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .transpose()?
                     .unwrap_or(1.0),
                 args.get(6).map(String::as_str).unwrap_or("all"),
+                args.iter().any(|arg| arg == "--unsafe-allow-remote-bind"),
             )
             .await?
         }
@@ -224,93 +232,156 @@ fn last_integer(text: &str) -> Option<i64> {
         })
 }
 
-/// A resident `benchmarks/llm_sidecar.py` process, spoken to over
-/// newline-delimited JSON. Spawned lazily on first use; configuration comes
-/// from CRAYON_LLM_SIDECAR (script path) and CRAYON_LLM_MODEL (model dir).
+struct SidecarProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
 #[derive(Default)]
 struct LlmSidecar {
-    version: u64,
-    io: Option<(
-        std::process::ChildStdin,
-        std::io::BufReader<std::process::ChildStdout>,
-    )>,
+    version: Option<u64>,
+    process: Option<SidecarProcess>,
 }
 
 impl LlmSidecar {
-    fn call(&mut self, request: &serde_json::Value) -> Result<serde_json::Value, Error> {
-        use std::io::{BufRead, Write};
-        if self.io.is_none() {
-            let script = std::env::var("CRAYON_LLM_SIDECAR")
-                .map_err(|_| Error::Protocol("CRAYON_LLM_SIDECAR not set".into()))?;
-            let model = std::env::var("CRAYON_LLM_MODEL")
-                .map_err(|_| Error::Protocol("CRAYON_LLM_MODEL not set".into()))?;
-            let mut child = std::process::Command::new("python3")
-                .arg(&script)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|e| Error::Protocol(format!("spawn sidecar: {e}")))?;
-            let stdin = child.stdin.take().unwrap();
-            let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
-            self.io = Some((stdin, stdout));
-            self.call(&serde_json::json!({"cmd": "init", "model": model}))?;
+    async fn start(&mut self) -> Result<(), Error> {
+        if self.process.is_some() {
+            return Ok(());
         }
-        let (stdin, stdout) = self.io.as_mut().unwrap();
-        writeln!(stdin, "{request}").map_err(|e| Error::Protocol(format!("sidecar: {e}")))?;
-        let mut line = String::new();
-        stdout
-            .read_line(&mut line)
-            .map_err(|e| Error::Protocol(format!("sidecar: {e}")))?;
-        let reply: serde_json::Value = serde_json::from_str(&line)
-            .map_err(|e| Error::Protocol(format!("sidecar reply: {e}")))?;
+        let script = std::env::var("CRAYON_LLM_SIDECAR")
+            .map_err(|_| Error::Protocol("CRAYON_LLM_SIDECAR not set".into()))?;
+        let model = std::env::var("CRAYON_LLM_MODEL")
+            .map_err(|_| Error::Protocol("CRAYON_LLM_MODEL not set".into()))?;
+        let mut child = Command::new("python3")
+            .arg(script)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        self.process = Some(SidecarProcess {
+            child,
+            stdin,
+            stdout,
+        });
+        self.exchange(&serde_json::json!({"cmd": "init", "model": model}))
+            .await?;
+        Ok(())
+    }
+
+    async fn exchange(&mut self, request: &serde_json::Value) -> Result<serde_json::Value, Error> {
+        const MAX_REPLY: usize = MAX_FRAME_BYTES;
+        let timeout_ms = std::env::var("CRAYON_LLM_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300_000);
+        let bytes = serde_json::to_vec(request)
+            .map_err(|error| Error::Protocol(format!("sidecar request: {error}")))?;
+        let mut process = self
+            .process
+            .take()
+            .ok_or_else(|| Error::Io("sidecar not running".into()))?;
+        let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+            process.stdin.write_all(&bytes).await?;
+            process.stdin.write_all(b"\n").await?;
+            process.stdin.flush().await?;
+            let mut line = Vec::new();
+            (&mut process.stdout)
+                .take((MAX_REPLY + 1) as u64)
+                .read_until(b'\n', &mut line)
+                .await?;
+            if line.is_empty() {
+                return Err(Error::Io("sidecar exited".into()));
+            }
+            if line.len() > MAX_REPLY || !line.ends_with(b"\n") {
+                return Err(Error::Protocol(
+                    "sidecar reply too large or incomplete".into(),
+                ));
+            }
+            serde_json::from_slice::<serde_json::Value>(&line)
+                .map_err(|error| Error::Protocol(format!("sidecar reply: {error}")))
+        })
+        .await;
+        let reply = match result {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(error)) => {
+                let _ = process.child.start_kill();
+                let _ = process.child.wait().await;
+                self.version = None;
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = process.child.start_kill();
+                let _ = process.child.wait().await;
+                self.version = None;
+                return Err(Error::DeadlineExceeded);
+            }
+        };
+        self.process = Some(process);
         if let Some(error) = reply.get("error") {
             return Err(Error::Protocol(format!("sidecar: {error}")));
         }
         Ok(reply)
     }
 
-    fn load(&mut self, version: u64, weights: &[u8]) -> Result<(), Error> {
+    async fn call(&mut self, request: &serde_json::Value) -> Result<serde_json::Value, Error> {
+        self.start().await?;
+        self.exchange(request).await
+    }
+
+    async fn load(&mut self, version: u64, weights: &[u8]) -> Result<(), Error> {
         let path =
             std::env::temp_dir().join(format!("crayon-llm-{}-{version}.pt", std::process::id()));
         std::fs::write(&path, weights)?;
-        let result = self.call(&serde_json::json!({
-            "cmd": "load", "path": path, "version": version,
-        }));
+        let result = self
+            .call(&serde_json::json!({"cmd": "load", "path": path, "version": version}))
+            .await;
         let _ = std::fs::remove_file(&path);
         result?;
-        self.version = version;
+        self.version = Some(version);
         Ok(())
     }
 
-    fn rollout(
+    async fn rollout(
         &mut self,
         seeds: &[u64],
         prompts: &[String],
         max_new_tokens: u32,
         temperature: f32,
     ) -> Result<Vec<String>, Error> {
-        let reply = self.call(&serde_json::json!({
-            "cmd": "rollout", "seeds": seeds, "prompts": prompts,
-            "max_new_tokens": max_new_tokens, "temperature": temperature,
-        }))?;
+        let reply = self
+            .call(&serde_json::json!({
+                "cmd": "rollout", "seeds": seeds, "prompts": prompts,
+                "max_new_tokens": max_new_tokens, "temperature": temperature,
+            }))
+            .await?;
         reply["rollouts"]
             .as_array()
             .map(|rollouts| {
                 rollouts
                     .iter()
-                    .map(|r| r["completion"].as_str().unwrap_or_default().to_string())
+                    .map(|rollout| {
+                        rollout["completion"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string()
+                    })
                     .collect()
             })
             .ok_or_else(|| Error::Protocol("sidecar rollout reply malformed".into()))
     }
 }
 
-fn bind_addr_for_advertise(advertise: &str) -> String {
-    if let Some(port) = advertise.rsplit(':').next() {
-        format!("0.0.0.0:{port}")
-    } else {
-        advertise.to_string()
+fn bind_addr_for_advertise(advertise: &str, allow_remote: bool) -> String {
+    if !allow_remote {
+        return advertise.to_string();
     }
+    advertise.rsplit_once(':').map_or_else(
+        || advertise.to_string(),
+        |(_, port)| format!("0.0.0.0:{port}"),
+    )
 }
 
 async fn run_worker(
@@ -319,10 +390,11 @@ async fn run_worker(
     node_id: Option<NodeId>,
     cpu: f64,
     operations: &str,
+    allow_remote: bool,
 ) -> Result<(), Error> {
     eprintln!("worker starting: coordinator={coordinator} advertise={advertise}");
     let objects = LocalObjectStore::default();
-    let bind_addr = bind_addr_for_advertise(advertise);
+    let bind_addr = bind_addr_for_advertise(advertise, allow_remote);
     serve_objects(&bind_addr, objects.clone()).await?;
     let mut registry = OperationRegistry::default();
     if matches!(operations, "all" | "add") {
@@ -368,7 +440,7 @@ async fn run_worker(
         // GPU; this op syncs it to the requested policy version (weights fetched
         // from the coordinator's arena once per version, not per task) and asks
         // it to generate completions for the seeded arithmetic prompts.
-        let sidecar = Arc::new(std::sync::Mutex::new(LlmSidecar::default()));
+        let sidecar = Arc::new(Mutex::new(LlmSidecar::default()));
         let coordinator_addr = coordinator.to_string();
         registry.register(llm_descriptor("rollout"), move |args| {
             let sidecar = sidecar.clone();
@@ -380,7 +452,7 @@ async fn run_worker(
                 let cfg: LlmRolloutCfg = serde_json::from_slice(&args[0])
                     .map_err(|e| Error::Protocol(format!("llm.rollout config: {e}")))?;
                 let stale =
-                    !cfg.weights.is_empty() && sidecar.lock().unwrap().version != cfg.version;
+                    !cfg.weights.is_empty() && sidecar.lock().await.version != Some(cfg.version);
                 let weights = if stale {
                     let weights_id = ObjectId::from_str(&cfg.weights)
                         .map_err(|e| Error::Protocol(format!("llm.rollout weights id: {e}")))?;
@@ -389,28 +461,26 @@ async fn run_worker(
                 } else {
                     None
                 };
-                tokio::task::spawn_blocking(move || {
-                    let mut sidecar = sidecar.lock().unwrap();
-                    if let Some(weights) = weights {
-                        sidecar.load(cfg.version, &weights)?;
-                    }
-                    let completions = sidecar.rollout(
+                let mut sidecar = sidecar.lock().await;
+                if let Some(weights) = weights {
+                    sidecar.load(cfg.version, &weights).await?;
+                }
+                let completions = sidecar
+                    .rollout(
                         &cfg.seeds,
                         &cfg.prompts,
                         cfg.max_new_tokens,
                         cfg.temperature,
-                    )?;
-                    let rollouts: Vec<LlmRollout> = cfg
-                        .seeds
-                        .iter()
-                        .zip(completions)
-                        .map(|(&seed, completion)| LlmRollout { seed, completion })
-                        .collect();
-                    serde_json::to_vec(&rollouts)
-                        .map_err(|e| Error::Protocol(format!("llm.rollout encode: {e}")))
-                })
-                .await
-                .map_err(|_| Error::Protocol("llm sidecar task aborted".into()))?
+                    )
+                    .await?;
+                let rollouts: Vec<LlmRollout> = cfg
+                    .seeds
+                    .iter()
+                    .zip(completions)
+                    .map(|(&seed, completion)| LlmRollout { seed, completion })
+                    .collect();
+                serde_json::to_vec(&rollouts)
+                    .map_err(|e| Error::Protocol(format!("llm.rollout encode: {e}")))
             }
         })?;
     }
@@ -805,7 +875,7 @@ async fn execute_assignment(
             // large outputs stay worker-local and are fetched from `location`.
             let inline =
                 (object.bytes.len() <= INLINE_RESULT_MAX_BYTES).then(|| object.bytes.clone());
-            report(
+            match report_outcome(
                 coordinator,
                 WorkerRequest::Completed {
                     identity: identity.clone(),
@@ -821,7 +891,19 @@ async fn execute_assignment(
                 },
                 epoch,
             )
-            .await
+            .await?
+            {
+                ReportOutcome::Accepted => Ok(()),
+                ReportOutcome::Rejected(error) => {
+                    objects.delete(assignment.output_id);
+                    match error {
+                        Error::IllegalTransition(_) | Error::StaleFence | Error::StaleEpoch => {
+                            Ok(())
+                        }
+                        error => Err(error),
+                    }
+                }
+            }
         }
         Err((error, class)) => {
             report(
@@ -839,6 +921,31 @@ async fn execute_assignment(
     }
 }
 
+enum ReportOutcome {
+    Accepted,
+    Rejected(Error),
+}
+
+async fn report_outcome(
+    coordinator: &str,
+    request_body: WorkerRequest,
+    coordinator_epoch: crayon::ids::CoordinatorEpoch,
+) -> Result<ReportOutcome, Error> {
+    match rpc(
+        coordinator,
+        RpcRequest::Worker(request_body),
+        Some(coordinator_epoch),
+    )
+    .await?
+    {
+        RpcReply::Worker(WorkerReply::Accepted) => Ok(ReportOutcome::Accepted),
+        RpcReply::Worker(WorkerReply::Error(error)) => Ok(ReportOutcome::Rejected(error)),
+        _ => Err(Error::Protocol(
+            "coordinator did not accept worker report".into(),
+        )),
+    }
+}
+
 /// Reports a worker status update. Terminal-state conflicts and stale fences
 /// are treated as "the coordinator already knows" so a single task cannot
 /// terminate the worker session.
@@ -847,21 +954,12 @@ async fn report(
     request_body: WorkerRequest,
     coordinator_epoch: crayon::ids::CoordinatorEpoch,
 ) -> Result<(), Error> {
-    match rpc(
-        coordinator,
-        RpcRequest::Worker(request_body),
-        Some(coordinator_epoch),
-    )
-    .await?
-    {
-        RpcReply::Worker(WorkerReply::Accepted) => Ok(()),
-        RpcReply::Worker(WorkerReply::Error(
+    match report_outcome(coordinator, request_body, coordinator_epoch).await? {
+        ReportOutcome::Accepted => Ok(()),
+        ReportOutcome::Rejected(
             Error::IllegalTransition(_) | Error::StaleFence | Error::StaleEpoch,
-        )) => Ok(()),
-        RpcReply::Worker(WorkerReply::Error(error)) => Err(error),
-        _ => Err(Error::Protocol(
-            "coordinator did not accept worker report".into(),
-        )),
+        ) => Ok(()),
+        ReportOutcome::Rejected(error) => Err(error),
     }
 }
 

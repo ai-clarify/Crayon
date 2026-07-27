@@ -1,7 +1,7 @@
 services:
   coordinator:
     build: .
-    command: ["coordinator", "0.0.0.0:7000"]
+    command: ["coordinator", "0.0.0.0:7000", "5000", "--unsafe-allow-remote-bind"]
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/7000'"]
       interval: 1s
@@ -10,7 +10,7 @@ services:
 
   worker:
     build: .
-    command: ["worker", "coordinator:7000", "worker:7001"]
+    command: ["worker", "coordinator:7000", "worker:7001", "00000000000000000000000000000001", "1.0", "all", "--unsafe-allow-remote-bind"]
     depends_on:
       coordinator:
         condition: service_healthy

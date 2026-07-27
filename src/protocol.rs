@@ -18,13 +18,9 @@ impl fmt::Display for TaskStatus {
 }
 
 pub const MAGIC: [u8; 4] = *b"CRYN";
-// Bumped to 7: `PutChunk`/`GetChunk` added for cross-host chunked streaming of
-// >8 MiB arena objects, shifting request/reply variant indices — wire-incompatible
-// with 6. Deploy all components at the same major.
-// (6 added `GetBatch.min_ready` for first-K-ready. 5/0.5.0 added the arena's
-// `ArenaReserve`/`ArenaCommit`. 3/0.4.0: `Failed` swapped `retryable: bool` for
-// a `FailureClass` enum.)
-pub const PROTOCOL_MAJOR: u16 = 7;
+// Arena reservations now carry an owner token and Direct/Streamed mode;
+// streamed commit requires complete coverage. Wire-incompatible with 7.
+pub const PROTOCOL_MAJOR: u16 = 8;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OBJECT_BYTES: usize = MAX_FRAME_BYTES - 64 * 1024;
@@ -144,6 +140,12 @@ pub struct TaskCompletion {
     /// `None` for large outputs, which are fetched from `location` on demand.
     pub bytes: Option<Arc<[u8]>>,
 }
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ArenaWriteMode {
+    Direct,
+    Streamed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientRequest {
     Connect,
@@ -191,14 +193,19 @@ pub enum ClientRequest {
         codec: Codec,
         size_bytes: u64,
         checksum: [u8; 32],
+        mode: ArenaWriteMode,
     },
-    ArenaCommit(ObjectId),
+    ArenaCommit {
+        id: ObjectId,
+        reservation: RequestId,
+    },
     /// Write a byte range of a reserved arena object over TCP, for a cross-host
     /// client that cannot mmap the arena. Sits between `ArenaReserve` and
     /// `ArenaCommit`: the coordinator copies `bytes` into the slot at `offset`.
     /// Each chunk is one frame, so a multi-GiB object crosses as many chunks.
     PutChunk {
         id: ObjectId,
+        reservation: RequestId,
         offset: u64,
         bytes: Vec<u8>,
     },
@@ -283,11 +290,12 @@ pub enum ClientReply {
     },
     Object(ObjectPayload),
     /// Slot granted for an `ArenaReserve`: write the bytes at `offset`, then
-    /// send `ArenaCommit(id)`. (A reserve of already-stored content returns
-    /// `Object` instead.)
+    /// send `ArenaCommit` with the reservation token. (A reserve of already-stored
+    /// content returns `Object` instead.)
     ArenaReserved {
         id: ObjectId,
         offset: u64,
+        reservation: RequestId,
     },
     Submitted {
         task_id: TaskId,

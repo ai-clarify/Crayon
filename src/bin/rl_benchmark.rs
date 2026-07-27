@@ -135,28 +135,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?
             .into_iter()
-            .filter_map(|result| match result {
-                Ok(handle) => Some(handle),
-                Err(error) => {
-                    eprintln!("iteration {iteration} submit rejected: {error}");
-                    None
-                }
-            })
-            .collect();
-
-        let mut returns = Vec::new();
-        for result in client.results(&handles, Duration::from_secs(30)).await? {
-            match result {
-                Ok(rollout) => returns.push(rollout.episode_return),
-                Err(error) => eprintln!("iteration {iteration} task failed: {error}"),
-            }
+            .collect::<Result<_, _>>()?;
+        if handles.len() != args.parallelism {
+            return Err("incomplete rollout admission".into());
         }
 
-        let mean_return = if returns.is_empty() {
-            0.0
-        } else {
-            returns.iter().sum::<f32>() / returns.len() as f32
-        };
+        let results = client.results(&handles, Duration::from_secs(30)).await?;
+        let returns: Vec<_> = results
+            .into_iter()
+            .map(|result| result.map(|rollout| rollout.episode_return))
+            .collect::<Result<_, _>>()?;
+        if returns.len() != args.parallelism {
+            return Err("incomplete rollout iteration".into());
+        }
+
+        let mean_return = returns.iter().sum::<f32>() / returns.len() as f32;
 
         // Simulate a policy update: nudge theta toward the mean return sign.
         for t in policy.theta.iter_mut() {
@@ -194,6 +187,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     kill(coordinator);
 
+    let expected_episodes = args.iterations as usize * args.parallelism;
+    if total_episodes != expected_episodes {
+        return Err(
+            format!("incomplete benchmark: {total_episodes}/{expected_episodes} episodes").into(),
+        );
+    }
     write_artifacts(&args, &samples, total_episodes, total)?;
     if let Some(path) = &args.baseline {
         let base: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
